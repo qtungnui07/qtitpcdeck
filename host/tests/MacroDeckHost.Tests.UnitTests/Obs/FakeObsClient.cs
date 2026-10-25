@@ -1,0 +1,582 @@
+using System.Globalization;
+using MacroDeckHost.Integrations.Obs.Protocol;
+
+namespace MacroDeckHost.Tests.UnitTests.Obs;
+
+internal sealed class FakeObsClient : IObsClient
+{
+	private static readonly ObsAudioTracks _noAudioTracks = new([false, false, false, false, false, false]);
+
+	private static readonly ObsSourceActivity _inactive = new(false, false);
+
+	public int ConnectCount { get; private set; }
+
+	public string? LastUrl { get; private set; }
+
+	public string? LastPassword { get; private set; }
+
+	public bool IsConnected { get; set; }
+
+	public bool ConnectRaisesConnected { get; set; }
+
+	public bool ConnectRaisesDisconnected { get; set; }
+
+	public string? DisconnectReason { get; set; }
+
+	public ObsStatus Status { get; set; } = new();
+
+	public Func<ObsStatus>? QueryStatusHandler { get; set; }
+
+	public IReadOnlyList<string> SceneNames { get; set; } = [];
+
+	public Dictionary<string, IReadOnlyList<string>> SceneItems { get; } = new();
+
+	public Dictionary<string, IReadOnlyList<string>> Groups { get; } = new(StringComparer.Ordinal);
+
+	public IReadOnlyList<string> InputNames { get; set; } = [];
+
+	public IReadOnlyList<string> ProfileNames { get; set; } = [];
+
+	public IReadOnlyList<string> SceneCollectionNames { get; set; } = [];
+
+	public IReadOnlyList<string> SourceNames { get; set; } = [];
+
+	public Dictionary<string, float> InputVolumes { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, IReadOnlyList<string>> SourceFilters { get; } = new(StringComparer.Ordinal);
+
+	public IReadOnlyList<string> OutputNames { get; set; } = [];
+
+	public Dictionary<string, bool> OutputStates { get; } = new(StringComparer.Ordinal);
+
+	public Exception? OutputFailure { get; set; }
+
+	public Dictionary<string, bool> FilterStates { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, string> InputAudioMonitorTypes { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, int> InputAudioSyncOffsetsMs { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, ObsAudioTracks> InputAudioTracksByName { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, ObsSourceActivity> SourceActivity { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, string> InputSettingsJson { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, string> InputDefaultSettingsJson { get; } = new(StringComparer.Ordinal);
+
+	public Exception? DefaultSettingsFailure { get; set; }
+
+	public bool DisconnectOnDefaultSettingsRead { get; set; }
+
+	/// <summary>
+	/// Names that used to exist but no longer do. A real OBS instance fails every request naming a gone
+	/// input or source; this is what lets tests simulate that instead of the dictionaries below silently
+	/// answering with their fallback value for a name that was never registered in the first place.
+	/// </summary>
+	public HashSet<string> DeletedNames { get; } = new(StringComparer.Ordinal);
+
+	public List<string> Calls { get; } = [];
+
+	public ObsRequestException? RequestFailure { get; set; }
+
+	public event EventHandler? Connected;
+
+	public event EventHandler<string?>? Disconnected;
+
+	public event EventHandler? StateChanged;
+
+	public event EventHandler<ObsInputMuteChange>? InputMuteChanged;
+
+	public event EventHandler<string>? ReplayBufferSaved;
+
+	public event EventHandler<string>? RecordFileChanged;
+
+	public event EventHandler<string>? ScreenshotSaved;
+
+	public event EventHandler<ObsInputSettingsChange>? InputSettingsChanged;
+
+	public event EventHandler<ObsFilterChange>? SourceFilterChanged;
+
+	public event EventHandler<ObsInputFlagChange>? InputActiveChanged;
+
+	public event EventHandler<ObsInputFlagChange>? InputShowingChanged;
+
+	public event EventHandler<ObsInputAudioChange>? InputAudioChanged;
+
+	public event EventHandler<ObsSceneItemEnableChange>? SceneItemEnableChanged;
+
+	public event EventHandler<string>? CustomEventReceived;
+
+	public int QueryStatusCount { get; private set; }
+
+	public Dictionary<string, int> Reads { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<(string SceneName, int SceneItemId), string> SceneItemSources { get; } = new();
+
+	public void RaiseInputAudioChanged(string inputName, ObsInputAudioProperty property)
+	{
+		InputAudioChanged?.Invoke(this, new ObsInputAudioChange(inputName, property));
+	}
+
+	public void RaiseSceneItemEnableChanged(string sceneName, int sceneItemId)
+	{
+		SceneItemEnableChanged?.Invoke(this, new ObsSceneItemEnableChange(sceneName, sceneItemId));
+	}
+
+	public void RaiseInputSettingsChanged(string inputName, params string[] keys)
+	{
+		InputSettingsChanged?.Invoke(this, new ObsInputSettingsChange(inputName, keys));
+	}
+
+	public void RaiseSourceFilterChanged(string sourceName, string filterName)
+	{
+		SourceFilterChanged?.Invoke(this, new ObsFilterChange(sourceName, filterName));
+	}
+
+	public void RaiseInputActiveChanged(string inputName, bool active)
+	{
+		InputActiveChanged?.Invoke(this, new ObsInputFlagChange(inputName, active));
+	}
+
+	public void RaiseInputShowingChanged(string inputName, bool showing)
+	{
+		InputShowingChanged?.Invoke(this, new ObsInputFlagChange(inputName, showing));
+	}
+
+	public void RaiseCustomEvent(string json)
+	{
+		CustomEventReceived?.Invoke(this, json);
+	}
+
+	public void RaiseInputMuteChanged(string inputName, bool muted)
+	{
+		InputMuteChanged?.Invoke(this, new ObsInputMuteChange(inputName, muted));
+	}
+
+	public void RaiseReplayBufferSaved(string path)
+	{
+		ReplayBufferSaved?.Invoke(this, path);
+	}
+
+	public void RaiseRecordFileChanged(string path)
+	{
+		RecordFileChanged?.Invoke(this, path);
+	}
+
+	public void RaiseScreenshotSaved(string path)
+	{
+		ScreenshotSaved?.Invoke(this, path);
+	}
+
+	public void Connect(string url, string? password)
+	{
+		ConnectCount++;
+		LastUrl = url;
+		LastPassword = password;
+
+		if (ConnectRaisesConnected)
+		{
+			IsConnected = true;
+			RaiseConnected();
+		}
+		else if (ConnectRaisesDisconnected)
+		{
+			IsConnected = false;
+			RaiseDisconnected(DisconnectReason);
+		}
+	}
+
+	public void Disconnect()
+	{
+		IsConnected = false;
+		Calls.Add("Disconnect");
+	}
+
+	public ObsStatus QueryStatus()
+	{
+		QueryStatusCount++;
+		return QueryStatusHandler?.Invoke() ?? Status;
+	}
+
+	public IReadOnlyList<string> GetSceneNames()
+	{
+		return SceneNames;
+	}
+
+	public IReadOnlyList<string> GetSceneItemNames(string sceneName)
+	{
+		return Groups.ContainsKey(sceneName) ? [] : SceneItems.GetValueOrDefault(sceneName, []);
+	}
+
+	public string? GetSceneItemSourceName(string sceneName, int sceneItemId)
+	{
+		return SceneItemSources.GetValueOrDefault((sceneName, sceneItemId));
+	}
+
+	public IReadOnlyList<string> GetGroupNames()
+	{
+		return Groups.Keys.ToList();
+	}
+
+	public IReadOnlyList<string> GetGroupItemNames(string groupName)
+	{
+		return Groups.GetValueOrDefault(groupName, []);
+	}
+
+	public IReadOnlyList<string> GetInputNames()
+	{
+		return InputNames;
+	}
+
+	public IReadOnlyList<string> GetSourceNames()
+	{
+		return SourceNames;
+	}
+
+	public IReadOnlyList<string> GetSourceFilterNames(string sourceName)
+	{
+		return SourceFilters.GetValueOrDefault(sourceName, []);
+	}
+
+	public void SetCurrentScene(string sceneName)
+	{
+		Calls.Add($"SetCurrentScene:{sceneName}");
+	}
+
+	public void SetPreviewScene(string sceneName)
+	{
+		Calls.Add($"SetPreviewScene:{sceneName}");
+	}
+
+	public IReadOnlyList<string> GetProfileNames()
+	{
+		return ProfileNames;
+	}
+
+	public void SetCurrentProfile(string profileName)
+	{
+		Calls.Add($"SetCurrentProfile:{profileName}");
+	}
+
+	public IReadOnlyList<string> GetSceneCollectionNames()
+	{
+		return SceneCollectionNames;
+	}
+
+	public void SetCurrentSceneCollection(string sceneCollectionName)
+	{
+		Calls.Add($"SetCurrentSceneCollection:{sceneCollectionName}");
+		ThrowRequestFailure();
+	}
+
+	public void StartRecord()
+	{
+		Calls.Add("StartRecord");
+	}
+
+	public void StopRecord()
+	{
+		Calls.Add("StopRecord");
+	}
+
+	public void ToggleRecord()
+	{
+		Calls.Add("ToggleRecord");
+	}
+
+	public void ToggleRecordPause()
+	{
+		Calls.Add("ToggleRecordPause");
+	}
+
+	public void StartStream()
+	{
+		Calls.Add("StartStream");
+	}
+
+	public void StopStream()
+	{
+		Calls.Add("StopStream");
+	}
+
+	public void ToggleStream()
+	{
+		Calls.Add("ToggleStream");
+	}
+
+	public void StartVirtualCam()
+	{
+		Calls.Add("StartVirtualCam");
+	}
+
+	public void StopVirtualCam()
+	{
+		Calls.Add("StopVirtualCam");
+	}
+
+	public void ToggleVirtualCam()
+	{
+		Calls.Add("ToggleVirtualCam");
+	}
+
+	public void StartReplayBuffer()
+	{
+		Calls.Add("StartReplayBuffer");
+	}
+
+	public void StopReplayBuffer()
+	{
+		Calls.Add("StopReplayBuffer");
+	}
+
+	public void ToggleReplayBuffer()
+	{
+		Calls.Add("ToggleReplayBuffer");
+	}
+
+	public void SaveReplayBuffer()
+	{
+		Calls.Add("SaveReplayBuffer");
+	}
+
+	public void SplitRecordFile()
+	{
+		Calls.Add("SplitRecordFile");
+		ThrowRequestFailure();
+	}
+
+	public void CreateRecordChapter(string? chapterName)
+	{
+		Calls.Add($"CreateRecordChapter:{chapterName ?? "<none>"}");
+		ThrowRequestFailure();
+	}
+
+	public void SetRecordDirectory(string directory)
+	{
+		Calls.Add($"SetRecordDirectory:{directory}");
+		ThrowRequestFailure();
+	}
+
+	private void ThrowRequestFailure()
+	{
+		if (RequestFailure is not null)
+		{
+			throw RequestFailure;
+		}
+	}
+
+	public Dictionary<string, bool> MutedInputs { get; } = new(StringComparer.Ordinal);
+
+	public Dictionary<string, bool> VisibleSources { get; } = new(StringComparer.Ordinal);
+
+	public bool GetInputMuted(string inputName)
+	{
+		Calls.Add($"GetInputMuted:{inputName}");
+		EnsureExists(inputName);
+		return MutedInputs.GetValueOrDefault(inputName);
+	}
+
+	public bool GetSourceVisible(string sceneName, string sourceName)
+	{
+		Calls.Add($"GetSourceVisible:{sceneName}:{sourceName}");
+		EnsureExists(sceneName, sourceName);
+		return VisibleSources.GetValueOrDefault($"{sceneName}:{sourceName}");
+	}
+
+	public void SetSourceVisible(string sceneName, string sourceName, bool visible)
+	{
+		Calls.Add($"SetSourceVisible:{sceneName}:{sourceName}:{visible}");
+	}
+
+	public void ToggleSourceVisible(string sceneName, string sourceName)
+	{
+		Calls.Add($"ToggleSourceVisible:{sceneName}:{sourceName}");
+	}
+
+	public void SetInputMute(string inputName, bool muted)
+	{
+		Calls.Add($"SetInputMute:{inputName}:{muted}");
+	}
+
+	public void ToggleInputMute(string inputName)
+	{
+		Calls.Add($"ToggleInputMute:{inputName}");
+	}
+
+	public float GetInputVolume(string inputName)
+	{
+		EnsureExists(inputName);
+		return InputVolumes.GetValueOrDefault(inputName, 0f);
+	}
+
+	public void SetInputVolume(string inputName, float volumeMultiplier)
+	{
+		InputVolumes[inputName] = volumeMultiplier;
+		Calls.Add($"SetInputVolume:{inputName}:{volumeMultiplier.ToString(CultureInfo.InvariantCulture)}");
+	}
+
+	public bool GetSourceFilterEnabled(string sourceName, string filterName)
+	{
+		CountRead("filter:" + sourceName + "::" + filterName);
+		EnsureExists(sourceName);
+		return FilterStates.GetValueOrDefault(FilterKey(sourceName, filterName), false);
+	}
+
+	public void SetSourceFilterEnabled(string sourceName, string filterName, bool enabled)
+	{
+		FilterStates[FilterKey(sourceName, filterName)] = enabled;
+		Calls.Add($"SetSourceFilterEnabled:{sourceName}:{filterName}:{enabled}");
+	}
+
+	public void ToggleSourceFilterEnabled(string sourceName, string filterName)
+	{
+		var key = FilterKey(sourceName, filterName);
+		FilterStates[key] = !FilterStates.GetValueOrDefault(key, false);
+		Calls.Add($"ToggleSourceFilterEnabled:{sourceName}:{filterName}");
+	}
+
+	public IReadOnlyList<string> GetOutputNames()
+	{
+		Calls.Add("GetOutputNames");
+		return OutputFailure is null ? OutputNames : throw OutputFailure;
+	}
+
+	public void StartOutput(string outputName)
+	{
+		EnsureOutput(outputName);
+		OutputStates[outputName] = true;
+		Calls.Add($"StartOutput:{outputName}");
+	}
+
+	public void StopOutput(string outputName)
+	{
+		EnsureOutput(outputName);
+		OutputStates[outputName] = false;
+		Calls.Add($"StopOutput:{outputName}");
+	}
+
+	public void ToggleOutput(string outputName)
+	{
+		EnsureOutput(outputName);
+		OutputStates[outputName] = !OutputStates.GetValueOrDefault(outputName, false);
+		Calls.Add($"ToggleOutput:{outputName}");
+	}
+
+	public bool GetOutputActive(string outputName)
+	{
+		EnsureOutput(outputName);
+		return OutputStates.GetValueOrDefault(outputName, false);
+	}
+
+	public void SetStudioMode(bool enabled)
+	{
+		Calls.Add($"SetStudioMode:{enabled}");
+	}
+
+	public string GetInputAudioMonitorType(string inputName)
+	{
+		EnsureExists(inputName);
+		return InputAudioMonitorTypes.GetValueOrDefault(inputName, "OBS_MONITORING_TYPE_NONE");
+	}
+
+	public int GetInputAudioSyncOffsetMilliseconds(string inputName)
+	{
+		EnsureExists(inputName);
+		return InputAudioSyncOffsetsMs.GetValueOrDefault(inputName, 0);
+	}
+
+	public ObsAudioTracks GetInputAudioTracks(string inputName)
+	{
+		EnsureExists(inputName);
+		return InputAudioTracksByName.GetValueOrDefault(inputName, _noAudioTracks);
+	}
+
+	public ObsSourceActivity GetSourceActive(string sourceName)
+	{
+		CountRead("active:" + sourceName);
+		EnsureExists(sourceName);
+		return SourceActivity.GetValueOrDefault(sourceName, _inactive);
+	}
+
+	public string GetInputSettings(string inputName)
+	{
+		CountRead("settings:" + inputName);
+		EnsureExists(inputName);
+		return InputSettingsJson.GetValueOrDefault(inputName, "{}");
+	}
+
+	public string GetInputDefaultSettings(string inputName)
+	{
+		CountRead("default-settings:" + inputName);
+		EnsureExists(inputName);
+		if (DisconnectOnDefaultSettingsRead)
+		{
+			IsConnected = false;
+			throw new InvalidOperationException("connection closed");
+		}
+
+		if (DefaultSettingsFailure is not null)
+		{
+			throw DefaultSettingsFailure;
+		}
+
+		return InputDefaultSettingsJson.GetValueOrDefault(inputName, "{}");
+	}
+
+	public void SetInputSettings(string inputName, string settingsJson)
+	{
+		Calls.Add($"SetInputSettings:{inputName}:{settingsJson}");
+		EnsureExists(inputName);
+		ThrowRequestFailure();
+	}
+
+	public void RaiseConnected()
+	{
+		Connected?.Invoke(this, EventArgs.Empty);
+	}
+
+	public void RaiseDisconnected(string? reason)
+	{
+		Disconnected?.Invoke(this, reason);
+	}
+
+	public void RaiseStateChanged()
+	{
+		StateChanged?.Invoke(this, EventArgs.Empty);
+	}
+
+	private void CountRead(string key)
+	{
+		Reads[key] = Reads.GetValueOrDefault(key) + 1;
+	}
+
+	private static string FilterKey(string sourceName, string filterName)
+	{
+		return $"{sourceName}::{filterName}";
+	}
+
+	private void EnsureOutput(string outputName)
+	{
+		if (OutputFailure is not null)
+		{
+			throw OutputFailure;
+		}
+
+		if (!OutputNames.Contains(outputName))
+		{
+			throw new ObsOutputNotFoundException(outputName);
+		}
+	}
+
+	private void EnsureExists(params string[] names)
+	{
+		foreach (var name in names)
+		{
+			if (DeletedNames.Contains(name))
+			{
+				throw new InvalidOperationException($"OBS resource '{name}' does not exist.");
+			}
+		}
+	}
+}

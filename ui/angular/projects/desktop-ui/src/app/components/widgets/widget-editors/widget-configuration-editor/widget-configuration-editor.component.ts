@@ -1,0 +1,411 @@
+import { NgTemplateOutlet } from '@angular/common';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  DestroyRef,
+  EventEmitter,
+  Input,
+  OnDestroy,
+  OnInit,
+  Output,
+  computed,
+  effect,
+  forwardRef,
+  inject,
+  signal,
+  untracked,
+  viewChild,
+} from '@angular/core';
+
+import {
+  applyConfigDraftEvent,
+  composeConfigDraft,
+  emitsEvent,
+  GridWidget,
+  spanSize,
+  UiConfigEntryPoints,
+  UiConfigEvents,
+  UiConfigPrimitives,
+  UiConfigProperties,
+  UiNode,
+  UiNodeEvent,
+  WidgetBorder,
+  WidgetData,
+  widgetTileBorder,
+  WIDGET_REFERENCE_CELL_SIZE,
+  WIDGET_REFERENCE_GAP,
+} from '@macro-deck/runtime';
+import {
+  ButtonComponent,
+  IWidgetEditorComponent,
+  TranslatePipe,
+  UiNodeEventBus,
+  UiSessionHandle,
+  UiSessionService,
+  UiTreeWidgetComponent,
+  WidgetBorderOverlayComponent,
+  WidgetTypeCatalogService,
+} from '@shared';
+import { UiNodeComponent } from '../../../ui-render/ui-node.component';
+import { UiRenderContext } from '../../../ui-render/ui-render-context';
+import { deepEqual } from '../../../../util/deep-equal';
+import { WidgetEditorShellComponent } from '../common/widget-editor-shell/widget-editor-shell.component';
+
+const DRAFT_EVENT_NAMES: ReadonlySet<string> = new Set([
+  UiConfigEvents.Change,
+  UiConfigEvents.Add,
+  UiConfigEvents.Remove,
+]);
+
+const FOLLOW_CONFIRM_MS = 2000;
+
+const PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE';
+
+type Draft = Record<string, unknown>;
+
+const PREVIEW_SHORT_SIDE_PX = 100;
+const PREVIEW_LONG_SIDE_MAX_PX = 220;
+
+@Component({
+  selector: 'app-widget-configuration-editor',
+  standalone: true,
+  imports: [
+    ButtonComponent,
+    NgTemplateOutlet,
+    TranslatePipe,
+    // Deferred like `UiNodeComponent`'s own mutual references to `UiChromeComponent`/`UiInputComponent`
+    // (see the file comment there): this is a new consumer of the ui-render module graph, so
+    // dereferencing the class at this file's own load time risks the same TDZ cycle.
+    forwardRef(() => UiNodeComponent),
+    UiTreeWidgetComponent,
+    WidgetBorderOverlayComponent,
+    WidgetEditorShellComponent,
+  ],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  providers: [UiNodeEventBus, UiRenderContext],
+  templateUrl: './widget-configuration-editor.component.html',
+  styleUrls: ['../common/widget-editor-sidebar.scss', './widget-configuration-editor.component.scss'],
+})
+export class WidgetConfigurationEditorComponent implements IWidgetEditorComponent, OnInit, OnDestroy {
+  @Input({ required: true }) widget!: GridWidget;
+
+  protected get previewReference(): { width: number; height: number } {
+    return {
+      width: spanSize(this.widget.w, WIDGET_REFERENCE_CELL_SIZE, WIDGET_REFERENCE_GAP),
+      height: spanSize(this.widget.h, WIDGET_REFERENCE_CELL_SIZE, WIDGET_REFERENCE_GAP),
+    };
+  }
+
+  protected get previewScale(): number {
+    const reference = this.previewReference;
+    return Math.min(
+      PREVIEW_SHORT_SIDE_PX / Math.min(reference.width, reference.height),
+      PREVIEW_LONG_SIDE_MAX_PX / Math.max(reference.width, reference.height));
+  }
+
+  private _unsavedChanges = false;
+  @Input()
+  set unsavedChanges(value: boolean) {
+    this._unsavedChanges = value;
+    this.context.setUnsavedChanges(value);
+  }
+  get unsavedChanges(): boolean {
+    return this._unsavedChanges;
+  }
+
+  @Output() save = new EventEmitter<Partial<WidgetData>>();
+  @Output() close = new EventEmitter<void>();
+
+  private readonly uiSessions = inject(UiSessionService);
+  private readonly widgetTypes = inject(WidgetTypeCatalogService);
+  protected readonly context = inject(UiRenderContext);
+  private readonly eventBus = inject(UiNodeEventBus);
+
+  private readonly handle = signal<UiSessionHandle | null>(null);
+
+  protected readonly root = computed<UiNode | null>(() => this.handle()?.root() ?? null);
+  protected readonly rejection = computed(() => this.handle()?.rejection() ?? null);
+
+  protected readonly sessionEnd = computed(() => this.handle()?.fault?.() ?? this.rejection());
+  protected readonly tooLarge = computed(() => this.sessionEnd()?.code === PAYLOAD_TOO_LARGE);
+
+  private readonly noConfiguration = signal(false);
+
+  /** Until the host answers with a tree there is only the preview to paint, and the single-pane
+   * fallback below would show it alone before the real split layout replaced it. */
+  readonly ready = computed(() => this.root() !== null || this.sessionEnd() !== null || this.noConfiguration());
+
+  readonly valid = computed(() => !this.tooLarge());
+
+  protected readonly propertiesRegion = computed<UiNode | null>(
+    () => findRegion(this.root(), UiConfigPrimitives.WidgetProperties));
+  protected readonly editorRegion = computed<UiNode | null>(
+    () => findRegion(this.root(), UiConfigPrimitives.WidgetEditor));
+
+  protected readonly previewData = signal<WidgetData>({} as WidgetData);
+
+  private readonly previewTree = viewChild(UiTreeWidgetComponent);
+
+  /** The same rule the deck's tile applies (`widgetTileBorder`): an Action Button's ring comes from
+   * its `ui.button` root node, host-resolved per active state, every other type's from the draft. */
+  protected readonly previewBorder = computed<WidgetBorder | undefined>(
+    () => widgetTileBorder(this.widget.type, this.previewData(), this.previewTree()?.treeRoot() ?? null));
+
+  private seenTree = false;
+  private treeGeneration = 0;
+  private previousRoot: UiNode | null = null;
+  private retainedRoot: UiNode | null = null;
+  private openedWith: WidgetData | null = null;
+  private lastShownDraft: WidgetData | null = null;
+  private lastOpenedDraft: WidgetData | null = null;
+
+  private treeDraft: WidgetData | null = null;
+
+  private builtIn = false;
+  private pendingFollow: { key: string; value: unknown } | null = null;
+  private followDeadline: ReturnType<typeof setTimeout> | undefined;
+
+  constructor() {
+    effect(() => this.context.setRoot(this.root()));
+
+    // A provider writes some keys itself rather than in response to a value edit - applying a preset,
+    // adopting a state provider. Those arrive as patches to the tree's values and never as `change`,
+    // so folding only events would leave the draft holding the old values while the form shows the new
+    // ones, and the save would quietly write the stale set. Reconciling on each revision covers every
+    // such write without the provider having to announce them.
+    //
+    // The first tree is deliberately not reconciled. It carries the provider's own defaults for keys the
+    // stored data never had, and folding those in would write them into the draft before the user has
+    // touched anything - which the page's dirty check reads as an edit, so the editor would open with an
+    // enabled Save button and saving would add keys nobody asked for.
+    effect(() => {
+      const root = this.root();
+      if (!root) return;
+
+      // A tree from a newly opened session carries provider defaults the draft never had.
+      const generation = this.handle()?.generation() ?? 0;
+      if (generation !== this.treeGeneration) {
+        this.treeGeneration = generation;
+        this.seenTree = false;
+        this.retainedRoot = this.previousRoot;
+      }
+
+      if (root === this.retainedRoot) return;
+      this.retainedRoot = null;
+
+      const previous = this.previousRoot;
+      this.previousRoot = root;
+
+      if (!this.seenTree) {
+        this.seenTree = true;
+        if (!deepEqual(this.widget.data, this.openedWith)) untracked(() => this.reopen());
+        else this.lastOpenedDraft = this.rememberShownDraft();
+        return;
+      }
+
+      untracked(() => this.onRevision(previous, root));
+    });
+
+    const subscription = this.eventBus.events$.subscribe(event => this.onNodeEvent(event));
+    inject(DestroyRef).onDestroy(() => subscription.unsubscribe());
+  }
+
+  ngOnInit(): void {
+    this.previewData.set({ ...this.widget.data });
+    this.context.setScopeRefId(this.widget.id);
+    void this.openSession();
+  }
+
+  ngOnDestroy(): void {
+    this.settleFollow();
+    this.handle()?.close();
+  }
+
+  /**
+   * Rebuilds the tree from the draft the page has just put on `widget`. The host composes the tree from
+   * the data the session was opened with, so a draft that arrived from outside the tree - a JSON-mode
+   * edit, a live update adopted while editing - is invisible to it until the session is opened again.
+   * Called by the editor page whenever it reseeds this editor.
+   */
+  reload(): void {
+    // Reopening throws away tree-local state such as the open tab, so only a draft the tree did not
+    // produce itself is worth it.
+    if (deepEqual(this.widget.data, this.treeDraft)) return;
+    this.reopen();
+  }
+
+  followLiveData(): void {
+    const data = this.widget.data as unknown as Draft;
+    if (deepEqual(data, this.treeDraft)) return;
+
+    const key = this.pendingFollow ? null : singleChangedKey(this.treeDraft as Draft | null, data);
+    const root = this.root();
+    const field = key !== null && key in data && root && this.builtIn ? findColorField(root, key) : null;
+    if (!field) {
+      this.reopen();
+      return;
+    }
+
+    const value = data[field.id];
+    this.treeDraft = structuredClone(this.widget.data);
+    this.previewData.set({ ...this.widget.data });
+    if (deepEqual(field.properties?.[UiConfigProperties.Value], value)) return;
+
+    const follow = { key: field.id, value };
+    this.pendingFollow = follow;
+    // The host accepts an event before dispatching it and an ignored dispatch emits no revision,
+    // so a follow that never lands can only be noticed by its missing confirmation.
+    this.followDeadline = setTimeout(() => {
+      if (this.pendingFollow === follow) this.reopen();
+    }, FOLLOW_CONFIRM_MS);
+    this.handle()?.send({ nodeId: field.id, name: UiConfigEvents.Change, data: value });
+  }
+
+  private reopen(): void {
+    this.settleFollow();
+    this.previousRoot = null;
+    this.handle()?.close();
+    this.handle.set(null);
+    // The next tree is a first tree again: it carries the provider's defaults for keys the draft never
+    // had, and the effect below must not fold those into the draft - see its own remarks.
+    this.seenTree = false;
+    this.previewData.set({ ...this.widget.data });
+    void this.openSession();
+  }
+
+  private onRevision(previous: UiNode | null, root: UiNode): void {
+    const data = this.widget.data as unknown as Draft;
+    const follow = this.pendingFollow;
+    if (!follow) {
+      this.applyDraft(composeConfigDraft(root, data));
+      this.rememberShownDraft();
+      return;
+    }
+
+    const composed = composeConfigDraft(root, data);
+    if (!deepEqual(composed[follow.key], follow.value)) {
+      this.reopen();
+      return;
+    }
+
+    this.settleFollow();
+    this.applyDraft(previous ? foldChanges(composeConfigDraft(previous, data), composed, data) : data);
+    this.rememberShownDraft();
+  }
+
+  protected canRestore(): boolean {
+    return this.tooLarge() && this.restoreTarget() !== null;
+  }
+
+  protected restoreLastShownDraft(): void {
+    const target = this.restoreTarget();
+    if (!target) return;
+    this.applyDraft(structuredClone(target) as unknown as Record<string, unknown>);
+    this.reopen();
+  }
+
+  // A tree revised within a session still echoes the data the session was opened with, so the last
+  // revision shown can be too large to open again; the last draft a session opened with never is.
+  private restoreTarget(): WidgetData | null {
+    return [this.lastShownDraft, this.lastOpenedDraft]
+      .find(draft => draft !== null && !deepEqual(draft, this.widget.data)) ?? null;
+  }
+
+  private rememberShownDraft(): WidgetData {
+    this.lastShownDraft = structuredClone(this.widget.data);
+    return this.lastShownDraft;
+  }
+
+  private settleFollow(): void {
+    clearTimeout(this.followDeadline);
+    this.followDeadline = undefined;
+    this.pendingFollow = null;
+  }
+
+  private async openSession(): Promise<void> {
+    const info = await this.widgetTypes.infoFor(this.widget.type);
+    this.builtIn = info?.isBuiltIn === true;
+    if (info && !info.supportsConfigUi) {
+      this.noConfiguration.set(true);
+      return;
+    }
+
+    this.handle.set(this.uiSessions.open(() => {
+      this.treeDraft = structuredClone(this.widget.data);
+      this.openedWith = structuredClone(this.widget.data);
+      return {
+        kind: 'config',
+        entryPoint: UiConfigEntryPoints.WidgetConfig,
+        widgetId: this.widget.id,
+        // The draft, not the stored record: this editor owns the transaction, and the tree has to render
+        // what is being edited rather than what the widget was last saved with.
+        widgetData: JSON.stringify(this.widget.data),
+        // The host catalogue is what WidgetRegistryService already consulted to mount this editor at
+        // all; falling back to 0 ("whatever the host speaks") only matters for the narrow race where
+        // that answer is not cached yet.
+        configUiModelVersion: info?.configUiModelVersion ?? 0,
+      };
+    }, { notifyFault: false }));
+  }
+
+  protected onNodeEvent(event: UiNodeEvent): void {
+    this.handle()?.send(event);
+    if (!DRAFT_EVENT_NAMES.has(event.name)) return;
+
+    const root = this.root();
+    if (!root) return;
+
+    const data = this.widget.data as unknown as Record<string, unknown>;
+    this.applyDraft(applyConfigDraftEvent(root, data, event));
+  }
+
+  private applyDraft(next: Record<string, unknown>): void {
+    const data = this.widget.data as unknown as Record<string, unknown>;
+
+    for (const key of Object.keys(data)) {
+      if (!(key in next)) delete data[key];
+    }
+
+    Object.assign(data, next);
+    this.treeDraft = structuredClone(this.widget.data);
+    this.previewData.set({ ...data });
+  }
+}
+
+function findRegion(root: UiNode | null, type: string): UiNode | null {
+  return root?.children?.find(child => child.type === type) ?? null;
+}
+
+function singleChangedKey(before: Draft | null, after: Draft): string | null {
+  if (!before) return null;
+  const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter(key => !deepEqual(before[key], after[key]));
+  return changed.length === 1 ? changed[0] : null;
+}
+
+// Only colour inputs: every built-in top-level one binds its cell plainly, while other input types
+// include setters with side effects on other keys.
+function findColorField(node: UiNode, key: string): UiNode | null {
+  for (const child of [...(node.children ?? []), ...(node.fallback ? [node.fallback] : [])]) {
+    if (child.id === key) {
+      return child.type === UiConfigPrimitives.Color
+        && child.properties?.[UiConfigProperties.Transient] !== true
+        && emitsEvent(child, UiConfigEvents.Change) ? child : null;
+    }
+    if (child.type === UiConfigPrimitives.Object || child.type === UiConfigPrimitives.Array) continue;
+
+    const found = findColorField(child, key);
+    if (found) return found;
+  }
+  return null;
+}
+
+function foldChanges(before: Draft, after: Draft, data: Draft): Draft {
+  const result = { ...data };
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (deepEqual(before[key], after[key])) continue;
+    if (key in after) result[key] = after[key];
+    else delete result[key];
+  }
+  return result;
+}

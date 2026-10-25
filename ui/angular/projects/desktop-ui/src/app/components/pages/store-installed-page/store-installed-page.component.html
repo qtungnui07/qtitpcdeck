@@ -1,0 +1,59 @@
+<div class="store-page" (scroll)="onScroll($event)">
+  <div class="store-page-content">
+    <app-store-page-header active="installed" [subtitle]="updatesSummary()">
+      <shared-button
+        storeHeaderAction
+        variant="primary"
+        [disabled]="updates.count() === 0 || updateAllBusy()"
+        [loading]="updates.installing()"
+        (click)="onUpdateAll()">
+        <span class="icon icon-refresh icon-sm" aria-hidden="true"></span>
+        <span>{{ 'macrodeck.app:Store.Page.UpdateAllAction' | translate }}</span>
+      </shared-button>
+    </app-store-page-header>
+
+    <app-store-community-notice />
+
+    @if (loadError()) {
+      <shared-error-banner [message]="loadError()!" (dismiss)="loadError.set(null)" />
+    }
+
+    <div class="store-sections">
+      @if (loaded() && items().length === 0 && !loadError()) {
+        <shared-empty-state
+          icon="store"
+          [heading]="'macrodeck.app:Store.Page.InstalledEmptyHeading' | translate"
+          [message]="'macrodeck.app:Store.Page.InstalledEmptyMessage' | translate" />
+      } @else {
+        <shared-store-section
+          [items]="items()"
+          [updatesAvailable]="updatesAvailable"
+          (install)="onInstall($event)"
+          (installUnsigned)="onInstallUnsigned($event)"
+          (retry)="onRetry($event)"
+          (uninstall)="onUninstallRequested($event)"
+          (checkForUpdates)="onCheckForUpdates()" />
+
+        @if (hasMore() && !loadError()) {
+          <div class="store-load-more">
+            <shared-button variant="secondary" [loading]="loadingMore()" (click)="onLoadMore()">
+              {{ 'macrodeck.app:Store.Page.LoadMoreAction' | translate }}
+            </shared-button>
+          </div>
+        }
+      }
+    </div>
+
+    <app-store-footer />
+  </div>
+</div>
+
+@if (pendingUninstall()) {
+  <shared-confirmation-modal
+    [heading]="'macrodeck.app:Store.UninstallHeading' | translate"
+    [message]="uninstallMessage()"
+    [confirmText]="'macrodeck.app:Store.Uninstall' | translate"
+    [danger]="true"
+    (confirm)="confirmUninstall()"
+    (cancel)="cancelUninstall()" />
+}

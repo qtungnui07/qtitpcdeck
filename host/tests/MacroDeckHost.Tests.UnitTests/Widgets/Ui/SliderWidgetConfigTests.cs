@@ -1,0 +1,589 @@
+using System.Text.Json;
+using MacroDeck.Sdk.Ui;
+using MacroDeck.Ui.Components;
+using MacroDeck.Ui.Config;
+using MacroDeck.Ui.Model.Nodes;
+using MacroDeck.Ui.Model.Surfaces;
+using MacroDeck.Ui.Testing;
+using MacroDeckHost.Application.Variables;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Domain.Common;
+using MacroDeckHost.Domain.Entities;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Domain.Widgets;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using MacroDeckHost.Tests.UnitTests.Triggers;
+using MacroDeckHost.Widgets.Preview;
+using MacroDeckHost.Widgets.Slider;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace MacroDeckHost.Tests.UnitTests.Widgets.Ui;
+
+/// <summary>
+/// The Slider widget's <c>widget-config</c> tree (issue #837): every key the shipped schema declares for it,
+/// the per-field <c>min</c>/<c>max</c>/<c>step</c> fallback the bound variable's own declared bounds
+/// override, and the provider's decline of a foreign widget type.
+/// </summary>
+[TestFixture]
+public class SliderWidgetConfigTests
+{
+	private const string BoundVariable = "vol";
+
+	private static readonly object _stored = new
+	{
+		label = "Volume",
+		showLabel = true,
+		showValue = true,
+		orientation = "horizontal",
+		interaction = "absolute",
+		color = "#111111",
+		labelColor = "#222222",
+		backgroundColor = "#333333",
+		border = new { style = "static", color = "#ff0000" },
+		valueVariable = BoundVariable,
+		min = 0,
+		max = 100,
+		step = 1
+	};
+
+	[Test]
+	public void Editing_every_control_still_validates_against_the_slider_schema()
+	{
+		var host = Render(_stored, Registry());
+
+		host.ById("label").Change("Master");
+		host.ById("showLabel").Change(false);
+		host.ById("showValue").Change(false);
+		host.ById("orientation").Change("vertical");
+		host.ById("interaction").Change("relative");
+		host.ById("color").Change("#444444");
+		host.ById("labelColor").Change("#555555");
+		host.ById("backgroundColor").Change("#666666");
+		host.ById("border.style").Change("comet");
+		host.ById("border.color").Change("#00ff00");
+		host.ById("min").Change(-60);
+		host.ById("max").Change(0);
+		host.ById("step").Change(0.5);
+
+		var composed = Compose(host);
+		var provider = new WidgetDataSchemaProvider(new WidgetTypeRegistry(new RecordingMediator()));
+
+		Assert.That(provider.TryGet(WidgetTypeIds.Slider, out var schema), Is.True);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetDataSchema.Validate(schema!, composed), Is.Empty);
+			Assert.That(composed.GetProperty("label").GetString(), Is.EqualTo("Master"));
+			Assert.That(composed.GetProperty("orientation").GetString(), Is.EqualTo("vertical"));
+			Assert.That(SliderWidgetData.Parse(composed).IsRelative, Is.True);
+			Assert.That(composed.GetProperty("min").GetDouble(), Is.EqualTo(-60));
+			Assert.That(composed.GetProperty("border").GetProperty("style").GetString(), Is.EqualTo("comet"));
+		});
+	}
+
+	[Test]
+	public void The_icon_colour_is_offered_only_while_an_icon_is_set_and_reads_back_what_was_picked()
+	{
+		var withoutIcon = Render(new { }, new VariableRegistry());
+		var withIcon = Render(new { icon = new { type = "icon-pack", reference = "abc" } }, new VariableRegistry());
+
+		withIcon.ById("iconColor").Change("#ef4444");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(withoutIcon, "iconColor"), Is.False);
+			Assert.That(WidgetConfigTestSupport.IsVisible(withIcon, "iconColor"), Is.True);
+			Assert.That(withIcon.ById("iconColor").Text(UiConfigProperties.Value), Is.EqualTo("#ef4444"));
+		});
+	}
+
+	[Test]
+	public void A_stored_icon_colour_is_shown_and_an_unset_one_saves_as_untinted()
+	{
+		var stored = Render(new { icon = new { type = "icon-pack", reference = "abc" }, iconColor = "#ef4444" },
+			new VariableRegistry());
+		var unset = Render(new { icon = new { type = "icon-pack", reference = "abc" } }, new VariableRegistry());
+
+		var saved = JsonSerializer.SerializeToElement(new
+		{
+			iconColor = unset.ById("iconColor").Text(UiConfigProperties.Value)
+		});
+		var provider = new WidgetDataSchemaProvider(new WidgetTypeRegistry(new RecordingMediator()));
+
+		Assert.That(provider.TryGet(WidgetTypeIds.Slider, out var schema), Is.True);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(stored.ById("iconColor").Text(UiConfigProperties.Value), Is.EqualTo("#ef4444"));
+			Assert.That(SliderWidgetData.Parse(saved).IconColor, Is.Null);
+			Assert.That(WidgetDataSchema.Validate(schema!,
+					JsonSerializer.SerializeToElement(new { iconColor = "#ef4444" })),
+				Is.Empty);
+		});
+	}
+
+	[Test]
+	public void A_bound_variable_declaring_its_own_minimum_hides_min_while_max_and_step_stay_visible()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable(-10, null, null));
+
+		var host = Render(new { valueVariable = BoundVariable }, registry);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "min"), Is.False);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "max"), Is.True);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "step"), Is.True);
+		});
+	}
+
+	[Test]
+	public void All_three_range_fields_are_visible_while_nothing_is_picked_since_slider_value_declares_no_range()
+	{
+		var host = Render(new { }, new VariableRegistry());
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "min"), Is.True);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "max"), Is.True);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "step"), Is.True);
+		});
+	}
+
+	[Test]
+	public void All_three_range_fields_are_visible_for_a_variable_declaring_no_bounds_of_its_own()
+	{
+		var host = Render(new { valueVariable = BoundVariable }, Registry());
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "min"), Is.True);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "max"), Is.True);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "step"), Is.True);
+		});
+	}
+
+	[Test]
+	public void A_variable_declaring_its_own_step_offers_a_custom_step_toggle_that_reveals_step()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable(0, 100, 1));
+
+		var host = Render(new { valueVariable = BoundVariable }, registry);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "customStep"), Is.True);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "step"), Is.False);
+		});
+
+		host.ById("customStep").Change(true);
+
+		Assert.That(WidgetConfigTestSupport.IsVisible(host, "step"), Is.True);
+	}
+
+	[Test]
+	public void The_custom_step_toggle_is_absent_where_the_widget_step_already_applies()
+	{
+		var unbound = Render(new { }, new VariableRegistry());
+		var undeclared = Render(new { valueVariable = BoundVariable }, Registry());
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(unbound, "customStep"), Is.False);
+			Assert.That(WidgetConfigTestSupport.IsVisible(undeclared, "customStep"), Is.False);
+		});
+	}
+
+	[Test]
+	public void Turning_the_custom_step_on_starts_from_the_step_the_variable_declares()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable(0, 1, 0.01));
+
+		var host = Render(new { valueVariable = BoundVariable, step = 1 }, registry);
+		host.ById("customStep").Change(true);
+
+		Assert.That(host.ById("step").Number(UiConfigProperties.Value), Is.EqualTo(0.01));
+	}
+
+	[Test]
+	public void A_stored_custom_step_is_offered_as_stored()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable(0, 100, 1));
+
+		var host = Render(new { valueVariable = BoundVariable, customStep = true, step = 5 }, registry);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(host.ById("customStep").Flag(UiConfigProperties.Value), Is.True);
+			Assert.That(host.ById("step").Number(UiConfigProperties.Value), Is.EqualTo(5));
+		});
+	}
+
+	[Test]
+	public void Picking_a_stepped_variable_then_turning_the_toggle_on_reveals_step()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable(BoundVariable, null, null, null));
+		registry.Upsert(Variable("stepped", 0, 100, 1));
+
+		var host = Render(new { valueVariable = BoundVariable, step = 5 }, registry);
+
+		host.ById("valueVariable").Change("stepped");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "step"), Is.False);
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "customStep"), Is.True);
+		});
+
+		host.ById("customStep").Change(true);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetConfigTestSupport.IsVisible(host, "step"), Is.True);
+			Assert.That(host.ById("step").Number(UiConfigProperties.Value), Is.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public void Switching_away_from_a_stepped_variable_offers_the_stored_step_not_the_variables()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable("stepped", 0, 1, 0.01));
+		registry.Upsert(Variable(BoundVariable, null, null, null));
+
+		var host = Render(new { valueVariable = "stepped", step = 5 }, registry);
+
+		host.ById("valueVariable").Change(BoundVariable);
+
+		Assert.That(host.ById("step").Number(UiConfigProperties.Value), Is.EqualTo(5));
+	}
+
+	[Test]
+	public void A_custom_step_still_validates_against_the_slider_schema()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable(null, null, 1));
+
+		var host = Render(new { valueVariable = BoundVariable }, registry);
+		host.ById("customStep").Change(true);
+		host.ById("step").Change(5);
+
+		var composed = JsonSerializer.SerializeToElement(new Dictionary<string, object?>
+		{
+			["valueVariable"] = host.ById("valueVariable").Text(UiConfigProperties.Value),
+			["customStep"] = host.ById("customStep").Flag(UiConfigProperties.Value),
+			["step"] = host.ById("step").Number(UiConfigProperties.Value)
+		});
+		var provider = new WidgetDataSchemaProvider(new WidgetTypeRegistry(new RecordingMediator()));
+
+		Assert.That(provider.TryGet(WidgetTypeIds.Slider, out var schema), Is.True);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(WidgetDataSchema.Validate(schema!, composed), Is.Empty);
+			Assert.That(composed.GetProperty("customStep").GetBoolean(), Is.True);
+			Assert.That(composed.GetProperty("step").GetDouble(), Is.EqualTo(5));
+		});
+	}
+
+	[Test]
+	public void The_editor_offers_double_tap_as_its_only_trigger_tab()
+	{
+		var host = Render(_stored, Registry());
+
+		var triggers = host.SingleByType(UiConfigPrimitives.ActionsListEditor).Property("triggers");
+
+		Assert.That(triggers?.EnumerateArray().Select(trigger => trigger.GetString()),
+			Is.EqualTo(new[] { WidgetTriggerTypes.DoublePress }));
+	}
+
+	[Test]
+	public void The_binding_sits_with_the_properties_and_the_editor_holds_only_the_actions()
+	{
+		var host = Render(_stored, Registry());
+
+		static string? RegionOf(UiTestNode node)
+		{
+			for (var current = node.Parent; current is not null; current = current.Parent)
+			{
+				if (current.Type is UiConfigPrimitives.WidgetProperties or UiConfigPrimitives.WidgetEditor)
+				{
+					return current.Type;
+				}
+			}
+
+			return null;
+		}
+
+		var editor = host.SingleByType(UiConfigPrimitives.WidgetEditor);
+
+		Assert.Multiple(() =>
+		{
+			foreach (var id in new[] { "valueVariable", "min", "max", "step" })
+			{
+				Assert.That(RegionOf(host.ById(id)), Is.EqualTo(UiConfigPrimitives.WidgetProperties), id);
+			}
+
+			Assert.That(editor.Children.Select(child => child.Type),
+				Is.EqualTo(new[] { UiConfigPrimitives.ActionsListEditor }));
+		});
+	}
+
+	[Test]
+	public void An_unbound_slider_still_offers_the_double_tap_actions()
+	{
+		var host = Render(new { label = "Volume" }, Registry());
+
+		Assert.That(host.ByType(UiConfigPrimitives.ActionsListEditor), Has.Count.EqualTo(1));
+	}
+
+	[Test]
+	public void The_label_field_is_not_literal_only_so_it_offers_the_variable_helper()
+	{
+		var host = Render(new { label = "Volume" }, Registry());
+
+		Assert.That(host.ById("label").HasProperty(UiConfigProperties.LiteralOnly), Is.False);
+	}
+
+	[TestCase(UiSurfaceKinds.Widget, true)]
+	[TestCase(UiSurfaceKinds.Preview, false)]
+	public async Task A_stored_double_tap_flow_makes_only_the_deck_tile_declare_double_press(string kind, bool expected)
+	{
+		var data = JsonSerializer.SerializeToElement(new
+		{
+			valueVariable = BoundVariable,
+			flows = """[{"triggerType":"onDoublePress","children":[{"type":"action"}]}]"""
+		});
+		var surface = new UiSurface
+		{
+			Kind = kind,
+			SessionMode = UiSessionModes.Shared,
+			Attributes = new Dictionary<string, JsonElement>(StringComparer.Ordinal)
+			{
+				[UiWidgetSurfaceAttributes.Data] = data,
+				[UiWidgetSurfaceAttributes.WidgetId] = JsonSerializer.SerializeToElement(Guid.NewGuid().ToString())
+			}
+		};
+
+		var session = await Provider()
+			.CreateSessionAsync(new UiSessionRequest { Surface = surface, UiModelVersion = 1 },
+				CancellationToken.None);
+		var track = Walk(session!.BuildTree().Root).Single(node => node.Type == UiComponents.Slider);
+		await session.DisposeAsync();
+
+		var declared = track.Properties.TryGetValue("events", out var events)
+			&& events.EnumerateArray().Any(name => name.GetString() == UiComponentEvents.DoublePress);
+
+		Assert.That(declared, Is.EqualTo(expected));
+	}
+
+	[Test]
+	public void A_stored_event_trigger_flow_reaches_the_editor_unchanged()
+	{
+		const string eventFlow =
+			"""{"triggerId":"evt1","triggerType":"onEvent","event":{"providerId":"macro-deck","eventId":"variable-changed"},"children":[{"type":"action"}]}""";
+		var host = Render(new { flows = $"[{eventFlow}]" }, Registry());
+
+		var value = host.SingleByType(UiConfigPrimitives.ActionsListEditor).Property(UiConfigProperties.Value);
+		var flow = value!.Value.EnumerateArray().Single();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(flow.GetProperty("triggerType").GetString(), Is.EqualTo(WidgetTriggerTypes.Event));
+			Assert.That(flow.GetProperty("event").GetProperty("eventId").GetString(), Is.EqualTo("variable-changed"));
+		});
+	}
+
+	[Test]
+	public void An_event_trigger_flow_alone_does_not_make_the_slider_wait_for_a_double_tap()
+	{
+		var data = JsonSerializer.SerializeToElement(new
+		{
+			flows
+				= """[{"triggerId":"evt1","triggerType":"onEvent","event":{"providerId":"macro-deck","eventId":"variable-changed"},"children":[{"type":"action"}]}]"""
+		});
+
+		Assert.That(SliderWidgetData.Parse(data).HasDoublePressFlow, Is.False);
+	}
+
+	[TestCase("""[{"triggerType":"onDoublePress","children":[{"type":"action"}]}]""", true)]
+	[TestCase("""[{"triggerType":"onDoublePress","children":[{"type":"action","disabled":true}]}]""", false)]
+	[TestCase("""[{"triggerType":"onDoublePress","children":[]}]""", false)]
+	[TestCase("""[{"triggerType":"onShortPress","children":[{"type":"action"}]}]""", false)]
+	public void Only_a_double_tap_flow_with_something_to_run_counts(string flows, bool expected)
+	{
+		var data = JsonSerializer.SerializeToElement(new { flows });
+
+		Assert.That(SliderWidgetData.Parse(data).HasDoublePressFlow, Is.EqualTo(expected));
+	}
+
+	private static IEnumerable<UiNode> Walk(UiNode node)
+	{
+		return node.Children.SelectMany(Walk).Prepend(node);
+	}
+
+	private static SliderWidgetUiProvider Provider()
+	{
+		return new SliderWidgetUiProvider(new FakeWidgetIconResources(),
+			new FakeHostLockState(),
+			new PassThroughSampleText(),
+			TimeProvider.System,
+			new VariableRegistry(),
+			new VariableChangeNotifier(),
+			new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
+			new SliderWidgetSessionTests.RecordingTriggerService(),
+			new StubFolderCache(),
+			new SliderWidgetSessionTests.NullUiTransport(),
+			new MacroDeckHost.Application.Rendering.WidgetRenderSignals(),
+			new Devices.Surfaces.StubIconPackCache());
+	}
+
+	[Test]
+	public async Task A_config_surface_naming_a_different_widget_type_is_declined()
+	{
+		var provider = Provider();
+
+		var surface = ConfigSurface(WidgetTypeIds.Clock, "{}");
+
+		var session = await provider.CreateSessionAsync(new UiSessionRequest { Surface = surface, UiModelVersion = 1 },
+			CancellationToken.None);
+
+		Assert.That(session, Is.Null);
+	}
+
+	// ---- resetting a customised colour (issue #896) ------------------------------------------------------
+
+	[Test]
+	public void Every_slider_colour_offers_a_reset_that_clears_it()
+	{
+		var host = Render(_stored, Registry());
+
+		foreach (var id in new[] { "color", "labelColor", "backgroundColor", "border.color" })
+		{
+			var node = host.ById(id);
+
+			Assert.Multiple(() =>
+			{
+				Assert.That(node.Flag(UiConfigProperties.SupportsReset), Is.True, id);
+				Assert.That(node.Text(UiConfigProperties.DefaultValue), Is.EqualTo(string.Empty), id);
+			});
+		}
+	}
+
+	private static VariableRegistry Registry()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(Variable(null, null, null));
+
+		return registry;
+	}
+
+	private static VariableEntity Variable(double? min, double? max, double? step)
+	{
+		return Variable(BoundVariable, min, max, step);
+	}
+
+	private static VariableEntity Variable(string name, double? min, double? max, double? step)
+	{
+		return new VariableEntity
+		{
+			Id = Guid.NewGuid(),
+			Name = name,
+			Scope = VariableScope.Global,
+			Type = VariableType.Numeric,
+			Classification = VariableClassification.User,
+			Value = "50",
+			Min = min,
+			Max = max,
+			Step = step,
+			UpdatedAt = DateTime.UtcNow
+		};
+	}
+
+	private static UiTestHost Render(object data, VariableRegistry variables)
+	{
+		return UiTestHost.Render(SliderWidgetConfigView.Build(JsonSerializer.SerializeToElement(data),
+			variables,
+			new Devices.Surfaces.StubIconPackCache()));
+	}
+
+	private static UiSurface ConfigSurface(string widgetType, string widgetData)
+	{
+		return new UiSurface
+		{
+			Kind = UiSurfaceKinds.Config,
+			SessionMode = UiSessionModes.Exclusive,
+			Attributes = new Dictionary<string, JsonElement>(StringComparer.Ordinal)
+			{
+				[UiConfigSurfaceAttributes.EntryPoint]
+					= JsonSerializer.SerializeToElement(UiConfigEntryPoints.WidgetConfig),
+				[UiConfigSurfaceAttributes.WidgetId] = JsonSerializer.SerializeToElement(Guid.NewGuid().ToString()),
+				[UiConfigSurfaceAttributes.WidgetType] = JsonSerializer.SerializeToElement(widgetType),
+				[UiConfigSurfaceAttributes.WidgetData] = JsonSerializer.Deserialize<JsonElement>(widgetData)
+			}
+		};
+	}
+
+	private static JsonElement Compose(UiTestHost host)
+	{
+		var border = new Dictionary<string, object?>
+		{
+			["style"] = host.ById("border.style").Text(UiConfigProperties.Value),
+			["color"] = host.ById("border.color").Text(UiConfigProperties.Value)
+		};
+
+		var data = new Dictionary<string, object?>
+		{
+			["label"] = host.ById("label").Text(UiConfigProperties.Value),
+			["showLabel"] = host.ById("showLabel").Flag(UiConfigProperties.Value),
+			["showValue"] = host.ById("showValue").Flag(UiConfigProperties.Value),
+			["orientation"] = host.ById("orientation").Text(UiConfigProperties.Value),
+			["interaction"] = host.ById("interaction").Text(UiConfigProperties.Value),
+			["color"] = host.ById("color").Text(UiConfigProperties.Value),
+			["labelColor"] = host.ById("labelColor").Text(UiConfigProperties.Value),
+			["backgroundColor"] = host.ById("backgroundColor").Text(UiConfigProperties.Value),
+			["border"] = border,
+			["valueVariable"] = host.ById("valueVariable").Text(UiConfigProperties.Value),
+			["min"] = host.ById("min").Number(UiConfigProperties.Value),
+			["max"] = host.ById("max").Number(UiConfigProperties.Value),
+			["step"] = host.ById("step").Number(UiConfigProperties.Value)
+		};
+
+		return JsonSerializer.SerializeToElement(data);
+	}
+
+	internal sealed class FakeWidgetIconResources : IWidgetIconResources
+	{
+		public Task<MacroDeck.Ui.Model.Resources.UiResource?> ResolveAsync(
+			WidgetIconReference? reference,
+			WidgetIconLimit limit,
+			CancellationToken cancellationToken)
+		{
+			return ResolveAsync(reference, cancellationToken);
+		}
+
+		public Task<MacroDeck.Ui.Model.Resources.UiResource?> ResolveAsync(
+			WidgetIconReference? reference,
+			CancellationToken cancellationToken)
+		{
+			return Task.FromResult<MacroDeck.Ui.Model.Resources.UiResource?>(null);
+		}
+
+		public void Evict(Guid iconId)
+		{
+		}
+	}
+
+	internal sealed class PassThroughSampleText : IWidgetSampleTextResolver
+	{
+		public ValueTask<string> ResolveAsync(MacroDeck.Localization.LocalizedString value)
+		{
+			return ValueTask.FromResult(value.ToString() ?? string.Empty);
+		}
+	}
+}

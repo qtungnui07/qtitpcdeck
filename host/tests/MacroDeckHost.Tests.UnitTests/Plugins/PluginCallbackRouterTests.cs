@@ -1,0 +1,2689 @@
+using System.Text.Json;
+using MacroDeck.Plugin.Protocol.Callbacks;
+using MacroDeck.Plugin.Protocol.Callbacks.Ui;
+using MacroDeck.Plugin.Protocol.Capabilities.DeviceProvider;
+using MacroDeck.Plugin.Protocol.Envelope;
+using MacroDeck.Plugin.Protocol.Errors;
+using MacroDeck.Plugin.Protocol.Serialization;
+using MacroDeckHost.Application.FolderViews;
+using MacroDeck.Localization;
+using MacroDeck.Plugin.Protocol.Capabilities.ScreenSaverProvider;
+using MacroDeckHost.Application.Ui.Modals;
+using MacroDeckHost.Application.Layouts;
+using MacroDeckHost.Application.ScreenSavers;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Application.Notifications;
+using MacroDeckHost.Infrastructure.Notifications;
+using MacroDeckHost.Application.Plugins;
+using MacroDeckHost.Application.Plugins.Capabilities;
+using MacroDeckHost.Application.Plugins.IconPacks;
+using MacroDeckHost.Application.Rendering;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Domain.Common;
+using MacroDeckHost.Domain.Entities;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Plugins.Capabilities.Callbacks;
+using MacroDeckHost.Tests.UnitTests.Auth;
+using MacroDeck.Sdk.Actions;
+using MacroDeck.Sdk.Decks;
+using MacroDeck.Sdk.MusicPlayer;
+using MacroDeck.Sdk.Scripts;
+using MacroDeck.Sdk.Variables;
+using MacroDeck.Sdk.Widgets;
+using Microsoft.Extensions.DependencyInjection;
+using DomainVariableType = MacroDeckHost.Domain.Enums.VariableType;
+using MacroDeckHost.Application.Ui.Resources;
+using MacroDeckHost.Application.Ui.Sessions;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using MacroDeckHost.Tests.UnitTests.VideoStreams;
+using MacroDeckHost.Application.Events;
+using MacroDeckHost.Application.Variables;
+using MacroDeckHost.Application.MusicPlayer;
+using MacroDeckHost.Application.VideoStreams;
+using MacroDeck.Plugin.Protocol.Capabilities.VideoStreamProvider;
+using MacroDeck.Sdk.VideoStreams;
+using MacroDeckHost.Application.HostLocking;
+
+namespace MacroDeckHost.Tests.UnitTests.Plugins;
+
+[TestFixture]
+public class PluginCallbackRouterTests
+{
+	private FakeVariableService _variableService = null!;
+	private FakeActionInteractions _actionInteractions = null!;
+	private FakeInvoker _invoker = null!;
+	private ManualTimeProvider _time = null!;
+
+	private static PluginCallbackRouter Router(
+		FakeVariableService variableService,
+		FakeActionInteractions actionInteractions,
+		FakeInvoker invoker,
+		HostCallbackThrottle throttle,
+		FakeHostLockState? lockState = null,
+		FakeScriptApi? scriptApi = null,
+		FakePluginDeviceRegistry? deviceRegistry = null,
+		ScreenSaverRegistry? screenSavers = null,
+		WidgetTypeRegistry? widgetTypes = null,
+		IPluginUiResources? uiResources = null,
+		UiResourceCallbackThrottle? uiResourceThrottle = null,
+		PluginSessionRegistry? sessionRegistry = null,
+		IUiSessionSink? uiSessions = null,
+		IPluginIconPackSync? iconPackSync = null,
+		IPluginIconPackUploads? iconPackUploads = null,
+		IPluginIconUiResources? pluginIconResources = null,
+		IPluginIconResolver? pluginIconResolver = null,
+		VideoStreamProviderRegistry? videoStreamProviders = null,
+		IVideoStreamSessionBroker? videoStreamSessions = null,
+		VideoStreamCallbackThrottle? videoStreamThrottle = null,
+		IMusicPlayerArtworkService? musicPlayerArtwork = null,
+		MusicPlayerArtworkCallbackThrottle? musicPlayerArtworkThrottle = null,
+		TimeSpan? musicPlayerArtworkTimeout = null,
+		INotificationManager? notificationManager = null,
+		PluginVariableHistoryWindows? variableHistory = null,
+		VariableHistoryReadThrottle? variableHistoryReadThrottle = null,
+		FakeUserVariableApi? userVariableApi = null)
+	{
+		var services = new ServiceCollection();
+		services.AddSingleton<IVariableService>(variableService);
+		var scopeFactory = services.BuildServiceProvider().GetRequiredService<IServiceScopeFactory>();
+
+		return new PluginCallbackRouter(
+			sessionRegistry ?? new PluginSessionRegistry(TimeProvider.System, Serilog.Core.Logger.None),
+			invoker,
+			scopeFactory,
+			new FakeNotificationStore(),
+			new FakeDeckNavigator(),
+			scriptApi ?? new FakeScriptApi(),
+			new FakeWidgetApi(),
+			new FakeWidgetIconInvalidator(),
+			userVariableApi ?? new FakeUserVariableApi(),
+			actionInteractions,
+			uiSessions ?? new NoOpUiSessionSink(),
+			deviceRegistry ?? new FakePluginDeviceRegistry(),
+			new LayoutRegistry(new RecordingMediator()),
+			new FolderViewRegistry(new RecordingMediator()),
+			widgetTypes ?? new WidgetTypeRegistry(new RecordingMediator()),
+			screenSavers ?? new ScreenSaverRegistry(new RecordingMediator()),
+			new ModalInteractionCoordinator(TimeProvider.System),
+			new RecordingUiTransport(),
+			throttle,
+			lockState ?? new FakeHostLockState(),
+			Serilog.Core.Logger.None,
+			uiResources: uiResources,
+			uiResourceThrottle: uiResourceThrottle,
+			iconPackSync: iconPackSync,
+			iconPackUploads: iconPackUploads,
+			pluginIconResources: pluginIconResources,
+			pluginIconResolver: pluginIconResolver,
+			videoStreamProviders: videoStreamProviders,
+			videoStreamSessions: videoStreamSessions,
+			videoStreamThrottle: videoStreamThrottle,
+			musicPlayerArtwork: musicPlayerArtwork,
+			musicPlayerArtworkThrottle: musicPlayerArtworkThrottle,
+			musicPlayerArtworkTimeout: musicPlayerArtworkTimeout,
+			notificationManager: notificationManager,
+			variableHistory: variableHistory,
+			variableHistoryReadThrottle: variableHistoryReadThrottle);
+	}
+
+	[SetUp]
+	public void SetUp()
+	{
+		_variableService = new FakeVariableService();
+		_actionInteractions = new FakeActionInteractions();
+		_invoker = new FakeInvoker();
+		_time = new ManualTimeProvider();
+	}
+
+	private PluginCallbackRouter Router(
+		int throttleCapacity = 100,
+		FakeHostLockState? lockState = null,
+		FakeScriptApi? scriptApi = null,
+		FakePluginDeviceRegistry? deviceRegistry = null,
+		ScreenSaverRegistry? screenSavers = null,
+		WidgetTypeRegistry? widgetTypes = null)
+	{
+		return Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, throttleCapacity, 100),
+			lockState,
+			scriptApi,
+			deviceRegistry,
+			screenSavers,
+			widgetTypes);
+	}
+
+	// ---- ui resources ---------------------------------------------------------------------------
+
+	private PluginCallbackRouter UiResourceRouter(
+		RecordingUiResources resources,
+		int sharedCapacity = 100,
+		int resourceCapacity = 100)
+	{
+		return Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, sharedCapacity, 0),
+			uiResources: resources,
+			uiResourceThrottle: new UiResourceCallbackThrottle(_time, resourceCapacity, 0));
+	}
+
+	private static HostInvokePayload RegisterResource(string name = "photo")
+	{
+		return new HostInvokePayload
+		{
+			Api = HostApis.Ui,
+			Operation = HostOperations.Ui.RegisterResource,
+			Arguments = Arg(new UiRegisterResourceArguments
+				{ Name = name, ContentHash = "sha256:abc", MediaType = "image/png" })
+		};
+	}
+
+	[Test]
+	public async Task A_resource_registration_is_made_for_the_calling_plugins_session_and_answers_the_handle()
+	{
+		var resources = new RecordingUiResources();
+		var router = UiResourceRouter(resources);
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterResource(), CancellationToken.None);
+
+		var answer = result.Data?.Deserialize<UiRegisterResourceResult>(PluginProtocolJson.Options);
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(resources.Calls, Is.EqualTo(new[] { ("plugin.a", "session-1", "photo") }));
+			Assert.That(answer?.Resource?.ResourceId, Is.EqualTo("plugin-x.photo"));
+			Assert.That(answer?.Resource?.ContentHash, Is.EqualTo("sha256:abc"));
+		});
+	}
+
+	[Test]
+	public async Task A_resource_registration_without_a_session_is_refused_as_retryable()
+	{
+		var resources = new RecordingUiResources();
+		var router = UiResourceRouter(resources);
+
+		var result = await router.RouteAsync("plugin.a", "c1", RegisterResource(), CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.SessionNotFound));
+			Assert.That(result.Error?.Retryable, Is.True);
+			Assert.That(resources.Calls, Is.Empty);
+		});
+	}
+
+	[TestCase(PluginUiResourceOutcome.QuotaExceeded, ProtocolErrorCodes.UiResourceQuotaExceeded)]
+	[TestCase(PluginUiResourceOutcome.InvalidName, ProtocolErrorCodes.InvalidPayload)]
+	[TestCase(PluginUiResourceOutcome.MediaTypeMismatch, ProtocolErrorCodes.InvalidPayload)]
+	[TestCase(PluginUiResourceOutcome.SessionNotCurrent, ProtocolErrorCodes.SessionNotFound)]
+	public async Task A_refused_registration_answers_its_protocol_error(PluginUiResourceOutcome outcome, string code)
+	{
+		var router = UiResourceRouter(new RecordingUiResources { Outcome = outcome });
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterResource(), CancellationToken.None);
+
+		Assert.That(result.Error?.Code, Is.EqualTo(code));
+	}
+
+	[Test]
+	public async Task Resource_registrations_do_not_spend_the_plugins_shared_callback_budget()
+	{
+		var router = UiResourceRouter(new RecordingUiResources(), 1);
+
+		for (var index = 0; index < 20; index++)
+		{
+			var result = await router.RouteAsync("plugin.a",
+				"session-1",
+				"c" + index,
+				RegisterResource($"photo-{index}"),
+				CancellationToken.None);
+			Assert.That(result.Error, Is.Null);
+		}
+
+		Assert.That(router.Admit("plugin.a",
+				new HostInvokePayload
+				{
+					Api = HostApis.Variables, Operation = HostOperations.Variables.List
+				}),
+			Is.Null);
+	}
+
+	[Test]
+	public async Task Resource_registrations_beyond_their_own_budget_are_rate_limited()
+	{
+		var router = UiResourceRouter(new RecordingUiResources(), resourceCapacity: 2);
+
+		await router.RouteAsync("plugin.a", "session-1", "c1", RegisterResource(), CancellationToken.None);
+		await router.RouteAsync("plugin.a", "session-1", "c2", RegisterResource(), CancellationToken.None);
+		var third = await router.RouteAsync("plugin.a", "session-1", "c3", RegisterResource(), CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(third.Error?.Code, Is.EqualTo(ProtocolErrorCodes.RateLimited));
+			Assert.That(third.Error?.Retryable, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task A_burst_of_ui_patches_is_still_not_throttled()
+	{
+		var router = UiResourceRouter(new RecordingUiResources(), 1, 1);
+
+		for (var index = 0; index < 100; index++)
+		{
+			var result = await router.RouteAsync("plugin.a",
+				"session-1",
+				"c" + index,
+				new HostInvokePayload
+				{
+					Api = HostApis.Ui,
+					Operation = HostOperations.Ui.Patch,
+					Arguments = Arg(new UiPatchArguments
+						{ SessionId = "ui-1", Patch = JsonSerializer.SerializeToElement(new { }) })
+				},
+				CancellationToken.None);
+			Assert.That(result.Error?.Code, Is.Not.EqualTo(ProtocolErrorCodes.RateLimited));
+		}
+	}
+
+	[Test]
+	public async Task Removing_a_resource_is_made_for_the_calling_plugins_session()
+	{
+		var resources = new RecordingUiResources();
+		var router = UiResourceRouter(resources);
+
+		var result = await router.RouteAsync("plugin.a",
+			"session-1",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Ui,
+				Operation = HostOperations.Ui.RemoveResource,
+				Arguments = Arg(new UiRemoveResourceArguments { Name = "photo" })
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(resources.Removed, Is.EqualTo(new[] { ("plugin.a", "session-1", "photo") }));
+		});
+	}
+
+	private PluginCallbackRouter ArtworkRouter(
+		RecordingUiResources resources,
+		FakeMusicPlayerArtworkService? artwork,
+		int artworkCapacity = 100)
+	{
+		return Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 1, 0),
+			uiResources: resources,
+			uiResourceThrottle: new UiResourceCallbackThrottle(_time, 100, 0),
+			musicPlayerArtwork: artwork,
+			musicPlayerArtworkThrottle: new MusicPlayerArtworkCallbackThrottle(_time, artworkCapacity, 0));
+	}
+
+	private PluginCallbackRouter TimeoutArtworkRouter(
+		RecordingUiResources resources,
+		IMusicPlayerArtworkService artwork)
+	{
+		return Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 1, 0),
+			uiResources: resources,
+			musicPlayerArtwork: artwork,
+			musicPlayerArtworkTimeout: TimeSpan.FromMilliseconds(50));
+	}
+
+	private static HostInvokePayload RegisterArtwork(
+		string name = "cover",
+		string instanceId = "net.example.jukebox::default",
+		string artworkId = "cover-1",
+		int? maxSize = null)
+	{
+		return new HostInvokePayload
+		{
+			Api = HostApis.Ui,
+			Operation = HostOperations.Ui.RegisterMusicPlayerArtwork,
+			Arguments = Arg(new UiRegisterMusicPlayerArtworkArguments
+				{ Name = name, InstanceId = instanceId, ArtworkId = artworkId, MaxSize = maxSize })
+		};
+	}
+
+	[Test]
+	public async Task Artwork_asked_for_at_a_size_is_looked_up_at_that_size()
+	{
+		var artwork = new FakeMusicPlayerArtworkService
+			{ Image = new ArtworkImageResult([1, 2], "image/webp", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources(), artwork);
+
+		var result = await router.RouteAsync("plugin.a",
+			"session-1",
+			"c1",
+			RegisterArtwork(maxSize: 256),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(artwork.Requests, Is.EqualTo(new[] { ("net.example.jukebox::default", "cover-1", (int?)256) }));
+		});
+	}
+
+	[TestCase(0)]
+	[TestCase(-128)]
+	public async Task An_artwork_size_that_is_not_positive_is_refused_before_the_player_is_asked(int maxSize)
+	{
+		var artwork = new FakeMusicPlayerArtworkService { Image = new ArtworkImageResult([1], "image/webp", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources(), artwork);
+
+		var result = await router.RouteAsync("plugin.a",
+			"session-1",
+			"c1",
+			RegisterArtwork(maxSize: maxSize),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+			Assert.That(artwork.Requests, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task Artwork_of_another_plugins_player_is_registered_for_the_calling_plugins_session()
+	{
+		var resources = new RecordingUiResources();
+		var artwork = new FakeMusicPlayerArtworkService
+			{ Image = new ArtworkImageResult([1, 2, 3], "image/webp", "\"e\"") };
+		var router = ArtworkRouter(resources, artwork);
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+
+		var answer = result.Data?.Deserialize<UiRegisterMusicPlayerArtworkResult>(PluginProtocolJson.Options);
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(artwork.Requests,
+				Is.EqualTo(new[] { ("net.example.jukebox::default", "cover-1", (int?)null) }));
+			Assert.That(resources.ContentCalls, Has.Count.EqualTo(1));
+			Assert.That(resources.ContentCalls[0].PluginId, Is.EqualTo("plugin.a"));
+			Assert.That(resources.ContentCalls[0].SessionId, Is.EqualTo("session-1"));
+			Assert.That(resources.ContentCalls[0].Name, Is.EqualTo("cover"));
+			Assert.That(resources.ContentCalls[0].Content, Is.EqualTo(new byte[] { 1, 2, 3 }));
+			Assert.That(resources.ContentCalls[0].MediaType, Is.EqualTo("image/webp"));
+			Assert.That(answer?.Resource?.ResourceId, Is.EqualTo("plugin-x.cover"));
+		});
+	}
+
+	[Test]
+	public async Task Artwork_the_host_does_not_have_answers_no_resource_and_registers_nothing()
+	{
+		var resources = new RecordingUiResources();
+		var router = ArtworkRouter(resources, new FakeMusicPlayerArtworkService());
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+
+		var answer = result.Data?.Deserialize<UiRegisterMusicPlayerArtworkResult>(PluginProtocolJson.Options);
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(answer, Is.Not.Null);
+			Assert.That(answer!.Resource, Is.Null);
+			Assert.That(resources.ContentCalls, Is.Empty);
+		});
+	}
+
+	[TestCase(PluginUiResourceOutcome.QuotaExceeded, ProtocolErrorCodes.UiResourceQuotaExceeded)]
+	[TestCase(PluginUiResourceOutcome.TooLarge, ProtocolErrorCodes.AssetTooLarge)]
+	[TestCase(PluginUiResourceOutcome.UnsupportedMediaType, ProtocolErrorCodes.InvalidPayload)]
+	[TestCase(PluginUiResourceOutcome.SessionNotCurrent, ProtocolErrorCodes.SessionNotFound)]
+	public async Task Artwork_that_cannot_be_registered_answers_its_protocol_error(
+		PluginUiResourceOutcome outcome,
+		string code)
+	{
+		var artwork = new FakeMusicPlayerArtworkService
+			{ Image = new ArtworkImageResult([1], "image/svg+xml", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources { Outcome = outcome }, artwork);
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+
+		Assert.That(result.Error?.Code, Is.EqualTo(code));
+	}
+
+	[Test]
+	public async Task Artwork_of_an_unsupported_type_is_refused_as_permanent_and_names_the_type()
+	{
+		var artwork = new FakeMusicPlayerArtworkService
+			{ Image = new ArtworkImageResult([1], "image/svg+xml", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources { Outcome = PluginUiResourceOutcome.UnsupportedMediaType },
+			artwork);
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Retryable, Is.Not.True);
+			Assert.That(result.Error?.Message, Does.Contain("image/svg+xml"));
+		});
+	}
+
+	[TestCase("not a name!", "net.example.jukebox::default", "cover-1")]
+	[TestCase("cover", "", "cover-1")]
+	[TestCase("cover", "net.example.jukebox::default", "")]
+	public async Task An_invalid_artwork_request_is_refused_before_the_host_looks_anything_up(
+		string name,
+		string instanceId,
+		string artworkId)
+	{
+		var artwork = new FakeMusicPlayerArtworkService { Image = new ArtworkImageResult([1], "image/png", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources(), artwork);
+
+		var result = await router.RouteAsync("plugin.a",
+			"session-1",
+			"c1",
+			RegisterArtwork(name, instanceId, artworkId),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+			Assert.That(artwork.Requests, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task An_artwork_id_beyond_the_length_limit_is_refused()
+	{
+		var artwork = new FakeMusicPlayerArtworkService();
+		var router = ArtworkRouter(new RecordingUiResources(), artwork);
+
+		var result = await router.RouteAsync("plugin.a",
+			"session-1",
+			"c1",
+			RegisterArtwork(artworkId: new string('a', 513)),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+			Assert.That(artwork.Requests, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task Artwork_requests_beyond_their_own_budget_are_rate_limited_before_reaching_the_player()
+	{
+		var artwork = new FakeMusicPlayerArtworkService { Image = new ArtworkImageResult([1], "image/png", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources(), artwork, 2);
+
+		await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+		await router.RouteAsync("plugin.a", "session-1", "c2", RegisterArtwork(), CancellationToken.None);
+		var third = await router.RouteAsync("plugin.a", "session-1", "c3", RegisterArtwork(), CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(third.Error?.Code, Is.EqualTo(ProtocolErrorCodes.RateLimited));
+			Assert.That(third.Error?.Retryable, Is.True);
+			Assert.That(artwork.Requests, Has.Count.EqualTo(2));
+		});
+	}
+
+	[Test]
+	public async Task Artwork_requests_do_not_spend_the_plugins_shared_callback_budget()
+	{
+		var artwork = new FakeMusicPlayerArtworkService { Image = new ArtworkImageResult([1], "image/png", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources(), artwork);
+
+		for (var index = 0; index < 10; index++)
+		{
+			await router.RouteAsync("plugin.a", "session-1", "c" + index, RegisterArtwork(), CancellationToken.None);
+		}
+
+		Assert.That(router.Admit("plugin.a",
+				new HostInvokePayload
+				{
+					Api = HostApis.Variables, Operation = HostOperations.Variables.List
+				}),
+			Is.Null);
+	}
+
+	[Test]
+	public async Task An_artwork_lookup_the_player_never_answers_ends_as_a_retryable_timeout_and_registers_nothing()
+	{
+		var resources = new RecordingUiResources();
+		var router = TimeoutArtworkRouter(resources, new NeverAnsweringArtworkService());
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.Timeout));
+			Assert.That(result.Error?.Retryable, Is.True);
+			Assert.That(resources.ContentCalls, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task Artwork_that_arrives_empty_is_treated_as_no_artwork()
+	{
+		var resources = new RecordingUiResources();
+		var artwork = new FakeMusicPlayerArtworkService { Image = new ArtworkImageResult([], "image/png", "\"e\"") };
+		var router = ArtworkRouter(resources, artwork);
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+
+		var answer = result.Data?.Deserialize<UiRegisterMusicPlayerArtworkResult>(PluginProtocolJson.Options);
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(answer!.Resource, Is.Null);
+			Assert.That(resources.ContentCalls, Is.Empty);
+		});
+	}
+
+	private sealed class NeverAnsweringArtworkService : IMusicPlayerArtworkService
+	{
+		public string GetETag(string artworkId, int? size)
+		{
+			return "\"" + artworkId + "\"";
+		}
+
+		public async Task<ArtworkImageResult?> GetImage(
+			string instanceId,
+			string artworkId,
+			int? size,
+			CancellationToken cancellationToken)
+		{
+			await Task.Delay(Timeout.Infinite, cancellationToken);
+
+			return null;
+		}
+
+		public Task<ArtworkImageResult?> GetImage(
+			MusicPlayerVariant variant,
+			string artworkId,
+			int? size,
+			CancellationToken cancellationToken)
+		{
+			throw new NotSupportedException();
+		}
+	}
+
+	[Test]
+	public async Task A_host_without_an_artwork_service_answers_the_operation_as_unsupported()
+	{
+		var router = ArtworkRouter(new RecordingUiResources(), null);
+
+		var result = await router.RouteAsync("plugin.a", "session-1", "c1", RegisterArtwork(), CancellationToken.None);
+
+		Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnsupported));
+	}
+
+	[Test]
+	public async Task Artwork_registration_without_a_session_is_refused_as_retryable()
+	{
+		var artwork = new FakeMusicPlayerArtworkService { Image = new ArtworkImageResult([1], "image/png", "\"e\"") };
+		var router = ArtworkRouter(new RecordingUiResources(), artwork);
+
+		var result = await router.RouteAsync("plugin.a", "c1", RegisterArtwork(), CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.SessionNotFound));
+			Assert.That(result.Error?.Retryable, Is.True);
+			Assert.That(artwork.Requests, Is.Empty);
+		});
+	}
+
+	private sealed class FakeMusicPlayerArtworkService : IMusicPlayerArtworkService
+	{
+		public ArtworkImageResult? Image { get; init; }
+
+		public List<(string InstanceId, string ArtworkId, int? Size)> Requests { get; } = [];
+
+		public string GetETag(string artworkId, int? size)
+		{
+			return "\"" + artworkId + "\"";
+		}
+
+		public Task<ArtworkImageResult?> GetImage(
+			string instanceId,
+			string artworkId,
+			int? size,
+			CancellationToken cancellationToken)
+		{
+			Requests.Add((instanceId, artworkId, size));
+
+			return Task.FromResult(Image);
+		}
+
+		public Task<ArtworkImageResult?> GetImage(
+			MusicPlayerVariant variant,
+			string artworkId,
+			int? size,
+			CancellationToken cancellationToken)
+		{
+			throw new NotSupportedException();
+		}
+	}
+
+	private sealed class RecordingUiResources : IPluginUiResources
+	{
+		public List<(string PluginId, string SessionId, string Name)> Calls { get; } = [];
+
+		public List<(string PluginId, string SessionId, string Name)> Removed { get; } = [];
+
+		public PluginUiResourceOutcome Outcome { get; init; } = PluginUiResourceOutcome.Registered;
+
+		public PluginUiResourceResult Register(
+			string pluginId,
+			string sessionId,
+			string name,
+			string contentHash,
+			string mediaType)
+		{
+			Calls.Add((pluginId, sessionId, name));
+
+			return Outcome == PluginUiResourceOutcome.Registered
+				? new PluginUiResourceResult(Outcome,
+					new MacroDeck.Ui.Model.Resources.UiResource
+					{
+						ResourceId = "plugin-x." + name, ContentHash = contentHash, MediaType = mediaType,
+						ByteLength = 3
+					})
+				: new PluginUiResourceResult(Outcome);
+		}
+
+		public List<(string PluginId, string SessionId, string Name, byte[] Content, string MediaType)> ContentCalls
+		{
+			get;
+		} = [];
+
+		public PluginUiResourceResult RegisterContent(
+			string pluginId,
+			string sessionId,
+			string name,
+			byte[] content,
+			string mediaType)
+		{
+			ContentCalls.Add((pluginId, sessionId, name, content, mediaType));
+
+			return Outcome == PluginUiResourceOutcome.Registered
+				? new PluginUiResourceResult(Outcome,
+					new MacroDeck.Ui.Model.Resources.UiResource
+					{
+						ResourceId = "plugin-x." + name, ContentHash = "sha256:art", MediaType = mediaType,
+						ByteLength = content.Length
+					})
+				: new PluginUiResourceResult(Outcome);
+		}
+
+		public PluginUiResourceResult Remove(string pluginId, string sessionId, string name)
+		{
+			Removed.Add((pluginId, sessionId, name));
+			return new PluginUiResourceResult(PluginUiResourceOutcome.Removed);
+		}
+	}
+
+	// ---- security: ownership containment -----------------------------------------------------
+
+	[Test]
+	public async Task A_plugin_registers_devices_in_its_own_name_only()
+	{
+		var registry = new FakePluginDeviceRegistry();
+		var router = Router(deviceRegistry: registry);
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Devices,
+				Operation = HostOperations.Devices.Register,
+				Arguments = Arg(new DevicesRegisterArguments
+				{
+					Device = new DeviceDescriptorDto { Id = "SERIAL-1", Name = "Deck" }
+				})
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(registry.AssignedIdOf("plugin.a", "SERIAL-1"), Is.Not.Null);
+			Assert.That(registry.AssignedIdOf("plugin.b", "SERIAL-1"), Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task A_plugin_registers_and_withdraws_screensavers_in_its_own_name_only()
+	{
+		var screenSavers = new ScreenSaverRegistry(new RecordingMediator());
+		var router = Router(screenSavers: screenSavers);
+
+		var registered = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.ScreenSavers,
+				Operation = HostOperations.ScreenSavers.Register,
+				Arguments = Arg(new ScreenSaversRegisterArguments
+				{
+					ScreenSaver = new ScreenSaverDescriptorDto
+						{ Id = "photos", Name = LocalizedText.FromLiteral("Photos") }
+				})
+			},
+			CancellationToken.None);
+		var id = registered.Data!.Value.Deserialize<ScreenSaversRegisterResult>(PluginProtocolJson.Options)!;
+
+		await router.RouteAsync("plugin.b",
+			"c2",
+			new HostInvokePayload
+			{
+				Api = HostApis.ScreenSavers,
+				Operation = HostOperations.ScreenSavers.Unregister,
+				Arguments = Arg(new ScreenSaversUnregisterArguments { ScreenSaverId = "photos" })
+			},
+			CancellationToken.None);
+		var stillThere = screenSavers.TryResolve(id.ScreenSaverId, out _);
+
+		await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.ScreenSavers,
+				Operation = HostOperations.ScreenSavers.Unregister,
+				Arguments = Arg(new ScreenSaversUnregisterArguments { ScreenSaverId = "photos" })
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(registered.Error, Is.Null);
+			Assert.That(id.ScreenSaverId, Is.EqualTo("plugin.a::photos"));
+			Assert.That(stillThere, Is.True, "another plugin must not withdraw it");
+			Assert.That(screenSavers.TryResolve(id.ScreenSaverId, out _), Is.False);
+		});
+	}
+
+	[TestCase("""{"widgetType":{"id":"panel","name":"Panel"}}""", false)]
+	[TestCase("""{"widgetType":{"id":"panel","name":"Panel","supportsFlows":true}}""", true)]
+	public async Task A_widget_type_runs_its_flows_only_when_its_registration_says_so(
+		string arguments,
+		bool expected)
+	{
+		var widgetTypes = new WidgetTypeRegistry(new RecordingMediator());
+		var router = Router(widgetTypes: widgetTypes);
+
+		var registered = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.WidgetTypes,
+				Operation = HostOperations.WidgetTypes.Register,
+				Arguments = JsonDocument.Parse(arguments).RootElement.Clone()
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(registered.Error, Is.Null);
+			Assert.That(widgetTypes.TryResolve("plugin.a::panel", out var entry), Is.True);
+			Assert.That(entry.Descriptor.SupportsFlows, Is.EqualTo(expected));
+		});
+	}
+
+	[TestCase("""{"widgetType":{"id":"panel","name":"Panel"}}""", null)]
+	[TestCase("""{"widgetType":{"id":"panel","name":"Panel","defaultShortPressAction":{"actionId":"open"}}}""", "open")]
+	public async Task A_widget_type_has_a_default_short_press_action_only_when_its_registration_names_one(
+		string arguments,
+		string? expected)
+	{
+		var widgetTypes = new WidgetTypeRegistry(new RecordingMediator());
+		var router = Router(widgetTypes: widgetTypes);
+
+		var registered = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.WidgetTypes,
+				Operation = HostOperations.WidgetTypes.Register,
+				Arguments = JsonDocument.Parse(arguments).RootElement.Clone()
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(registered.Error, Is.Null);
+			Assert.That(widgetTypes.TryResolve("plugin.a::panel", out var entry), Is.True);
+			Assert.That(entry.Descriptor.DefaultShortPressAction?.ActionId, Is.EqualTo(expected));
+		});
+	}
+
+	[Test]
+	public async Task A_widget_type_whose_default_short_press_action_names_no_action_is_not_registered()
+	{
+		var widgetTypes = new WidgetTypeRegistry(new RecordingMediator());
+		var router = Router(widgetTypes: widgetTypes);
+
+		var registered = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.WidgetTypes,
+				Operation = HostOperations.WidgetTypes.Register,
+				Arguments = JsonDocument.Parse(
+						"""{"widgetType":{"id":"panel","name":"Panel","defaultShortPressAction":{"actionId":""}}}""")
+					.RootElement.Clone()
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(registered.Error, Is.Not.Null);
+			Assert.That(widgetTypes.TryResolve("plugin.a::panel", out _), Is.False);
+		});
+	}
+
+	[TestCase("""{"widgetType":{"id":"panel","name":"Panel"}}""", new int[0])]
+	[TestCase("""{"widgetType":{"id":"panel","name":"Panel","appearanceProperties":[0,1]}}""", new[] { 0, 1 })]
+	public async Task A_widget_type_declares_its_appearance_properties_only_when_its_registration_lists_them(
+		string arguments,
+		int[] expected)
+	{
+		var widgetTypes = new WidgetTypeRegistry(new RecordingMediator());
+		var router = Router(widgetTypes: widgetTypes);
+
+		var registered = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.WidgetTypes,
+				Operation = HostOperations.WidgetTypes.Register,
+				Arguments = JsonDocument.Parse(arguments).RootElement.Clone()
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(registered.Error, Is.Null);
+			Assert.That(widgetTypes.TryResolve("plugin.a::panel", out var entry), Is.True);
+			Assert.That(entry.Descriptor.AppearanceProperties?.Select(property => (int)property) ?? [],
+				Is.EqualTo(expected));
+		});
+	}
+
+	[Test]
+	public async Task A_device_registered_without_an_id_is_rejected_as_an_invalid_payload()
+	{
+		var router = Router();
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Devices,
+				Operation = HostOperations.Devices.Register,
+				Arguments = Arg(new DevicesRegisterArguments
+				{
+					Device = new DeviceDescriptorDto { Id = string.Empty, Name = "Deck" }
+				})
+			},
+			CancellationToken.None);
+
+		Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+	}
+
+	[Test]
+	public async Task A_plugin_cannot_take_another_plugins_device_offline()
+	{
+		var registry = new FakePluginDeviceRegistry();
+		var router = Router(deviceRegistry: registry);
+
+		await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Devices,
+				Operation = HostOperations.Devices.Register,
+				Arguments = Arg(new DevicesRegisterArguments
+				{
+					Device = new DeviceDescriptorDto { Id = "SERIAL-1", Name = "Deck" }
+				})
+			},
+			CancellationToken.None);
+
+		await router.RouteAsync("plugin.b",
+			"c2",
+			new HostInvokePayload
+			{
+				Api = HostApis.Devices,
+				Operation = HostOperations.Devices.Unregister,
+				Arguments = Arg(new DevicesUnregisterArguments { DeviceId = "SERIAL-1" })
+			},
+			CancellationToken.None);
+
+		Assert.That(registry.IsOnline("plugin.a", "SERIAL-1"), Is.True);
+	}
+
+	[Test]
+	public async Task A_plugin_cannot_read_another_plugins_variable_by_name()
+	{
+		var router = Router();
+
+		await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.Create,
+				Arguments = Arg(new VariablesCreateArguments
+					{ Name = "secret", Type = "Text", InitialValue = Arg("shh") })
+			},
+			CancellationToken.None);
+
+		var fromOtherPlugin = await router.RouteAsync("plugin.b",
+			"c2",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.Get,
+				Arguments = Arg(new VariablesGetArguments { Name = "secret" })
+			},
+			CancellationToken.None);
+
+		Assert.That(fromOtherPlugin.Error, Is.Null, "an unknown-to-this-plugin name is a null result, not an error");
+		Assert.That(fromOtherPlugin.Data, Is.Null, "the other plugin's variable is invisible, not merely unresolved");
+	}
+
+	[Test]
+	public async Task A_plugin_cannot_list_another_plugins_variables()
+	{
+		var router = Router();
+
+		await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.Create,
+				Arguments = Arg(new VariablesCreateArguments { Name = "a-only", Type = "Text" })
+			},
+			CancellationToken.None);
+
+		var listedByB = await router.RouteAsync("plugin.b",
+			"c2",
+			new HostInvokePayload { Api = HostApis.Variables, Operation = HostOperations.Variables.List },
+			CancellationToken.None);
+
+		var names = listedByB.Data!.Value.Deserialize<List<VariableHandle>>(PluginProtocolJson.Options)!;
+		Assert.That(names, Is.Empty);
+	}
+
+	[Test]
+	public async Task A_plugin_cannot_overwrite_another_plugins_variable_by_id()
+	{
+		var router = Router();
+
+		var created = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.Create,
+				Arguments = Arg(new VariablesCreateArguments { Name = "owned-by-a", Type = "Text" })
+			},
+			CancellationToken.None);
+
+		var handle = created.Data!.Value.Deserialize<VariableHandle>(PluginProtocolJson.Options)!;
+
+		var attackerWrite = await router.RouteAsync("plugin.b",
+			"c2",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.Set,
+				Arguments = Arg(new VariablesSetArguments { VariableId = handle.Id, Value = Arg("pwned") })
+			},
+			CancellationToken.None);
+
+		Assert.That(attackerWrite.Error, Is.Not.Null);
+		Assert.That(_variableService.ValueOf(handle.Id), Is.Not.EqualTo("pwned"));
+	}
+
+
+	[Test]
+	public async Task A_host_without_widget_data_or_variable_history_answers_those_operations_as_unsupported()
+	{
+		var router = Router();
+
+		var data = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Widgets,
+				Operation = HostOperations.Widgets.GetData,
+				Arguments = JsonSerializer.SerializeToElement(
+					new WidgetsGetDataArguments { WidgetId = Guid.NewGuid().ToString() },
+					PluginProtocolJson.Options)
+			},
+			CancellationToken.None);
+		var history = await router.RouteAsync("plugin.a",
+			"c2",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.HistoryOpen,
+				Arguments = JsonSerializer.SerializeToElement(
+					new VariablesHistoryOpenArguments { Name = "viewer_count", Capacity = 10 },
+					PluginProtocolJson.Options)
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(data.Error?.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnsupported));
+			Assert.That(history.Error?.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnsupported));
+		});
+	}
+
+	[Test]
+	public async Task Variable_history_reads_pass_once_per_second_per_window_and_a_tight_loop_is_refused()
+	{
+		var variables = new VariableRegistry();
+		var sessions = new PluginSessionRegistry(TimeProvider.System, Serilog.Core.Logger.None);
+		using var windows = new PluginVariableHistoryWindows(
+			new OwnedVariableHistory(new VariableHistory(variables, TimeProvider.System), variables),
+			sessions);
+		var router = Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 100, 0),
+			sessionRegistry: sessions,
+			variableHistory: windows,
+			variableHistoryReadThrottle: new VariableHistoryReadThrottle(_time));
+		string[] windowIds =
+		[
+			windows.Open("plugin.a", "viewer_count", 10),
+			windows.Open("plugin.a", "follower_count", 10),
+			windows.Open("plugin.a", "subscriber_count", 10)
+		];
+
+		var paced = new List<HostCallbackResult>();
+		for (var second = 0; second < 30; second++)
+		{
+			_time.Advance(TimeSpan.FromSeconds(1));
+			foreach (var windowId in windowIds)
+			{
+				paced.Add(await ReadHistoryAsync(router, windowId));
+			}
+		}
+
+		var looped = new List<HostCallbackResult>();
+		for (var call = 0; call < 200; call++)
+		{
+			looped.Add(await ReadHistoryAsync(router, windowIds[0]));
+		}
+
+		var refused = looped.Where(result => result.Error is not null).ToList();
+		Assert.Multiple(() =>
+		{
+			Assert.That(paced.Select(result => result.Error), Is.All.Null);
+			Assert.That(refused, Is.Not.Empty);
+			Assert.That(refused.Select(result => result.Error!.Code), Is.All.EqualTo(ProtocolErrorCodes.RateLimited));
+			Assert.That(refused.Select(result => result.Error!.Retryable), Is.All.True);
+			Assert.That(looped.Count(result => result.Error is null),
+				Is.LessThanOrEqualTo(windowIds.Length * VariableHistoryReadThrottle.BurstPerWindow));
+		});
+	}
+
+	private static Task<HostCallbackResult> ReadHistoryAsync(PluginCallbackRouter router, string windowId)
+	{
+		return router.RouteAsync("plugin.a",
+			"read",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.HistoryRead,
+				Arguments = JsonSerializer.SerializeToElement(
+					new VariablesHistoryWindowArguments { WindowId = windowId },
+					PluginProtocolJson.Options)
+			},
+			CancellationToken.None);
+	}
+
+	[Test]
+	public async Task An_unknown_api_is_capability_unsupported()
+	{
+		var router = Router();
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload { Api = "not-a-real-api", Operation = "whatever" },
+			CancellationToken.None);
+
+		Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnsupported));
+	}
+
+	[Test]
+	public async Task An_unknown_operation_on_a_known_api_is_capability_unsupported()
+	{
+		var router = Router();
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload { Api = HostApis.Variables, Operation = "not-a-real-operation" },
+			CancellationToken.None);
+
+		Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnsupported));
+	}
+
+
+	[Test]
+	public async Task Exceeding_the_throttle_yields_a_retryable_rate_limited()
+	{
+		var router = Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 1, 0));
+
+		var first = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload { Api = HostApis.Variables, Operation = HostOperations.Variables.List },
+			CancellationToken.None);
+		var second = await router.RouteAsync("plugin.a",
+			"c2",
+			new HostInvokePayload { Api = HostApis.Variables, Operation = HostOperations.Variables.List },
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(first.Error, Is.Null);
+			Assert.That(second.Error!.Code, Is.EqualTo(ProtocolErrorCodes.RateLimited));
+			Assert.That(second.Error!.Retryable, Is.True);
+		});
+	}
+
+	// ---- video streams -------------------------------------------------------------------------
+
+	private PluginCallbackRouter VideoRouter(VideoStreamWorld world, int sharedCapacity = 100, int videoCapacity = 100)
+	{
+		return Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, sharedCapacity, 0),
+			videoStreamProviders: world.Registry,
+			videoStreamSessions: world.Broker,
+			videoStreamThrottle: new VideoStreamCallbackThrottle(_time, videoCapacity, 0));
+	}
+
+	private static HostInvokePayload Video(string operation, object? arguments = null)
+	{
+		return new HostInvokePayload
+		{
+			Api = HostApis.VideoStreams,
+			Operation = operation,
+			Arguments = arguments is null ? null : Arg(arguments)
+		};
+	}
+
+	private static async Task<string> OpenPluginSessionAsync(VideoStreamWorld world, string pluginId)
+	{
+		world.Plugin.AddProvider("front", "r1", "main");
+		await world.AttachPluginAsync(pluginId);
+		var ticket = world.Open(pluginId + "::front", "main");
+		await world.WaitForActiveAsync(ticket.SessionId);
+		return ticket.SessionId;
+	}
+
+	[Test]
+	public async Task Video_stream_callbacks_are_charged_to_their_own_bucket_and_leave_the_shared_one_alone()
+	{
+		using var world = new VideoStreamWorld();
+		var router = VideoRouter(world, 1, 2);
+
+		var first = await router.RouteAsync("plugin.a",
+			"c1",
+			Video(HostOperations.VideoStreams.ProvidersChanged),
+			CancellationToken.None);
+		var second = await router.RouteAsync("plugin.a",
+			"c2",
+			Video(HostOperations.VideoStreams.ProvidersChanged),
+			CancellationToken.None);
+		var third = await router.RouteAsync("plugin.a",
+			"c3",
+			Video(HostOperations.VideoStreams.ProvidersChanged),
+			CancellationToken.None);
+		var shared = await router.RouteAsync("plugin.a",
+			"c4",
+			new HostInvokePayload { Api = HostApis.Variables, Operation = HostOperations.Variables.List },
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(first.Error, Is.Null);
+			Assert.That(second.Error, Is.Null);
+			Assert.That(third.Error!.Code, Is.EqualTo(ProtocolErrorCodes.RateLimited));
+			Assert.That(third.Error.Retryable, Is.True);
+			Assert.That(shared.Error, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task Providers_changed_makes_the_host_read_the_calling_plugins_providers()
+	{
+		using var world = new VideoStreamWorld();
+		world.Plugin.AddProvider("front", "r1", "main");
+		var (sessionId, connection) = await world.ConnectPluginAsync("plugin.a");
+		var router = VideoRouter(world);
+
+		var result = await router.RouteAsync("plugin.a",
+			sessionId,
+			connection,
+			"c1",
+			Video(HostOperations.VideoStreams.ProvidersChanged),
+			CancellationToken.None);
+		await VideoStreamWorld.WaitForAsync(() => world.Registry.GetProviders().Count == 1,
+			"the providers were never read");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(world.Registry.GetProviders().Single().QualifiedId, Is.EqualTo("plugin.a::front"));
+			Assert.That(world.Registry.GetProviders().Single().Streams.Single().Id, Is.EqualTo("main"));
+		});
+	}
+
+	[Test]
+	public async Task A_plugin_updates_and_closes_its_own_video_session()
+	{
+		using var world = new VideoStreamWorld();
+		var sessionId = await OpenPluginSessionAsync(world, "plugin.a");
+		var router = VideoRouter(world);
+
+		var update = await router.RouteAsync("plugin.a",
+			"c1",
+			Video(HostOperations.VideoStreams.SessionUpdate,
+				new VideoStreamsSessionUpdateArguments
+				{
+					SessionId = sessionId, State = "Reconnecting", Reason = "SourceLost"
+				}),
+			CancellationToken.None);
+		var close = await router.RouteAsync("plugin.a",
+			"c3",
+			Video(HostOperations.VideoStreams.SessionClose,
+				new VideoStreamsSessionCloseArguments { SessionId = sessionId, Reason = "SourceLost" }),
+			CancellationToken.None);
+		await world.WaitForClosedAsync(sessionId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(new[] { update.Error, close.Error }, Is.All.Null);
+			Assert.That(world.Publisher.Of<VideoStreamSessionChangedNotification>()[^1],
+				Has.Property(nameof(VideoStreamSessionChangedNotification.State))
+					.EqualTo(VideoStreamSessionState.Reconnecting)
+					.And.Property(nameof(VideoStreamSessionChangedNotification.Reason))
+					.EqualTo(VideoStreamSessionReason.SourceLost));
+			Assert.That(world.Publisher.Of<VideoStreamSessionClosedNotification>().Single().Reason,
+				Is.EqualTo(VideoStreamSessionReason.SourceLost));
+		});
+	}
+
+	[Test]
+	public async Task A_video_update_with_an_unusable_description_is_refused_before_the_session_hears_of_it()
+	{
+		using var world = new VideoStreamWorld();
+		var sessionId = await OpenPluginSessionAsync(world, "plugin.a");
+		var router = VideoRouter(world);
+
+		var refused = await router.RouteAsync("plugin.a",
+			"c1",
+			Video(HostOperations.VideoStreams.SessionUpdate,
+				new VideoStreamsSessionUpdateArguments
+				{
+					SessionId = sessionId,
+					State = "Active",
+					Description = new VideoStreamSessionDescriptionDto
+						{ Transport = "hls", Url = "ftp://camera.local/live" }
+				}),
+			CancellationToken.None);
+		await Task.Delay(50);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(refused.Error!.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+			Assert.That(world.Publisher.Of<VideoStreamSessionChangedNotification>(), Has.Count.EqualTo(1));
+			Assert.That(world.Publisher.Of<VideoStreamSessionClosedNotification>(), Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task A_plugin_cannot_report_on_another_plugins_video_session()
+	{
+		using var world = new VideoStreamWorld();
+		var sessionId = await OpenPluginSessionAsync(world, "plugin.a");
+		var router = VideoRouter(world);
+
+		var update = await router.RouteAsync("plugin.b",
+			"c1",
+			Video(HostOperations.VideoStreams.SessionUpdate,
+				new VideoStreamsSessionUpdateArguments { SessionId = sessionId, State = "Suspended" }),
+			CancellationToken.None);
+		var close = await router.RouteAsync("plugin.b",
+			"c2",
+			Video(HostOperations.VideoStreams.SessionClose,
+				new VideoStreamsSessionCloseArguments { SessionId = sessionId }),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(update.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnavailable));
+			Assert.That(update.Error.Details!["reason"], Is.EqualTo(ProtocolErrorReasons.VideoStreamUnknownSession));
+			Assert.That(close.Error, Is.Null);
+			Assert.That(world.Publisher.ForSession(sessionId), Has.Count.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public async Task A_session_description_past_the_limits_is_an_invalid_payload()
+	{
+		using var world = new VideoStreamWorld();
+		var sessionId = await OpenPluginSessionAsync(world, "plugin.a");
+		var router = VideoRouter(world);
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			Video(HostOperations.VideoStreams.SessionUpdate,
+				new VideoStreamsSessionUpdateArguments
+				{
+					SessionId = sessionId,
+					State = "Active",
+					Description = new VideoStreamSessionDescriptionDto { Transport = "WebRTC" }
+				}),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+			Assert.That(world.Publisher.ForSession(sessionId), Has.Count.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public async Task A_picker_request_outside_a_live_execute_of_that_plugin_is_refused()
+	{
+		var router = Router();
+		_invoker.LiveExecuteCorrelations.Clear();
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.ActionInteractions,
+				Operation = HostOperations.ActionInteractions.RequestItemPicker,
+				Arguments = Arg(new ActionInteractionsRequestItemPickerArguments
+				{
+					ExecuteCorrelationId = "forged-correlation",
+					InstanceId = "instance-1",
+					Kind = nameof(MusicPlayerCatalogItemKind.Track)
+				})
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnavailable));
+			Assert.That(_actionInteractions.ItemPickerRequests, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task A_picker_request_inside_a_live_execute_of_that_plugin_is_honoured()
+	{
+		var router = Router();
+		_invoker.LiveExecuteCorrelations.Add(("plugin.a", "real-correlation"));
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.ActionInteractions,
+				Operation = HostOperations.ActionInteractions.RequestItemPicker,
+				Arguments = Arg(new ActionInteractionsRequestItemPickerArguments
+				{
+					ExecuteCorrelationId = "real-correlation",
+					InstanceId = "instance-1",
+					Kind = nameof(MusicPlayerCatalogItemKind.Track)
+				})
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(_actionInteractions.ItemPickerRequests, Has.Count.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public async Task A_picker_request_naming_a_live_execute_of_a_different_plugin_is_refused()
+	{
+		var router = Router();
+		_invoker.LiveExecuteCorrelations.Add(("plugin.other", "someone-elses-correlation"));
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.ActionInteractions,
+				Operation = HostOperations.ActionInteractions.RequestItemPicker,
+				Arguments = Arg(new ActionInteractionsRequestItemPickerArguments
+				{
+					ExecuteCorrelationId = "someone-elses-correlation",
+					InstanceId = "instance-1",
+					Kind = nameof(MusicPlayerCatalogItemKind.Track)
+				})
+			},
+			CancellationToken.None);
+
+		Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnavailable));
+	}
+
+	// ---- scripts -------------------------------------------------------------------------------
+
+	[Test]
+	public async Task Scripts_run_carries_the_supplied_inputs_through_to_the_api()
+	{
+		var scripts = new FakeScriptApi();
+		var router = Router(scriptApi: scripts);
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Scripts,
+				Operation = HostOperations.Scripts.Run,
+				Arguments = JsonDocument
+					.Parse("""
+						   {"scriptId":"s1","originClientId":"c9","inputs":{"scene":"Live","volume":42,"muted":true}}
+						   """)
+					.RootElement.Clone()
+			},
+			CancellationToken.None);
+
+		var run = scripts.Runs.Single();
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(run.ScriptId, Is.EqualTo("s1"));
+			Assert.That(run.OriginClientId, Is.EqualTo("c9"));
+			Assert.That(((JsonElement)run.Inputs!["volume"]!).ValueKind, Is.EqualTo(JsonValueKind.Number));
+			Assert.That(((JsonElement)run.Inputs["volume"]!).GetDouble(), Is.EqualTo(42d));
+			Assert.That(((JsonElement)run.Inputs["scene"]!).GetString(), Is.EqualTo("Live"));
+			Assert.That(((JsonElement)run.Inputs["muted"]!).ValueKind, Is.EqualTo(JsonValueKind.True));
+		});
+	}
+
+	[Test]
+	public async Task Scripts_run_forwards_a_plugin_supplied_owner_widget_to_the_script_api()
+	{
+		var scripts = new FakeScriptApi();
+		var router = Router(scriptApi: scripts);
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Scripts,
+				Operation = HostOperations.Scripts.Run,
+				Arguments = Arg(new ScriptsRunArguments { ScriptId = "s1", OwnerWidgetId = "w-1" })
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(scripts.Runs.Single().OwnerWidgetId, Is.EqualTo("w-1"));
+		});
+	}
+
+	[Test]
+	public async Task Scripts_run_without_an_inputs_field_still_invokes_the_api()
+	{
+		var scripts = new FakeScriptApi();
+		var router = Router(scriptApi: scripts);
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Scripts,
+				Operation = HostOperations.Scripts.Run,
+				Arguments = Arg(new ScriptsRunArguments { ScriptId = "s1" })
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(scripts.Runs.Single().Inputs, Is.Null);
+		});
+	}
+
+	// ---- host lock state -----------------------------------------------------------------------
+
+	[Test]
+	public async Task Scripts_run_is_refused_while_locked()
+	{
+		var router = Router(lockState: new FakeHostLockState { IsLocked = true });
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Scripts,
+				Operation = HostOperations.Scripts.Run,
+				Arguments = Arg(new ScriptsRunArguments { ScriptId = "s1" })
+			},
+			CancellationToken.None);
+
+		Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnavailable));
+	}
+
+	[Test]
+	public async Task Variables_set_is_refused_while_locked_and_the_variable_is_untouched()
+	{
+		var router = Router();
+
+		var created = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.Create,
+				Arguments = Arg(new VariablesCreateArguments { Name = "v", Type = "Text", InitialValue = Arg("a") })
+			},
+			CancellationToken.None);
+		var handle = created.Data!.Value.Deserialize<VariableHandle>(PluginProtocolJson.Options)!;
+
+		var lockedRouter = Router(lockState: new FakeHostLockState { IsLocked = true });
+		var result = await lockedRouter.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Variables,
+				Operation = HostOperations.Variables.Set,
+				Arguments = Arg(new VariablesSetArguments { VariableId = handle.Id, Value = Arg("b") })
+			},
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnavailable));
+			Assert.That(_variableService.ValueOf(handle.Id), Is.EqualTo("a"));
+		});
+	}
+
+	[Test]
+	public async Task UserVariables_apply_is_refused_while_locked()
+	{
+		var router = Router(lockState: new FakeHostLockState { IsLocked = true });
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.UserVariables,
+				Operation = HostOperations.UserVariables.Apply,
+				Arguments = Arg(new UserVariablesApplyArguments { Name = "v", Operation = "Set", Value = "1" })
+			},
+			CancellationToken.None);
+
+		Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnavailable));
+	}
+
+	[Test]
+	public async Task UserVariables_apply_hands_the_script_and_automation_on_and_an_old_plugin_sends_neither()
+	{
+		var userVariables = new FakeUserVariableApi();
+		var router = Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 100, 100),
+			userVariableApi: userVariables);
+
+		await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.UserVariables,
+				Operation = HostOperations.UserVariables.Apply,
+				Arguments = Arg(new UserVariablesApplyArguments
+				{
+					Name = "v", Operation = "Set", OwnerWidgetId = "w1", ScriptId = "s1", AutomationId = "a1"
+				})
+			},
+			CancellationToken.None);
+		await router.RouteAsync("plugin.a",
+			"c2",
+			new HostInvokePayload
+			{
+				Api = HostApis.UserVariables,
+				Operation = HostOperations.UserVariables.Apply,
+				Arguments = Arg(new UserVariablesApplyArguments { Name = "v", Operation = "Set", OwnerWidgetId = "w1" })
+			},
+			CancellationToken.None);
+
+		Assert.That(userVariables.Contexts,
+			Is.EqualTo(new[] { new UserVariableContext("w1", "s1", "a1"), new UserVariableContext("w1") }));
+	}
+
+	[Test]
+	public async Task Deck_change_folder_is_refused_while_locked()
+	{
+		var router = Router(lockState: new FakeHostLockState { IsLocked = true });
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Deck,
+				Operation = HostOperations.Deck.ChangeFolder,
+				Arguments = Arg(new DeckChangeFolderArguments { FolderId = "f1" })
+			},
+			CancellationToken.None);
+
+		Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnavailable));
+	}
+
+	[Test]
+	public async Task Variables_list_a_state_report_still_works_while_locked()
+	{
+		var router = Router(lockState: new FakeHostLockState { IsLocked = true });
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			new HostInvokePayload { Api = HostApis.Variables, Operation = HostOperations.Variables.List },
+			CancellationToken.None);
+
+		Assert.That(result.Error, Is.Null);
+	}
+
+	// ---- icon packs ---------------------------------------------------------------------------
+
+	private const string IconPluginId = "com.example.logos";
+
+	private PluginCallbackRouter IconPackRouter(
+		IconPacks.PluginIconPackTestHost host,
+		PluginIconPackUploads? uploads = null,
+		IUiSessionSink? uiSessions = null)
+	{
+		return Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 100, 100),
+			sessionRegistry: host.Sessions,
+			uiSessions: uiSessions,
+			iconPackSync: host.Sync,
+			iconPackUploads: uploads ?? new PluginIconPackUploads(new PluginAssetReceiverStub(), host.Sessions),
+			pluginIconResources: host.UiResources,
+			pluginIconResolver: host.Resolver);
+	}
+
+	private static Task CreateSession(IconPacks.PluginIconPackTestHost host, PluginSessionOrigin origin)
+	{
+		return host.Sessions.Create(new PluginSessionRecord
+		{
+			SessionId = "session-1",
+			PluginId = IconPluginId,
+			DisplayName = "Logos",
+			Origin = origin,
+			NegotiatedVersion = 1,
+			Capabilities = new Dictionary<string, MacroDeck.Plugin.Protocol.Versioning.CapabilityNegotiationResult>(),
+			DeclaredCapabilities = [],
+			State = PluginSessionState.Connected,
+			CreatedAt = DateTimeOffset.UtcNow
+		});
+	}
+
+	private static HostInvokePayload SyncBundled(string key, byte[] archive)
+	{
+		return new HostInvokePayload
+		{
+			Api = HostApis.IconPacks,
+			Operation = HostOperations.IconPacks.SyncBundled,
+			Arguments = Arg(new MacroDeck.Plugin.Protocol.Callbacks.IconPacks.IconPackSyncArguments
+			{
+				Packs =
+				[
+					new MacroDeck.Plugin.Protocol.Callbacks.IconPacks.BundledIconPackDeclarationDto
+					{
+						Key = key,
+						ContentHash = MacroDeck.Plugin.Protocol.Assets.AssetContentHash.Compute(archive),
+						ByteLength = archive.Length
+					}
+				]
+			})
+		};
+	}
+
+	[Test]
+	public async Task Syncing_bundled_packs_is_refused_for_a_session_the_host_launched_itself()
+	{
+		using var host = new IconPacks.PluginIconPackTestHost();
+		await CreateSession(host, PluginSessionOrigin.Managed);
+		var router = IconPackRouter(host);
+
+		var result = await router.RouteAsync(IconPluginId,
+			"session-1",
+			"c1",
+			SyncBundled("logos", await host.BuildArchive("Logos", ("spotify", "green"))),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error?.Code, Is.EqualTo(ProtocolErrorCodes.IconPackSyncNotAllowed));
+			Assert.That(host.PluginPack(IconPluginId, "logos"), Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task A_development_session_uploads_what_the_host_asks_for_and_then_syncs_its_pack()
+	{
+		using var host = new IconPacks.PluginIconPackTestHost();
+		await CreateSession(host, PluginSessionOrigin.SelfRegistered);
+		var receiver = new MacroDeckHost.Application.Plugins.Assets.PluginAssetReceiver(new InMemoryPluginAssetCache());
+		var router = IconPackRouter(host, new PluginIconPackUploads(receiver, host.Sessions));
+		var archive = await host.BuildArchive("Logos", ("spotify", "green"));
+		var hash = MacroDeck.Plugin.Protocol.Assets.AssetContentHash.Compute(archive);
+
+		var first = await router.RouteAsync(IconPluginId,
+			"session-1",
+			"c1",
+			SyncBundled("logos", archive),
+			CancellationToken.None);
+		receiver.Begin(IconPluginId,
+			"a1",
+			MacroDeck.Plugin.Protocol.Assets.AssetKinds.IconPack,
+			"application/zip",
+			archive.Length,
+			hash);
+		receiver.Chunk(IconPluginId, "a1", 0, archive);
+		receiver.Commit(IconPluginId, "a1");
+		var second = await router.RouteAsync(IconPluginId,
+			"session-1",
+			"c2",
+			SyncBundled("logos", archive),
+			CancellationToken.None);
+
+		var askedFor
+			= first.Data?.Deserialize<MacroDeck.Plugin.Protocol.Callbacks.IconPacks.IconPackSyncResult>(
+				PluginProtocolJson.Options);
+		var synced
+			= second.Data?.Deserialize<MacroDeck.Plugin.Protocol.Callbacks.IconPacks.IconPackSyncResult>(
+				PluginProtocolJson.Options);
+		Assert.Multiple(() =>
+		{
+			Assert.That(askedFor?.UploadRequired, Is.EqualTo(new[] { hash }));
+			Assert.That(second.Error, Is.Null);
+			Assert.That(synced?.Changed, Is.True);
+			Assert.That(host.PluginPack(IconPluginId, "logos"), Is.Not.Null);
+		});
+	}
+
+	[Test]
+	public async Task An_icon_pack_upload_from_a_session_the_host_launched_itself_is_not_kept()
+	{
+		using var host = new IconPacks.PluginIconPackTestHost();
+		await CreateSession(host, PluginSessionOrigin.Managed);
+		var receiver = new MacroDeckHost.Application.Plugins.Assets.PluginAssetReceiver(new InMemoryPluginAssetCache());
+		using var uploads = new PluginIconPackUploads(receiver, host.Sessions);
+		var archive = await host.BuildArchive("Logos", ("spotify", "green"));
+		var hash = MacroDeck.Plugin.Protocol.Assets.AssetContentHash.Compute(archive);
+
+		receiver.Begin(IconPluginId,
+			"a1",
+			MacroDeck.Plugin.Protocol.Assets.AssetKinds.IconPack,
+			"application/zip",
+			archive.Length,
+			hash);
+		receiver.Chunk(IconPluginId, "a1", 0, archive);
+		receiver.Commit(IconPluginId, "a1");
+
+		Assert.That(uploads.Find(IconPluginId, hash), Is.Null);
+	}
+
+	[Test]
+	public async Task A_plugin_asks_for_its_own_icon_as_a_ui_resource_handle_and_an_unknown_one_is_not_found()
+	{
+		using var host = new IconPacks.PluginIconPackTestHost();
+		await host.SyncDevelopment(IconPluginId, ("logos", await host.BuildArchive("Logos", ("spotify", "green"))));
+		var router = IconPackRouter(host);
+
+		HostInvokePayload Get(string name)
+		{
+			return new HostInvokePayload
+			{
+				Api = HostApis.IconPacks,
+				Operation = HostOperations.IconPacks.GetIconResource,
+				Arguments = Arg(new MacroDeck.Plugin.Protocol.Callbacks.IconPacks.GetIconResourceArguments
+					{ Key = "logos", Name = name })
+			};
+		}
+
+		var found = await router.RouteAsync(IconPluginId, "session-1", "c1", Get("spotify"), CancellationToken.None);
+		var missing = await router.RouteAsync(IconPluginId, "session-1", "c2", Get("tidal"), CancellationToken.None);
+
+		var handle = found.Data?.Deserialize<UiResourceHandleDto>(PluginProtocolJson.Options);
+		Assert.Multiple(() =>
+		{
+			Assert.That(found.Error, Is.Null);
+			Assert.That(handle?.ResourceId, Does.StartWith(PluginIconReferences.ResourceOwnerId + "."));
+			Assert.That(missing.Error?.Code, Is.EqualTo(ProtocolErrorCodes.PluginIconNotFound));
+		});
+	}
+
+	[Test]
+	public async Task A_plugin_asks_for_any_installed_icon_by_id_and_an_unknown_id_is_not_found()
+	{
+		using var host = new IconPacks.PluginIconPackTestHost();
+		await host.SyncDevelopment("com.example.other",
+			("logos", await host.BuildArchive("Logos", ("spotify", "green"))));
+		var foreignIconId = host.Icon(host.PluginPack("com.example.other", "logos")!, "spotify").Id;
+		var router = IconPackRouter(host);
+
+		HostInvokePayload Get(Guid iconId)
+		{
+			return new HostInvokePayload
+			{
+				Api = HostApis.IconPacks,
+				Operation = HostOperations.IconPacks.GetIcon,
+				Arguments = Arg(new MacroDeck.Plugin.Protocol.Callbacks.IconPacks.GetIconArguments { IconId = iconId })
+			};
+		}
+
+		var found = await router.RouteAsync(IconPluginId,
+			"session-1",
+			"c1",
+			Get(foreignIconId),
+			CancellationToken.None);
+		var missing = await router.RouteAsync(IconPluginId,
+			"session-1",
+			"c2",
+			Get(Guid.NewGuid()),
+			CancellationToken.None);
+
+		var handle = found.Data?.Deserialize<UiResourceHandleDto>(PluginProtocolJson.Options);
+		Assert.Multiple(() =>
+		{
+			Assert.That(found.Error, Is.Null);
+			Assert.That(handle?.ResourceId, Is.EqualTo(PluginIconReferences.ResourceId(foreignIconId)));
+			Assert.That(missing.Error?.Code, Is.EqualTo(ProtocolErrorCodes.IconNotFound));
+		});
+	}
+
+	[Test]
+	public async Task A_ui_snapshot_naming_a_plugin_icon_reaches_clients_as_an_icon_pack_reference()
+	{
+		using var host = new IconPacks.PluginIconPackTestHost();
+		await host.SyncDevelopment(IconPluginId, ("logos", await host.BuildArchive("Logos", ("spotify", "green"))));
+		var spotifyId = host.Icon(host.PluginPack(IconPluginId, "logos")!, "spotify").Id;
+		var sink = new CapturingUiSessionSink();
+		var router = IconPackRouter(host, uiSessions: sink);
+		using var tree
+			= JsonDocument.Parse("""{"type":"image","source":{"type":"plugin-icon","reference":"logos/spotify"}}""");
+
+		await router.RouteAsync(IconPluginId,
+			"session-1",
+			"c1",
+			new HostInvokePayload
+			{
+				Api = HostApis.Ui,
+				Operation = HostOperations.Ui.Snapshot,
+				Arguments = Arg(new UiSnapshotArguments { SessionId = "ui-1", Tree = tree.RootElement.Clone() })
+			},
+			CancellationToken.None);
+
+		var source = sink.Snapshots.Single().ToElement().GetProperty("source");
+		Assert.Multiple(() =>
+		{
+			Assert.That(source.GetProperty("type").GetString(), Is.EqualTo("icon-pack"));
+			Assert.That(source.GetProperty("reference").GetString(), Is.EqualTo(spotifyId.ToString()));
+		});
+	}
+
+	private sealed class CapturingUiSessionSink : IUiSessionSink
+	{
+		public List<UiRawJson> Snapshots { get; } = [];
+
+		public UiSessionIngestResult PublishSnapshot(string providerId, string sessionId, UiRawJson tree)
+		{
+			Snapshots.Add(tree);
+			return UiSessionIngestResult.Accept();
+		}
+
+		public UiSessionIngestResult PublishPatch(string providerId, string sessionId, UiRawJson patch)
+		{
+			return UiSessionIngestResult.Accept();
+		}
+
+		public void PublishFault(string providerId, string sessionId, string code, string? message)
+		{
+		}
+
+		public void PublishReload(string providerId, string sessionId)
+		{
+		}
+
+		public UiSessionIngestResult PublishParameterValues(
+			string providerId,
+			string sessionId,
+			IReadOnlyDictionary<string, JsonElement> values)
+		{
+			return UiSessionIngestResult.Accept();
+		}
+	}
+
+	private sealed class PluginAssetReceiverStub : MacroDeckHost.Application.Plugins.Assets.IPluginAssetReceiver
+	{
+		public event EventHandler<MacroDeckHost.Application.Plugins.Assets.AssetCommittedEventArgs>? AssetCommitted
+		{
+			add { }
+			remove { }
+		}
+
+		public MacroDeckHost.Application.Plugins.Assets.AssetOperationResult Begin(
+			string pluginId,
+			string assetId,
+			string kind,
+			string mimeType,
+			int totalBytes,
+			string contentHash)
+		{
+			throw new NotSupportedException();
+		}
+
+		public MacroDeckHost.Application.Plugins.Assets.AssetOperationResult Chunk(
+			string pluginId,
+			string assetId,
+			int index,
+			ReadOnlySpan<byte> data)
+		{
+			throw new NotSupportedException();
+		}
+
+		public MacroDeckHost.Application.Plugins.Assets.AssetOperationResult Commit(string pluginId, string assetId)
+		{
+			throw new NotSupportedException();
+		}
+
+		public void DropSession(string pluginId)
+		{
+		}
+	}
+
+	private static JsonElement Arg<T>(T value)
+	{
+		return JsonSerializer.SerializeToElement(value, PluginProtocolJson.Options);
+	}
+
+	private sealed class FakeHostLockState : IHostLockState
+	{
+		public bool IsSupported { get; init; } = true;
+
+		public bool IsLocked { get; init; }
+	}
+
+	private sealed class FakeInvoker : IPluginCapabilityInvoker
+	{
+		public HashSet<(string PluginId, string CorrelationId)> LiveExecuteCorrelations { get; } = [];
+
+		public Task<JsonElement?> InvokeAsync(
+			string pluginId,
+			CapabilityInvokeRequest request,
+			CancellationToken cancellationToken)
+		{
+			throw new NotSupportedException();
+		}
+
+		public bool TryComplete(string pluginId, ProtocolEnvelope result)
+		{
+			return false;
+		}
+
+		public void AbortAll(string pluginId, ProtocolError reason)
+		{
+		}
+
+		public bool IsLiveActionExecute(string pluginId, string correlationId)
+		{
+			return LiveExecuteCorrelations.Contains((pluginId, correlationId));
+		}
+	}
+
+	private sealed class FakeActionInteractions : IActionInteractions
+	{
+		public List<(string? OriginClientId, string InstanceId, MusicPlayerCatalogItemKind Kind)> ItemPickerRequests
+		{
+			get;
+		} = [];
+
+		public void RequestItemPicker(
+			string? originClientId,
+			string instanceId,
+			MusicPlayerCatalogItemKind kind,
+			string? prompt = null)
+		{
+			ItemPickerRequests.Add((originClientId, instanceId, kind));
+		}
+
+		public void RequestDevicePicker(
+			string? originClientId,
+			string instanceId,
+			bool startPlayback,
+			string? prompt = null)
+		{
+		}
+	}
+
+	private sealed class FakeNotificationStore : IUserNotificationStore
+	{
+		public int Capacity => 100;
+
+		public UserNotification? Raise(UserNotificationDraft draft)
+		{
+			return null;
+		}
+
+		public UserNotification? RaiseIfAbsent(UserNotificationDraft draft)
+		{
+			return null;
+		}
+
+		public IReadOnlyList<UserNotification> Snapshot()
+		{
+			return [];
+		}
+
+		public bool UpdateProgress(string dedupeKey, UserNotificationProgress progress)
+		{
+			return false;
+		}
+
+		public bool DismissByKey(string dedupeKey)
+		{
+			return false;
+		}
+
+		public bool Dismiss(string id)
+		{
+			return false;
+		}
+
+		public bool Retire(string dedupeKey)
+		{
+			return false;
+		}
+
+		public UserNotification? RaiseIfPresent(UserNotificationDraft draft)
+		{
+			return null;
+		}
+
+		public bool MarkRead(string id)
+		{
+			return false;
+		}
+
+		public bool MarkAllRead()
+		{
+			return false;
+		}
+
+		public bool DismissAll()
+		{
+			return false;
+		}
+
+		public event Action? Changed
+		{
+			add { }
+			remove { }
+		}
+	}
+
+	private sealed class FakeDeckNavigator : IDeckNavigator
+	{
+		public Task ChangeFolderAsync(
+			string folderId,
+			string? originClientId = null,
+			CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task ChangeProfileAsync(
+			string profileId,
+			string? originClientId = null,
+			CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task GoToParentAsync(string? originClientId = null, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task GoBackAsync(string? originClientId = null, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public IReadOnlyList<DeckFolder> GetFolders()
+		{
+			return [];
+		}
+
+		public IReadOnlyList<DeckProfile> GetProfiles()
+		{
+			return [];
+		}
+	}
+
+	private sealed class FakeScriptApi : IScriptApi
+	{
+		public List<(string ScriptId, IReadOnlyDictionary<string, object?>? Inputs, string? OriginClientId, string?
+			OwnerWidgetId)> Runs { get; } = [];
+
+		public IReadOnlyList<Script> GetScripts()
+		{
+			return [];
+		}
+
+		public Task<ActionResult> RunAsync(
+			string scriptId,
+			IReadOnlyDictionary<string, object?>? inputs = null,
+			string? originClientId = null,
+			string? ownerWidgetId = null,
+			CancellationToken cancellationToken = default)
+		{
+			Runs.Add((scriptId, inputs, originClientId, ownerWidgetId));
+			return ActionResult.SucceededTask;
+		}
+	}
+
+	private sealed class FakeWidgetApi : IWidgetApi
+	{
+		public IReadOnlyList<WidgetTargetInfo> GetWidgets()
+		{
+			return [];
+		}
+
+		public bool Exists(string widgetId)
+		{
+			return false;
+		}
+
+		public Task<bool> ApplyAsync(WidgetAppearanceRequest request, CancellationToken cancellationToken = default)
+		{
+			return Task.FromResult(false);
+		}
+
+		public Task<WidgetStateWriteResult> SetStateAsync(
+			string widgetId,
+			string stateId,
+			CancellationToken cancellationToken = default)
+		{
+			return Task.FromResult(WidgetStateWriteResult.Failed(WidgetStateWriteError.NotFound));
+		}
+
+		public Task<WidgetStateWriteResult> AdvanceStateAsync(
+			string widgetId,
+			CancellationToken cancellationToken = default)
+		{
+			return Task.FromResult(WidgetStateWriteResult.Failed(WidgetStateWriteError.NotFound));
+		}
+	}
+
+	private sealed class FakeWidgetIconInvalidator : IWidgetIconInvalidator
+	{
+		public List<(string IntegrationId, string ActionId)> Invalidations { get; } = [];
+
+		public void Invalidate(string integrationId, string actionId)
+		{
+			Invalidations.Add((integrationId, actionId));
+		}
+	}
+
+	private sealed class FakeUserVariableApi : IUserVariableApi
+	{
+		public List<UserVariableContext> Contexts { get; } = [];
+
+		public Task<UserVariableWriteResult> ApplyAsync(
+			string name,
+			string? ownerWidgetId,
+			UserVariableOperation operation,
+			string? value,
+			CancellationToken cancellationToken = default)
+		{
+			return Task.FromResult(UserVariableWriteResult.Applied());
+		}
+
+		public Task<UserVariableWriteResult> ApplyInContextAsync(
+			string name,
+			UserVariableContext context,
+			UserVariableOperation operation,
+			string? value,
+			CancellationToken cancellationToken = default)
+		{
+			Contexts.Add(context);
+			return Task.FromResult(UserVariableWriteResult.Applied());
+		}
+	}
+
+	private sealed class FakeVariableService : IVariableService
+	{
+		private readonly Dictionary<Guid, VariableEntity> _byId = [];
+
+		public string? ValueOf(Guid id)
+		{
+			return _byId.TryGetValue(id, out var entity) ? entity.Value : null;
+		}
+
+		public Task<IReadOnlyList<VariableEntity>> GetAll()
+		{
+			return Task.FromResult<IReadOnlyList<VariableEntity>>([.. _byId.Values]);
+		}
+
+		public Task<IReadOnlyList<VariableEntity>> GetByScope(VariableScope scope, string? scopeRefId)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<VariableEntity?> GetById(Guid id)
+		{
+			return Task.FromResult(_byId.GetValueOrDefault(id));
+		}
+
+		public Task<VariableEntity?> Resolve(string name, VariableScope contextScope, string? contextScopeRefId)
+		{
+			return Task.FromResult(_byId.Values.FirstOrDefault(entity => entity.Name == name));
+		}
+
+		public Task<VariableEntity?> Resolve(string name, VariableScopeChain chain)
+		{
+			return Task.FromResult(_byId.Values.FirstOrDefault(entity => entity.Name == name));
+		}
+
+		public Task<Result<VariableEntity, VariableError>> CreateUserVariable(
+			string name,
+			VariableScope scope,
+			string? scopeRefId,
+			DomainVariableType type,
+			object? initialValue,
+			int? decimalPlaces,
+			VariableFileSource? fileSource = null,
+			VariableTemplateSource? templateSource = null)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<VariableEntity, VariableError>> SetValue(
+			Guid id,
+			object? value,
+			CancellationToken cancellationToken = default)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<VariableEntity, VariableError>> UpdateUserVariable(
+			Guid id,
+			string? name,
+			int? decimalPlaces,
+			VariableFileSource? fileSource = null,
+			VariableTemplateSource? templateSource = null)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<VariableError>> DeleteUserVariable(Guid id)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<VariableEntity, VariableError>> CreateIntegrationVariable(
+			string integrationId,
+			string name,
+			VariableScope scope,
+			string? scopeRefId,
+			DomainVariableType type,
+			object? initialValue,
+			int? decimalPlaces,
+			string? definitionId = null,
+			VariableDeclaration? declaration = null,
+			VariableUpdateMode updateMode = VariableUpdateMode.Polled,
+			bool publishedByHost = false)
+		{
+			var entity = new VariableEntity
+			{
+				Id = Guid.CreateVersion7(),
+				Name = name,
+				Scope = scope,
+				ScopeRefId = scopeRefId,
+				Type = type,
+				Classification = VariableClassification.Integration,
+				OwnerIntegrationId = integrationId,
+				DefinitionId = definitionId,
+				Value = initialValue?.ToString() ?? string.Empty,
+				DecimalPlaces = decimalPlaces,
+				CreatedAt = DateTime.UtcNow,
+				UpdatedAt = DateTime.UtcNow,
+				Presentation = declaration?.Presentation
+			};
+
+			_byId[entity.Id] = entity;
+			return Task.FromResult(Result.Ok<VariableEntity, VariableError>(entity));
+		}
+
+		public Task<Result<VariableEntity, VariableError>> MaterializeCatalogVariable(
+			string integrationId,
+			string resourceId,
+			string name,
+			Domain.Enums.VariableType type,
+			int? decimalPlaces,
+			VariableDeclaration? declaration = null)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<VariableEntity?> GetByDefinition(MacroDeck.Sdk.Identity.QualifiedId definitionId)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<VariableEntity, VariableError>> ReportIntegrationVariableValue(
+			string integrationId,
+			Guid id,
+			object? value,
+			VariableBounds? bounds = null)
+		{
+			if (!_byId.TryGetValue(id, out var entity))
+			{
+				return Task.FromResult(Result.Fail<VariableEntity, VariableError>(VariableError.NotFound));
+			}
+
+			if (entity.OwnerIntegrationId != integrationId)
+			{
+				return Task.FromResult(Result.Fail<VariableEntity, VariableError>(VariableError.NotOwnedByIntegration));
+			}
+
+			entity.Value = value?.ToString() ?? string.Empty;
+			return Task.FromResult(Result.Ok<VariableEntity, VariableError>(entity));
+		}
+
+		public Task<Result<VariableError>> SetIntegrationVariableAvailability(
+			string integrationId,
+			Guid id,
+			bool available)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<VariableError>> DeleteIntegrationVariable(string integrationId, Guid id)
+		{
+			if (!_byId.TryGetValue(id, out var entity))
+			{
+				return Task.FromResult(Result.Fail<VariableError>(VariableError.NotFound));
+			}
+
+			if (entity.OwnerIntegrationId != integrationId)
+			{
+				return Task.FromResult(Result.Fail<VariableError>(VariableError.NotOwnedByIntegration));
+			}
+
+			_byId.Remove(id);
+			return Task.FromResult(Result.Ok<VariableError>());
+		}
+
+		public Task<IReadOnlyList<VariableEntity>> GetByOwnerIntegration(string integrationId)
+		{
+			return Task.FromResult<IReadOnlyList<VariableEntity>>([
+				.. _byId.Values.Where(entity => entity.OwnerIntegrationId == integrationId)
+			]);
+		}
+
+		public Task DeleteByScopeInstance(VariableScope scope, string scopeRefId)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task UpsertWidgetVariable(
+			VariableScope scope,
+			string scopeRefId,
+			string name,
+			DomainVariableType type,
+			object? value)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task RemoveWidgetVariable(VariableScope scope, string scopeRefId, string name)
+		{
+			throw new NotSupportedException();
+		}
+	}
+
+	private (PluginCallbackRouter Router, NotificationManager Manager) NotificationRouter()
+	{
+		var manager = new NotificationManager(new UserNotificationStore(),
+			TestLocalization.Resolver,
+			TestLocalization.ScopeFactory,
+			TimeProvider.System,
+			Serilog.Core.Logger.None);
+
+		return (Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 100, 100),
+			notificationManager: manager), manager);
+	}
+
+	private static HostInvokePayload Notification(string operation, object arguments)
+	{
+		return new HostInvokePayload
+			{ Api = HostApis.Notifications, Operation = operation, Arguments = Arg(arguments) };
+	}
+
+	[Test]
+	public async Task A_plugin_shows_a_notification_as_itself_whatever_the_payload_claims()
+	{
+		var (router, manager) = NotificationRouter();
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments { Title = "Macro Deck", Popup = NotificationsWire.Popup.Toast }),
+			CancellationToken.None);
+
+		var id = result.Data!.Value.GetProperty("id").GetGuid();
+		var shown = manager.Find(id)!;
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.Null);
+			Assert.That(shown.Owner.Category, Is.EqualTo(NotificationSourceCategory.Plugin));
+			Assert.That(shown.Owner.Id, Is.EqualTo("plugin.a"));
+		});
+	}
+
+	[Test]
+	public async Task A_plugin_cannot_update_or_close_another_plugins_notification()
+	{
+		var (router, manager) = NotificationRouter();
+		var shown = await router.RouteAsync("plugin.a",
+			"c1",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments { Title = "Mine", Popup = NotificationsWire.Popup.Toast }),
+			CancellationToken.None);
+		var id = shown.Data!.Value.GetProperty("id").GetGuid();
+
+		var update = await router.RouteAsync("plugin.b",
+			"c2",
+			Notification(HostOperations.Notifications.Update,
+				new NotificationsUpdateArguments { Id = id, Title = "Hijacked" }),
+			CancellationToken.None);
+		var close = await router.RouteAsync("plugin.b",
+			"c3",
+			Notification(HostOperations.Notifications.Close, new NotificationsCloseArguments { Id = id }),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(update.Error, Is.Not.Null);
+			Assert.That(close.Error, Is.Not.Null);
+			Assert.That(manager.Find(id), Is.Not.Null);
+			Assert.That(manager.Find(id)!.Title.Literal, Is.EqualTo("Mine"));
+		});
+	}
+
+	[Test]
+	public async Task The_owner_can_update_and_close_its_notification()
+	{
+		var (router, manager) = NotificationRouter();
+		var shown = await router.RouteAsync("plugin.a",
+			"c1",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments { Title = "Sync", Popup = NotificationsWire.Popup.Toast }),
+			CancellationToken.None);
+		var id = shown.Data!.Value.GetProperty("id").GetGuid();
+
+		var update = await router.RouteAsync("plugin.a",
+			"c2",
+			Notification(HostOperations.Notifications.Update,
+				new NotificationsUpdateArguments
+				{
+					Id = id, Progress = new NotificationsProgressDto { Processed = 2, Total = 5 }
+				}),
+			CancellationToken.None);
+		var progress = manager.Find(id)!.Progress;
+		var close = await router.RouteAsync("plugin.a",
+			"c3",
+			Notification(HostOperations.Notifications.Close, new NotificationsCloseArguments { Id = id }),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(update.Error, Is.Null);
+			Assert.That(progress!.Processed, Is.EqualTo(2));
+			Assert.That(close.Error, Is.Null);
+			Assert.That(manager.Find(id), Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task An_invalid_notification_is_an_invalid_payload_and_a_limit_is_rate_limited()
+	{
+		var (router, _) = NotificationRouter();
+
+		var invalid = await router.RouteAsync("plugin.a",
+			"c1",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments { Title = "Nowhere", Popup = NotificationsWire.Popup.None }),
+			CancellationToken.None);
+		var unknownKind = await router.RouteAsync("plugin.a",
+			"c2",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments { Title = "Odd", Popup = "banner" }),
+			CancellationToken.None);
+		var tooLong = await router.RouteAsync("plugin.a",
+			"c3",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments { Title = new string('x', 500) }),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(invalid.Error!.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+			Assert.That(unknownKind.Error!.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+			Assert.That(tooLong.Error!.Code, Is.EqualTo(ProtocolErrorCodes.RateLimited));
+		});
+	}
+
+	[Test]
+	public async Task A_huge_duration_or_a_content_that_is_not_a_tree_is_an_invalid_payload_not_a_crash()
+	{
+		var (router, _) = NotificationRouter();
+
+		var duration = await router.RouteAsync("plugin.a",
+			"c1",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments { Title = "Long", DurationMs = long.MaxValue }),
+			CancellationToken.None);
+		var content = await router.RouteAsync("plugin.a",
+			"c2",
+			Notification(HostOperations.Notifications.Show,
+				new NotificationsShowArguments
+				{
+					Title = "Odd",
+					Popup = NotificationsWire.Popup.Dialog,
+					Content = JsonSerializer.SerializeToElement("not a tree")
+				}),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(duration.Error, Is.Null);
+			Assert.That(content.Error!.Code, Is.EqualTo(ProtocolErrorCodes.InvalidPayload));
+		});
+	}
+
+	[Test]
+	public async Task A_host_without_a_notification_manager_answers_unsupported()
+	{
+		var router = Router(_variableService,
+			_actionInteractions,
+			_invoker,
+			new HostCallbackThrottle(_time, 100, 100));
+
+		var result = await router.RouteAsync("plugin.a",
+			"c1",
+			Notification(HostOperations.Notifications.Show, new NotificationsShowArguments { Title = "Hello" }),
+			CancellationToken.None);
+
+		Assert.That(result.Error!.Code, Is.EqualTo(ProtocolErrorCodes.CapabilityUnsupported));
+	}
+}
+
+internal sealed class NoOpUiSessionSink : IUiSessionSink
+{
+	public UiSessionIngestResult PublishSnapshot(string providerId, string sessionId, UiRawJson tree)
+	{
+		return UiSessionIngestResult.Accept();
+	}
+
+	public UiSessionIngestResult PublishPatch(string providerId, string sessionId, UiRawJson patch)
+	{
+		return UiSessionIngestResult.Accept();
+	}
+
+	public void PublishFault(string providerId, string sessionId, string code, string? message)
+	{
+	}
+
+	public void PublishReload(string providerId, string sessionId)
+	{
+	}
+
+	public UiSessionIngestResult PublishParameterValues(
+		string providerId,
+		string sessionId,
+		IReadOnlyDictionary<string, JsonElement> values)
+	{
+		return UiSessionIngestResult.Accept();
+	}
+}

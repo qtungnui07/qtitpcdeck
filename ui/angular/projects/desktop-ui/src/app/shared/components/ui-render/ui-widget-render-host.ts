@@ -1,0 +1,82 @@
+import { DestroyRef, Injectable, Signal, inject, signal } from '@angular/core';
+
+import {
+  DEFAULT_UI_COMPONENT_REGISTRY,
+  UiNode,
+  UiRenderHost,
+  containsTickingNode,
+  hasIconAppearances,
+  uiResourceUrl,
+} from '@macro-deck/runtime';
+
+import { FontLoaderService, internalFontFamily } from '../../services/font-loader.service';
+import { IconAppearanceContextService } from '../../services/icon-appearance-context.service';
+import { LocalizationService } from '../../localization';
+import { RenderingModeService } from '../../services/rendering-mode.service';
+import { ServerClockService } from '../../services/server-clock.service';
+import { UiFontService } from '../../services/theme.service';
+import { VideoStreamService } from '../../services/video-stream.service';
+import { UiNodeEventBus } from './ui-node-event-bus';
+import { UiWidgetResourceBaseUrl } from './ui-widget-resource-base-url';
+import { UiWidgetTimeService } from './ui-widget-time.service';
+
+@Injectable({ providedIn: 'root' })
+export class UiWidgetRenderHostFactory {
+  private readonly localization = inject(LocalizationService);
+  private readonly resourceBaseUrl = inject(UiWidgetResourceBaseUrl);
+  private readonly serverClock = inject(ServerClockService);
+  private readonly renderingMode = inject(RenderingModeService);
+  private readonly fontLoader = inject(FontLoaderService);
+  private readonly uiFonts = inject(UiFontService);
+  private readonly videoStreams = inject(VideoStreamService);
+  private readonly iconAppearance = inject(IconAppearanceContextService);
+
+  private readonly baseUrl = signal<string | null>(this.resourceBaseUrl.current);
+
+  constructor() {
+    if (this.baseUrl() === null) void this.resourceBaseUrl.get().then(url => this.baseUrl.set(url));
+  }
+
+  readonly localizationVersion: Signal<number> = this.localization.catalogVersion;
+
+  bind(bus: UiNodeEventBus, ownsRootWidgetBorder: () => boolean = () => false): UiRenderHost {
+    return {
+      localization: this.localization,
+      resourceUrl: resource => {
+        const base = this.baseUrl();
+        if (base === null) return null;
+        const context = hasIconAppearances(resource) ? this.iconAppearance.current() : undefined;
+        return uiResourceUrl(base, resource, undefined, context);
+      },
+      now: () => this.serverClock.now(),
+      culture: () => this.localization.culture(),
+      hourCycle: () => this.localization.hourCycle(),
+      hourPadded: () => this.localization.hourPadded(),
+      simpleRendering: () => this.renderingMode.mode() === 'simple',
+      fontFamily: faceId => `${internalFontFamily(faceId)}, var(--font-sans)`,
+      // Reading the face's status signal inside the paint is the whole of the readiness gate: the
+      // renderer hides text in a face that is still loading, and the read is what brings the frame
+      // back once the face lands (issue #457 findings 7/8).
+      fontReady: faceId => this.fontLoader.ensureFace(faceId)() !== 'loading',
+      uiFontKey: () => String(this.uiFonts.version()),
+      videoStreams: () => this.videoStreams.surface(),
+      emit: (node, name, data) => bus.emit(node, name, data),
+      setPressed: (node, pressed) => bus.setPressed(node, pressed),
+      flashPressed: node => bus.flashPressed(node),
+      ownsRootWidgetBorder,
+    };
+  }
+}
+
+@Injectable({ providedIn: 'root' })
+export class UiWidgetTickBridge {
+  private readonly time = inject(UiWidgetTimeService);
+
+  readonly instant = this.time.instant;
+
+  track(root: UiNode, destroyRef: DestroyRef, attached: boolean): boolean {
+    if (attached || !containsTickingNode(root, DEFAULT_UI_COMPONENT_REGISTRY)) return attached;
+    this.time.attach(destroyRef);
+    return true;
+  }
+}

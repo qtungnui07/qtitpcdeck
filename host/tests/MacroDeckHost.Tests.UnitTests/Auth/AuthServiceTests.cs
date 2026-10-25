@@ -1,0 +1,956 @@
+using System.Globalization;
+using System.Security.Claims;
+using MacroDeckHost.Infrastructure.Auth;
+using MacroDeckHost.Application.Auth;
+using MacroDeckHost.Application.Devices;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Domain.Common;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using MacroDeckHost.Tests.UnitTests.Triggers;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace MacroDeckHost.Tests.UnitTests.Auth;
+
+public class AuthServiceTests
+{
+	private InMemoryUserRepository _users = null!;
+	private InMemoryRefreshTokenRepository _tokens = null!;
+	private ManualTimeProvider _time = null!;
+	private FakeOnboardingPreferences _preferences = null!;
+	private AuthService _service = null!;
+	private PairingCodeStore _pairingCodes = null!;
+	private DeviceConnectionTracker _connections = null!;
+	private AccessTokenCutoff _cutoff = null!;
+	private RefreshServingEpoch _epoch = null!;
+	private FakeLastServedRotation _lastRotation = null!;
+	private DeviceSessionGuard _sessionGuard = null!;
+	private InMemoryDeviceRepository _devices = null!;
+	private StartupReadiness _readiness = null!;
+
+	private static readonly DeviceRegistration _phone = new(null,
+		null,
+		DeviceClientType.Native,
+		"Pixel 8 - Phone",
+		"Android",
+		null,
+		DeviceFormFactor.Phone,
+		"1.0.0");
+
+	[SetUp]
+	public void SetUp()
+	{
+		_pairingCodes = new PairingCodeStore();
+		_users = new InMemoryUserRepository();
+		_tokens = new InMemoryRefreshTokenRepository();
+		_time = new ManualTimeProvider();
+		_preferences = new FakeOnboardingPreferences();
+		_devices = new InMemoryDeviceRepository();
+		_readiness = new StartupReadiness();
+		_readiness.MarkCachesReady();
+		_readiness.MarkVariablesReady();
+		_connections = new DeviceConnectionTracker(new RecordingEventBus(),
+			_time,
+			new MacroDeckHost.Application.Deck.DeckClientTracker(Serilog.Core.Logger.None));
+		_cutoff = new AccessTokenCutoff();
+		_epoch = new RefreshServingEpoch();
+		_lastRotation = new FakeLastServedRotation();
+		_sessionGuard = new DeviceSessionGuard();
+		BuildService();
+	}
+
+	private void BuildService()
+	{
+		_service = new AuthService(_users,
+			_tokens,
+			new FakePasswordHasher(),
+			new FakeAccessTokenIssuer(_time),
+			new DeviceService(_devices,
+				_tokens,
+				_connections,
+				new RecordingUiTransport(),
+				new RecordingMediator(),
+				_time,
+				new FakeProfileRegistry(),
+				new FakeDeviceDeckNavigator(),
+				_readiness,
+				new ProviderDevicePresenceTracker(),
+				new FakeIntegrationRegistry(),
+				TestScreenSaverProviders.Registry(),
+				_sessionGuard),
+			new DeviceEnrollmentStore(),
+			_pairingCodes,
+			_cutoff,
+			_epoch,
+			_lastRotation,
+			_preferences,
+			_time,
+			NullLogger<AuthService>.Instance);
+	}
+
+	[Test]
+	public async Task Setup_creates_the_single_user()
+	{
+		var result = await _service.Setup("  admin  ", "password123");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Success, Is.True);
+			Assert.That(_users.User, Is.Not.Null);
+			Assert.That(_users.User!.Username, Is.EqualTo("admin"));
+			Assert.That(_users.User.PasswordHash, Is.EqualTo("H:password123"));
+		});
+	}
+
+	[Test]
+	public async Task Setup_rejects_short_password_and_empty_username()
+	{
+		var shortPassword = await _service.Setup("admin", "short");
+		var emptyUsername = await _service.Setup("   ", "password123");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(shortPassword.Error, Is.EqualTo(AuthError.ValidationError));
+			Assert.That(emptyUsername.Error, Is.EqualTo(AuthError.ValidationError));
+			Assert.That(_users.User, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task Setup_fails_when_user_already_exists()
+	{
+		await _service.Setup("admin", "password123");
+
+		var result = await _service.Setup("other", "password456");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.EqualTo(AuthError.SetupAlreadyComplete));
+			Assert.That(_users.User!.Username, Is.EqualTo("admin"));
+		});
+	}
+
+	[Test]
+	public async Task Setup_arms_the_onboarding_wizard()
+	{
+		var result = await _service.Setup("admin", "password123");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Success, Is.True);
+			Assert.That(_preferences.OnboardingPending, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task Setup_arms_no_onboarding_wizard_when_it_is_rejected()
+	{
+		await _service.Setup("admin", "short");
+		await _service.Setup("   ", "password123");
+
+		Assert.That(_preferences.OnboardingPending, Is.False);
+	}
+
+	[Test]
+	public async Task Setup_cannot_re_arm_an_onboarding_wizard_the_user_already_finished()
+	{
+		await _service.Setup("admin", "password123");
+		_preferences.OnboardingPending = false;
+
+		var result = await _service.Setup("other", "password456");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Error, Is.EqualTo(AuthError.SetupAlreadyComplete));
+			Assert.That(_preferences.OnboardingPending, Is.False);
+		});
+	}
+
+	[Test]
+	public async Task Login_succeeds_with_correct_credentials_and_is_case_insensitive()
+	{
+		await _service.Setup("Admin", "password123");
+
+		var result = await _service.Login("admin", "password123", AuthScope.Client);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.Success, Is.True);
+			Assert.That(result.Data!.Scope, Is.EqualTo(AuthScope.Client));
+			Assert.That(result.Data.Username, Is.EqualTo("Admin"));
+			Assert.That(result.Data.RefreshToken, Is.Not.Empty);
+			Assert.That(_tokens.Tokens, Has.Count.EqualTo(1));
+			Assert.That(_tokens.Tokens[0].TokenHash, Is.Not.EqualTo(result.Data.RefreshToken));
+			Assert.That(result.Data.RefreshTokenExpiresAt,
+				Is.EqualTo(_time.Now.UtcDateTime.Add(AuthDefaults.RefreshTokenLifetime)));
+		});
+	}
+
+	[Test]
+	public async Task Login_fails_with_wrong_password_or_username()
+	{
+		await _service.Setup("admin", "password123");
+
+		var wrongPassword = await _service.Login("admin", "nope", AuthScope.Client);
+		var wrongUsername = await _service.Login("nobody", "password123", AuthScope.Client);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(wrongPassword.Error, Is.EqualTo(AuthError.InvalidCredentials));
+			Assert.That(wrongUsername.Error, Is.EqualTo(AuthError.InvalidCredentials));
+			Assert.That(_tokens.Tokens, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task Refresh_rotates_the_token_and_keeps_scope()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client);
+
+		var refreshed = await _service.Refresh(login.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(refreshed.Success, Is.True);
+			Assert.That(refreshed.Data!.Scope, Is.EqualTo(AuthScope.Client));
+			Assert.That(refreshed.Data.RefreshToken, Is.Not.EqualTo(login.Data.RefreshToken));
+			Assert.That(_tokens.Tokens, Has.Count.EqualTo(2));
+			Assert.That(_tokens.Tokens[0].RevokedAt, Is.Not.Null);
+			Assert.That(_tokens.Tokens[0].ReplacedById, Is.EqualTo(_tokens.Tokens[1].Id));
+		});
+	}
+
+	[Test]
+	public async Task Refresh_with_unknown_or_expired_token_fails()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client);
+
+		var unknown = await _service.Refresh("does-not-exist");
+
+		_time.Advance(AuthDefaults.RefreshTokenLifetime + TimeSpan.FromMinutes(1));
+		var expired = await _service.Refresh(login.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(unknown.Error, Is.EqualTo(AuthError.InvalidRefreshToken));
+			Assert.That(expired.Error, Is.EqualTo(AuthError.InvalidRefreshToken));
+		});
+	}
+
+	[Test]
+	public async Task Refresh_reuse_revokes_the_reused_family_and_leaves_other_sessions_alone()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client);
+		var otherSession = await _service.Login("admin", "password123", AuthScope.Admin);
+		var rotated = await _service.Refresh(login.Data!.RefreshToken);
+		var family = TokenRow(rotated.Data!.RefreshToken).FamilyId;
+
+		_time.Advance(AuthDefaults.RefreshTokenReuseGrace + TimeSpan.FromSeconds(1));
+		var reuse = await _service.Refresh(login.Data.RefreshToken);
+		var otherAfterReuse = await _service.Refresh(otherSession.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(reuse.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(otherAfterReuse.Success, Is.True);
+			Assert.That(_tokens.Tokens.Where(t => t.FamilyId == family).All(t => t.RevokedAt is not null),
+				Is.True);
+		});
+	}
+
+	[Test]
+	public async Task A_lost_rotation_can_be_retried_once_with_the_previous_token_inside_the_grace_window()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var otherSession = await _service.Login("admin", "password123", AuthScope.Admin);
+		var lost = await _service.Refresh(login.Data!.RefreshToken);
+
+		_time.Advance(TimeSpan.FromSeconds(30));
+		var retry = await _service.Refresh(login.Data.RefreshToken);
+		var other = await _service.Refresh(otherSession.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(retry.Success, Is.True);
+			Assert.That(retry.Data!.RefreshToken,
+				Is.Not.EqualTo(login.Data.RefreshToken).And.Not.EqualTo(lost.Data!.RefreshToken));
+			Assert.That(retry.Data.Scope, Is.EqualTo(AuthScope.Client));
+			Assert.That(retry.Data.DeviceId, Is.EqualTo(login.Data.DeviceId));
+			Assert.That(other.Success, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task A_rotation_response_lost_to_a_restart_can_still_be_retried_once_the_host_is_back()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		Restart();
+		var lost = await _service.Refresh(login.Data!.RefreshToken);
+
+		_time.Advance(TimeSpan.FromMinutes(30));
+		Restart();
+		_time.Advance(TimeSpan.FromMinutes(5));
+
+		var retry = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(retry.Success, Is.True);
+			Assert.That(retry.Data!.RefreshToken, Is.Not.EqualTo(lost.Data!.RefreshToken));
+			Assert.That(retry.Data.DeviceId, Is.EqualTo(login.Data.DeviceId));
+		});
+	}
+
+	[Test]
+	public async Task A_device_that_stays_away_past_the_restart_window_is_treated_as_reuse()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		Restart();
+		await _service.Refresh(login.Data!.RefreshToken);
+
+		_time.Advance(TimeSpan.FromMinutes(30));
+		Restart();
+		_time.Advance(AuthDefaults.RefreshTokenReuseGraceAfterRestart + TimeSpan.FromMinutes(1));
+
+		var retry = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.That(retry.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+	}
+
+	[Test]
+	public async Task A_previous_token_coming_back_late_to_a_host_that_never_stopped_is_still_reuse()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		Restart();
+		await _service.Refresh(login.Data!.RefreshToken);
+
+		_time.Advance(AuthDefaults.RefreshTokenReuseGrace + TimeSpan.FromSeconds(1));
+		var retry = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.That(retry.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+	}
+
+	[Test]
+	public async Task A_rotation_the_previous_host_long_outlived_is_not_replayable_after_a_restart()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		Restart();
+		await _service.Refresh(login.Data!.RefreshToken);
+
+		var other = await _service.Login("admin", "password123", AuthScope.Client);
+		_time.Advance(TimeSpan.FromDays(3));
+		await _service.Refresh(other.Data!.RefreshToken);
+
+		_time.Advance(TimeSpan.FromMinutes(1));
+		Restart();
+		_time.Advance(TimeSpan.FromMinutes(1));
+
+		var replay = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.That(replay.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+	}
+
+	[Test]
+	public async Task Reuse_ends_the_access_the_compromised_device_already_holds()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var deviceId = login.Data!.DeviceId!.Value;
+		var issuedAt = _time.GetUtcNow().UtcDateTime;
+		await _service.Refresh(login.Data.RefreshToken);
+
+		_time.Advance(AuthDefaults.RefreshTokenReuseGrace + TimeSpan.FromSeconds(1));
+		var reuse = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(reuse.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(_sessionGuard.Rejects(TokenIssuedAt(issuedAt, deviceId)), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task The_previous_token_presented_a_second_time_revokes_its_own_family()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var otherSession = await _service.Login("admin", "password123", AuthScope.Admin);
+		await _service.Refresh(login.Data!.RefreshToken);
+
+		var retry = await _service.Refresh(login.Data.RefreshToken);
+		var secondRetry = await _service.Refresh(login.Data.RefreshToken);
+		var retried = await _service.Refresh(retry.Data!.RefreshToken);
+		var other = await _service.Refresh(otherSession.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(retry.Success, Is.True);
+			Assert.That(secondRetry.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(retried.Success, Is.False);
+			Assert.That(other.Success, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task An_older_ancestor_revokes_its_own_family_even_inside_the_grace_window()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var second = await _service.Refresh(login.Data!.RefreshToken);
+		var third = await _service.Refresh(second.Data!.RefreshToken);
+
+		var ancestor = await _service.Refresh(login.Data.RefreshToken);
+		var current = await _service.Refresh(third.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(ancestor.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(current.Success, Is.False);
+		});
+	}
+
+	[TestCase(true, TestName = "The_previous_token_whose_successor_belongs_to_another_device_revokes_its_family")]
+	[TestCase(false, TestName = "The_previous_token_whose_successor_has_another_scope_revokes_its_family")]
+	public async Task The_previous_token_whose_successor_does_not_match_revokes_its_family(bool otherDevice)
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var rotated = await _service.Refresh(login.Data!.RefreshToken);
+		var successor = TokenRow(rotated.Data!.RefreshToken);
+		if (otherDevice)
+		{
+			successor.DeviceId = Guid.NewGuid();
+		}
+		else
+		{
+			successor.Scope = AuthScope.Admin;
+		}
+
+		var retry = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(retry.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(_tokens.Tokens.All(t => t.RevokedAt is not null), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task The_previous_token_does_not_bring_back_a_successor_that_was_logged_out()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var rotated = await _service.Refresh(login.Data!.RefreshToken);
+		await _service.Logout(rotated.Data!.RefreshToken);
+
+		var retry = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.That(retry.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+	}
+
+	[Test]
+	public async Task The_token_a_retry_rotated_away_revokes_its_family_when_it_comes_back()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var rotated = await _service.Refresh(login.Data!.RefreshToken);
+		var replayed = await _service.Refresh(login.Data.RefreshToken);
+
+		var owner = await _service.Refresh(rotated.Data!.RefreshToken);
+		var replayer = await _service.Refresh(replayed.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(replayed.Success, Is.True);
+			Assert.That(owner.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(replayer.Success, Is.False);
+		});
+	}
+
+	[Test]
+	public async Task Two_refreshes_of_the_same_live_token_racing_both_succeed()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		Result<LoginResult, AuthError>? winner = null;
+		_tokens.BeforeNextRevoke = async () => winner = await _service.Refresh(login.Data!.RefreshToken);
+
+		var loser = await _service.Refresh(login.Data!.RefreshToken);
+		var winnerNext = await _service.Refresh(winner!.Data!.RefreshToken);
+		var loserNext = await _service.Refresh(loser.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(winner.Success, Is.True);
+			Assert.That(loser.Success, Is.True);
+			Assert.That(winnerNext.Success, Is.True);
+			Assert.That(loserNext.Success, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task The_owner_refreshing_while_its_predecessor_is_replayed_revokes_its_family()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var rotated = await _service.Refresh(login.Data!.RefreshToken);
+		Result<LoginResult, AuthError>? replay = null;
+		_tokens.BeforeNextRevoke = async () => replay = await _service.Refresh(login.Data.RefreshToken);
+
+		var owner = await _service.Refresh(rotated.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(replay!.Success, Is.True);
+			Assert.That(owner.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(_tokens.Tokens.All(t => t.RevokedAt is not null), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task A_refresh_racing_a_logout_of_the_same_token_leaves_no_live_session()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		_tokens.BeforeNextRevoke = () => _service.Logout(login.Data!.RefreshToken);
+
+		var refresh = await _service.Refresh(login.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(refresh.Error, Is.EqualTo(AuthError.InvalidRefreshToken));
+			Assert.That(_tokens.Tokens.All(t => t.RevokedAt is not null), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task Two_racing_retries_of_a_lost_rotation_are_accepted_only_once()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		await _service.Refresh(login.Data!.RefreshToken);
+		Result<LoginResult, AuthError>? first = null;
+		_tokens.BeforeNextRevoke = async () => first = await _service.Refresh(login.Data.RefreshToken);
+
+		var second = await _service.Refresh(login.Data.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(first!.Success, Is.True);
+			Assert.That(second.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(_tokens.Tokens.All(t => t.RevokedAt is not null), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task Logout_revokes_the_token_and_is_idempotent()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client);
+
+		await _service.Logout(login.Data!.RefreshToken);
+		await _service.Logout(login.Data.RefreshToken);
+		await _service.Logout("unknown-token");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(_tokens.Tokens[0].RevokedAt, Is.Not.Null);
+			Assert.That(_tokens.Tokens, Has.Count.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public async Task ChangePassword_also_ends_the_access_tokens_already_out_there()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var deviceId = login.Data!.DeviceId!.Value;
+		var issuedAt = _time.GetUtcNow().UtcDateTime;
+
+		_time.Advance(TimeSpan.FromMinutes(5));
+		await _service.ChangePassword("password123", "newpassword1");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(_cutoff.Rejects(TokenIssuedAt(issuedAt, deviceId)), Is.True);
+			Assert.That(_sessionGuard.Rejects(TokenIssuedAt(issuedAt, deviceId)), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task ChangeUsername_also_ends_the_access_tokens_already_out_there()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var deviceId = login.Data!.DeviceId!.Value;
+		var issuedAt = _time.GetUtcNow().UtcDateTime;
+
+		_time.Advance(TimeSpan.FromMinutes(5));
+		await _service.ChangeUsername("password123", "renamed");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(_cutoff.Rejects(TokenIssuedAt(issuedAt, deviceId)), Is.True);
+			Assert.That(_sessionGuard.Rejects(TokenIssuedAt(issuedAt, deviceId)), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task Only_a_session_tied_to_a_device_gets_the_long_access_token()
+	{
+		await _service.Setup("admin", "password123");
+		var now = _time.GetUtcNow().UtcDateTime;
+
+		var device = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var deviceless = await _service.Login("admin", "password123", AuthScope.Client);
+		var admin = await _service.Login("admin", "password123", AuthScope.Admin, _phone);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(device.Data!.AccessTokenExpiresAt,
+				Is.EqualTo(now.Add(AuthDefaults.ClientAccessTokenLifetime)));
+			Assert.That(deviceless.Data!.AccessTokenExpiresAt,
+				Is.EqualTo(now.Add(AuthDefaults.AdminAccessTokenLifetime)));
+			Assert.That(admin.Data!.AccessTokenExpiresAt,
+				Is.EqualTo(now.Add(AuthDefaults.AdminAccessTokenLifetime)));
+		});
+	}
+
+	[Test]
+	public async Task ChangePassword_verifies_current_password_and_revokes_all_sessions()
+	{
+		await _service.Setup("admin", "password123");
+		await _service.Login("admin", "password123", AuthScope.Client);
+
+		var wrongCurrent = await _service.ChangePassword("wrong", "newpassword1");
+		var tooShort = await _service.ChangePassword("password123", "short");
+		var ok = await _service.ChangePassword("password123", "newpassword1");
+		var oldLogin = await _service.Login("admin", "password123", AuthScope.Client);
+		var newLogin = await _service.Login("admin", "newpassword1", AuthScope.Client);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(wrongCurrent.Error, Is.EqualTo(AuthError.InvalidCredentials));
+			Assert.That(tooShort.Error, Is.EqualTo(AuthError.ValidationError));
+			Assert.That(ok.Success, Is.True);
+			Assert.That(_tokens.Tokens[0].RevokedAt, Is.Not.Null);
+			Assert.That(oldLogin.Error, Is.EqualTo(AuthError.InvalidCredentials));
+			Assert.That(newLogin.Success, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task ResetPassword_sets_a_new_password_without_the_old_one_and_ends_every_session()
+	{
+		await _service.Setup("admin", "password123");
+		await _service.Login("admin", "password123", AuthScope.Client);
+		var issuedBefore = new ClaimsPrincipal(new ClaimsIdentity(
+			[new Claim("iat", _time.GetUtcNow().ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture))],
+			"test"));
+
+		var tooShort = await _service.ResetPassword("short");
+		var ok = await _service.ResetPassword("newpassword1");
+		var oldLogin = await _service.Login("admin", "password123", AuthScope.Client);
+		var newLogin = await _service.Login("admin", "newpassword1", AuthScope.Client);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(tooShort.Error, Is.EqualTo(AuthError.ValidationError));
+			Assert.That(ok.Success, Is.True);
+			Assert.That(_tokens.Tokens[0].RevokedAt, Is.Not.Null);
+			Assert.That(_cutoff.Rejects(issuedBefore), Is.True);
+			Assert.That(oldLogin.Error, Is.EqualTo(AuthError.InvalidCredentials));
+			Assert.That(newLogin.Success, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task ResetPassword_without_an_account_is_a_validation_error()
+	{
+		var result = await _service.ResetPassword("newpassword1");
+
+		Assert.That(result.Error, Is.EqualTo(AuthError.ValidationError));
+	}
+
+	[Test]
+	public async Task ResetPassword_drops_device_connections_keeps_the_desktop_and_lets_the_device_sign_in_again()
+	{
+		await _service.Setup("admin", "password123");
+		var first = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var deviceId = first.Data!.DeviceId!.Value;
+		var deviceAborts = 0;
+		var desktopAborts = 0;
+		_connections.Attach("device-connection", deviceId, () => deviceAborts++);
+		_connections.Attach("desktop-connection", null, () => desktopAborts++);
+
+		await _service.ResetPassword("newpassword1");
+		var again = await _service.Login("admin",
+			"newpassword1",
+			AuthScope.Client,
+			_phone with { DeviceId = deviceId, DeviceSecret = first.Data.IssuedDeviceSecret });
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(deviceAborts, Is.EqualTo(1));
+			Assert.That(desktopAborts, Is.Zero);
+			Assert.That(again.Data?.DeviceId, Is.EqualTo(deviceId));
+		});
+	}
+
+	[Test]
+	public async Task ResetPassword_voids_the_pairing_code_and_outstanding_enrollments()
+	{
+		await _service.Setup("admin", "password123");
+		var code = _pairingCodes.Current(_time.GetUtcNow().UtcDateTime).Code;
+		var enrollment = await _service.CreateDeviceEnrollment(TimeSpan.FromMinutes(5));
+
+		await _service.ResetPassword("newpassword1");
+		var byCode = await _service.RedeemDeviceEnrollment(code, _phone);
+		var byToken = await _service.RedeemDeviceEnrollment(enrollment.Data!.Token, _phone);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(byCode.Error, Is.EqualTo(AuthError.InvalidCredentials));
+			Assert.That(byToken.Error, Is.EqualTo(AuthError.InvalidCredentials));
+		});
+	}
+
+	[Test]
+	public async Task ChangeUsername_verifies_current_password_and_revokes_all_sessions()
+	{
+		await _service.Setup("admin", "password123");
+		await _service.Login("admin", "password123", AuthScope.Admin);
+
+		var wrongCurrent = await _service.ChangeUsername("wrong", "root");
+		var ok = await _service.ChangeUsername("password123", "root");
+		var login = await _service.Login("root", "password123", AuthScope.Admin);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(wrongCurrent.Error, Is.EqualTo(AuthError.InvalidCredentials));
+			Assert.That(ok.Success, Is.True);
+			Assert.That(_users.User!.Username, Is.EqualTo("root"));
+			Assert.That(_tokens.Tokens[0].RevokedAt, Is.Not.Null);
+			Assert.That(login.Success, Is.True);
+		});
+	}
+
+	[Test]
+	public void A_pairing_code_is_six_ascii_digits()
+	{
+		for (var i = 0; i < 200; i++)
+		{
+			Assert.That(_pairingCodes.Rotate(_time.Now.UtcDateTime).Code, Does.Match("^[0-9]{6}$"));
+		}
+	}
+
+	[Test]
+	public async Task A_pairing_code_buys_one_client_scope_session_and_is_then_spent()
+	{
+		await _service.Setup("admin", "password123");
+		var code = _pairingCodes.Rotate(_time.Now.UtcDateTime).Code;
+
+		var first = await _service.RedeemDeviceEnrollment(code, _phone);
+		var replay = await _service.RedeemDeviceEnrollment(code, _phone);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(first.Success, Is.True);
+			Assert.That(first.Data!.Scope, Is.EqualTo(AuthScope.Client));
+			Assert.That(first.Data.DeviceId, Is.Not.Null);
+			Assert.That(replay.Error, Is.EqualTo(AuthError.InvalidCredentials));
+		});
+	}
+
+	[Test]
+	public async Task Opening_the_panel_again_invalidates_the_previous_code_at_once()
+	{
+		await _service.Setup("admin", "password123");
+		var previous = _pairingCodes.Rotate(_time.Now.UtcDateTime).Code;
+		var current = _pairingCodes.Rotate(_time.Now.UtcDateTime).Code;
+
+		var withPrevious = await _service.RedeemDeviceEnrollment(previous, _phone);
+		var withCurrent = await _service.RedeemDeviceEnrollment(current, _phone);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(current, Is.Not.EqualTo(previous));
+			Assert.That(withPrevious.Success, Is.False);
+			Assert.That(withCurrent.Success, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task A_pairing_code_stays_the_same_until_it_expires_after_fifteen_minutes()
+	{
+		await _service.Setup("admin", "password123");
+		var minted = _pairingCodes.Rotate(_time.Now.UtcDateTime);
+
+		_time.Advance(TimeSpan.FromMinutes(14));
+		var beforeExpiry = _pairingCodes.Current(_time.Now.UtcDateTime);
+		_time.Advance(TimeSpan.FromMinutes(1));
+		var expired = await _service.RedeemDeviceEnrollment(minted.Code, _phone);
+		var replacement = _pairingCodes.Current(_time.Now.UtcDateTime);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(beforeExpiry, Is.EqualTo(minted));
+			Assert.That(minted.ExpiresAt, Is.EqualTo(_time.Now.UtcDateTime));
+			Assert.That(expired.Success, Is.False);
+			Assert.That(replacement.Code, Is.Not.EqualTo(minted.Code));
+		});
+	}
+
+	[Test]
+	public async Task Five_failed_redeems_from_any_caller_clear_the_code()
+	{
+		await _service.Setup("admin", "password123");
+		var code = _pairingCodes.Rotate(_time.Now.UtcDateTime).Code;
+
+		for (var i = 1; i <= PairingCodeStore.MaxFailures; i++)
+		{
+			await _service.RedeemDeviceEnrollment(WrongCode(code, i), _phone);
+		}
+
+		var correct = await _service.RedeemDeviceEnrollment(code, _phone);
+		var next = _pairingCodes.Current(_time.Now.UtcDateTime).Code;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(correct.Success, Is.False);
+			Assert.That(next, Is.Not.EqualTo(code));
+		});
+	}
+
+	[Test]
+	public async Task Fewer_failed_redeems_than_the_limit_leave_the_code_valid()
+	{
+		await _service.Setup("admin", "password123");
+		var code = _pairingCodes.Rotate(_time.Now.UtcDateTime).Code;
+
+		for (var i = 1; i < PairingCodeStore.MaxFailures; i++)
+		{
+			await _service.RedeemDeviceEnrollment(WrongCode(code, i), _phone);
+		}
+
+		Assert.That((await _service.RedeemDeviceEnrollment(code, _phone)).Success, Is.True);
+	}
+
+	[Test]
+	public async Task A_burst_of_parallel_guesses_never_gets_more_than_the_failure_limit()
+	{
+		var now = _time.Now.UtcDateTime;
+		var code = _pairingCodes.Rotate(now).Code;
+
+		await Task.WhenAll(Enumerable.Range(1, 50)
+			.Select(i => Task.Run(() => _pairingCodes.TryRedeem(WrongCode(code, i), now))));
+
+		Assert.That(_pairingCodes.TryRedeem(code, now), Is.False);
+	}
+
+	[Test]
+	public async Task Failed_enrollment_tokens_do_not_count_against_the_pairing_code()
+	{
+		await _service.Setup("admin", "password123");
+		var code = _pairingCodes.Rotate(_time.Now.UtcDateTime).Code;
+
+		for (var i = 0; i < PairingCodeStore.MaxFailures * 2; i++)
+		{
+			await _service.RedeemDeviceEnrollment(TokenHasher.Generate(), _phone);
+		}
+
+		Assert.That((await _service.RedeemDeviceEnrollment(code, _phone)).Success, Is.True);
+	}
+
+	[Test]
+	public async Task No_pairing_code_is_valid_until_the_desktop_mints_one()
+	{
+		await _service.Setup("admin", "password123");
+
+		var guesses = await Task.WhenAll(Enumerable.Range(0, 3)
+			.Select(i => _service.RedeemDeviceEnrollment(i.ToString("D6", CultureInfo.InvariantCulture), _phone)));
+
+		Assert.That(guesses.Select(guess => guess.Success), Is.All.False);
+	}
+
+	[Test]
+	public async Task A_refresh_token_lives_365_days()
+	{
+		await _service.Setup("admin", "password123");
+
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+
+		Assert.That(login.Data!.RefreshTokenExpiresAt, Is.EqualTo(_time.Now.UtcDateTime.AddDays(365)));
+	}
+
+	[Test]
+	public async Task A_rotated_refresh_token_presented_again_within_30_days_still_revokes_its_family()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var rotated = await _service.Refresh(login.Data!.RefreshToken);
+
+		_time.Advance(TimeSpan.FromDays(29));
+		await _service.Login("admin", "password123", AuthScope.Client);
+		var reuse = await _service.Refresh(login.Data.RefreshToken);
+		var successor = await _service.Refresh(rotated.Data!.RefreshToken);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(reuse.Error, Is.EqualTo(AuthError.RefreshTokenReused));
+			Assert.That(successor.Success, Is.False);
+		});
+	}
+
+	[Test]
+	public async Task Rotated_refresh_tokens_are_deleted_30_days_after_rotation_while_live_ones_stay()
+	{
+		await _service.Setup("admin", "password123");
+		var login = await _service.Login("admin", "password123", AuthScope.Client, _phone);
+		var rotated = await _service.Refresh(login.Data!.RefreshToken);
+
+		_time.Advance(TimeSpan.FromDays(31));
+		await _service.Login("admin", "password123", AuthScope.Client);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(_tokens.Tokens.Any(t => t.TokenHash == TokenHasher.Hash(login.Data.RefreshToken)), Is.False);
+			Assert.That(_tokens.Tokens.Any(t => t.TokenHash == TokenHasher.Hash(rotated.Data!.RefreshToken)), Is.True);
+		});
+	}
+
+	private void Restart()
+	{
+		_epoch = new RefreshServingEpoch();
+		_epoch.Begin(_time.GetUtcNow().UtcDateTime, _lastRotation.Read());
+		BuildService();
+	}
+
+	private static ClaimsPrincipal TokenIssuedAt(DateTime issuedAt, Guid deviceId)
+	{
+		return new ClaimsPrincipal(new ClaimsIdentity([
+			new Claim(AuthDefaults.DeviceClaim, deviceId.ToString()),
+			new Claim(AccessTokenIssuedAt.Claim,
+				AccessTokenIssuedAt.UnixSeconds(issuedAt).ToString(CultureInfo.InvariantCulture))
+		]));
+	}
+
+	private Domain.Entities.RefreshTokenEntity TokenRow(string rawToken)
+	{
+		return _tokens.Tokens.Single(t => t.TokenHash == TokenHasher.Hash(rawToken));
+	}
+
+	private static string WrongCode(string code, int offset)
+	{
+		return ((int.Parse(code, CultureInfo.InvariantCulture) + offset) % 1_000_000)
+			.ToString("D6", CultureInfo.InvariantCulture);
+	}
+}

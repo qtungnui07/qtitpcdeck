@@ -1,0 +1,1320 @@
+using System.Text.Json;
+using MacroDeck.Plugin.Packaging.Manifest;
+using MacroDeckHost.Api.Controllers;
+using MacroDeckHost.Application.Store;
+using MacroDeckHost.Application.Store.Installation;
+using MacroDeckHost.Application.Store.Issues;
+using MacroDeckHost.Application.Store.Model;
+using MacroDeckHost.Application.Store.Operations;
+using MacroDeckHost.Application.Store.Updates;
+using MacroDeckHost.Application.Ui.Transport.Messages.Store;
+using MacroDeckHost.Domain.Common;
+using MacroDeckHost.Infrastructure.Plugins;
+using MacroDeckHost.Infrastructure.Store;
+using MacroDeckHost.Tests.UnitTests.Http;
+using MacroDeckHost.Tests.UnitTests.Store;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using Microsoft.AspNetCore.Mvc;
+using MacroDeckHost.Infrastructure.Plugins.Trust;
+
+namespace MacroDeckHost.Tests.UnitTests.Api;
+
+[TestFixture]
+internal sealed class StoreControllerTests
+{
+	private const string PluginId = "com.acme.hue";
+	private const string SourceCommit = "0123456789abcdef0123456789abcdef01234567";
+
+	private static readonly string[] _appleAndWindowsRids = ["osx-arm64", "osx-x64", "win-x64"];
+	private static readonly string[] _expectedOperatingSystems = ["Windows", "macOS"];
+
+	private static readonly string[] _declaredAiServices = ["OpenAI"];
+
+	private static readonly string[] _detailTags = ["streaming", "obs"];
+
+	private TestPaths _paths = null!;
+	private StoreCatalog _catalog = null!;
+	private StoreCatalogQueryService _catalogQuery = null!;
+	private StoreOperationTracker _tracker = null!;
+	private StoreInstallCoordinator _installCoordinator = null!;
+	private FakeStoreUninstallService _uninstallService = null!;
+	private StoreController _controller = null!;
+	private FakeStoreInstallCounts _reviews = null!;
+	private FakeStoreRepositoryIssueClient _issues = null!;
+
+	[SetUp]
+	public void SetUp()
+	{
+		_paths = new TestPaths();
+		Directory.CreateDirectory(_paths.StoreDirectory);
+		Directory.CreateDirectory(_paths.PluginsDirectory);
+		Directory.CreateDirectory(_paths.StoreMediaDirectory);
+
+		_catalog = new StoreCatalog();
+		var installations = new JsonStoreInstallationStore(_paths, Serilog.Core.Logger.None);
+		var plugins = new PluginInstallationCatalog(_paths, Serilog.Core.Logger.None);
+		_catalogQuery = new StoreCatalogQueryService(_catalog,
+			plugins,
+			installations,
+			new JsonStoreTestInstallationStore(_paths, Serilog.Core.Logger.None),
+			new InstalledPluginSigners());
+		_tracker = new StoreOperationTracker(new InMemoryStoreOperationStore(), TimeProvider.System);
+		_installCoordinator = new StoreInstallCoordinator(_catalogQuery,
+			_tracker,
+			new StoreOperationChannel(),
+			new StoreOperationCancellation(),
+			new StoreInstallConsent(),
+			new StoreInstallBackupBatches());
+
+		_uninstallService = new FakeStoreUninstallService();
+		_reviews = new FakeStoreInstallCounts();
+		_issues = new FakeStoreRepositoryIssueClient();
+		_controller = CreateController(new FakeStoreRegistryRefresher(),
+			new StoreRegistryRefreshTracker(TimeProvider.System));
+	}
+
+	[TearDown]
+	public void TearDown()
+	{
+		_paths.Cleanup();
+	}
+
+	private StoreController CreateController(
+		IStoreRegistryRefresher refresher,
+		IStoreRegistryRefreshTracker refreshTracker,
+		IStoreArtifactDownloader? downloader = null)
+	{
+		return new StoreController(_catalogQuery,
+			refresher,
+			_installCoordinator,
+			_tracker,
+			new FakeStoreUpdateDetector(),
+			new StoreUpdateState(),
+			downloader ?? new ThrowingStoreArtifactDownloader(),
+			new FakeDeveloperModePreferences(),
+			_paths,
+			StoreRegistryOptions.Default,
+			_uninstallService,
+			refreshTracker,
+			new StoreUpdateBatchInstaller(_installCoordinator),
+			new StoreCatalogPopularity(_catalogQuery, _reviews),
+			new StoreSimilarPackages(_catalogQuery, _reviews),
+			new StoreLinkResolver(_catalog, StoreRegistryOptions.Default),
+			new StoreRepositoryIssueService(_issues, TimeProvider.System))
+		{
+			ControllerContext = new ControllerContext
+			{
+				HttpContext = new Microsoft.AspNetCore.Http.DefaultHttpContext()
+			}
+		};
+	}
+
+	[Test]
+	public async Task A_refresh_requested_while_one_runs_joins_it_and_every_session_sees_the_same_run()
+	{
+		Directory.CreateDirectory(_paths.StoreRegistryDirectory);
+		Directory.CreateDirectory(_paths.StoreRegistryStagingDirectory);
+		var fixture = new StoreRegistryFixture { SignedAt = DateTimeOffset.UtcNow };
+		fixture.AddPackage("plugin", PluginId, "1.0.0", "Hue Bridge");
+		fixture.ManifestHold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		var refreshTracker = new StoreRegistryRefreshTracker(TimeProvider.System);
+		using var lifetime = new StubHostApplicationLifetime();
+		using var refresher = new StoreRegistryRefresher(fixture.Build(),
+			StoreRegistryOptions.Default with
+			{
+				BaseUrl = new Uri(StoreRegistryFixture.BaseUrl),
+				RootPublicKeyOverride = MacroDeck.Signing.TestSupport.TestPki.Root.PublicKey,
+				UpdateRaceRetryDelays = []
+			},
+			new JsonStoreRegistryStateStore(_paths, Serilog.Core.Logger.None),
+			new StoreRegistryReader(Serilog.Core.Logger.None),
+			_catalog,
+			_paths,
+			TimeProvider.System,
+			refreshTracker,
+			new RecordingMediator(),
+			lifetime,
+			Serilog.Core.Logger.None);
+		var controller = CreateController(refresher, refreshTracker);
+
+		var started = controller.RefreshRegistry(CancellationToken.None);
+		await fixture.ManifestRequested.Task.WaitAsync(TimeSpan.FromSeconds(10));
+		var joined = controller.RefreshRegistry(CancellationToken.None);
+		var status = await controller.GetStatus();
+		fixture.ManifestHold.SetResult();
+		var responses = await Task.WhenAll(started, joined);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(fixture.ManifestRequests, Is.EqualTo(1));
+			Assert.That(status.RefreshRun!.State, Is.EqualTo(StoreRegistryRefreshRunState.Running));
+			Assert.That(status.Registry.Refreshing, Is.True);
+			Assert.That(responses.Select(response => response.RefreshRun!.Id), Is.All.EqualTo(status.RefreshRun.Id));
+			Assert.That(responses.Select(response => response.Success),
+				Is.All.True,
+				responses[0].Error?.Message.ToString());
+			Assert.That(responses[0].RefreshRun!.State, Is.EqualTo(StoreRegistryRefreshRunState.Succeeded));
+		});
+	}
+
+	[Test]
+	public async Task An_uninitialised_registry_answers_registry_unavailable_not_an_empty_catalog()
+	{
+		var response = await _controller.GetCatalog(null, null, null);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items, Is.Empty);
+			Assert.That(response.Registry.HasCatalog, Is.False);
+		});
+	}
+
+	[Test]
+	public async Task Repeated_kind_parameters_narrow_the_catalog_to_exactly_those_kinds()
+	{
+		SeedBrowseCatalog();
+
+		var response = await _controller.GetCatalog(null,
+			null,
+			StoreCatalogSection.Name,
+			kinds: [StoreExtensionKind.Plugin, StoreExtensionKind.IconPack]);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items.Select(item => item.Id), Is.EqualTo(new[] { "i1", "p1", "p2" }));
+			Assert.That(response.Total, Is.EqualTo(3));
+			Assert.That(response.Items.Select(item => item.Kind),
+				Has.None.EqualTo(StoreExtensionKind.ProfileTemplate));
+		});
+	}
+
+	[Test]
+	public async Task A_publisher_parameter_lists_only_that_publishers_packages()
+	{
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Entries =
+			[
+				BrowseEntry("p1", "Plugin One", StoreExtensionKind.Plugin) with { Publisher = "PyFlat" },
+				BrowseEntry("p2", "Plugin Two", StoreExtensionKind.Plugin) with { Publisher = "Squibs" },
+				BrowseEntry("i1", "Icons", StoreExtensionKind.IconPack) with { Publisher = "PyFlat" }
+			]
+		});
+
+		var response = await _controller.GetCatalog(null,
+			null,
+			StoreCatalogSection.Name,
+			publisher: "pyflat");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items.Select(item => item.Id), Is.EqualTo(new[] { "i1", "p1" }));
+			Assert.That(response.Total, Is.EqualTo(2));
+		});
+	}
+
+	[Test]
+	public async Task A_single_kind_parameter_keeps_selecting_only_that_kind()
+	{
+		SeedBrowseCatalog();
+
+		var plugins = await _controller.GetCatalog(StoreExtensionKind.Plugin, null, null);
+		var templates = await _controller.GetCatalog(StoreExtensionKind.ProfileTemplate,
+			null,
+			null);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(plugins.Items.Select(item => item.Id), Is.EquivalentTo(new[] { "p1", "p2" }));
+			Assert.That(plugins.Total, Is.EqualTo(2));
+			Assert.That(templates.Items.Select(item => item.Id), Is.EquivalentTo(new[] { "t1" }));
+			Assert.That(templates.Total, Is.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public async Task A_page_smaller_than_the_catalog_still_reports_how_much_there_is_to_reach()
+	{
+		SeedBrowseCatalog();
+
+		var response = await _controller.GetCatalog(null,
+			null,
+			StoreCatalogSection.Name,
+			0,
+			2);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items, Has.Count.EqualTo(2));
+			Assert.That(response.Total, Is.EqualTo(4));
+		});
+	}
+
+	[Test]
+	public async Task A_registry_that_features_nothing_answers_with_an_empty_section_not_an_unavailable_store()
+	{
+		SeedBrowseCatalog();
+
+		var response = await _controller.GetCatalog(null,
+			null,
+			StoreCatalogSection.Featured);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items, Is.Empty);
+			Assert.That(response.Total, Is.Zero);
+		});
+	}
+
+	[Test]
+	public void Two_install_calls_for_the_same_package_return_the_same_operation_id()
+	{
+		SeedPlugin();
+
+		var first = _controller.Install(new InstallStoreExtensionRequest
+		{
+			Kind = StoreExtensionKind.Plugin,
+			PackageId = PluginId
+		});
+		var second = _controller.Install(new InstallStoreExtensionRequest
+		{
+			Kind = StoreExtensionKind.Plugin,
+			PackageId = PluginId
+		});
+
+		Assert.That(second.Operation?.Id, Is.EqualTo(first.Operation?.Id));
+	}
+
+	[Test]
+	public async Task The_catalog_response_never_carries_an_artifact_url()
+	{
+		SeedPlugin();
+
+		var response = await _controller.GetCatalog(null, null, null);
+		var json = JsonSerializer.Serialize(response);
+
+		Assert.That(json, Does.Not.Contain("cdn.example"));
+	}
+
+	[Test]
+	public async Task A_screenshot_index_the_entry_does_not_declare_is_refused()
+	{
+		SeedPlugin();
+
+		var result = await _controller.GetScreenshot(StoreExtensionKind.Plugin,
+			PluginId,
+			5,
+			CancellationToken.None);
+
+		Assert.That(result, Is.InstanceOf<NotFoundResult>());
+	}
+
+	// The published registry serves SVG icons, so a media path that only recognises raster magic bytes
+	// refuses every real icon. Exercised through the cache so no network is involved.
+	[Test]
+	public async Task An_svg_icon_is_served_as_an_image_rather_than_refused()
+	{
+		var svg = global::System.Text.Encoding.UTF8.GetBytes(
+			"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"></svg>");
+		SeedPluginWithIcon(svg);
+
+		var result = await _controller.GetIcon(StoreExtensionKind.Plugin, PluginId, CancellationToken.None);
+
+		Assert.That(result, Is.TypeOf<FileContentResult>());
+		Assert.That(((FileContentResult)result).ContentType, Is.EqualTo("image/svg+xml"));
+	}
+
+	[Test]
+	public async Task A_screenshot_index_the_verified_entry_does_not_declare_is_refused()
+	{
+		SeedPlugin();
+
+		var result = await _controller.GetScreenshot(StoreExtensionKind.Plugin,
+			PluginId,
+			3,
+			CancellationToken.None);
+
+		Assert.That(result, Is.TypeOf<NotFoundResult>());
+	}
+
+	[Test]
+	public void A_share_link_resolves_a_listed_package_to_its_kind_and_a_missing_one_to_not_found()
+	{
+		SeedPlugin();
+
+		var found = _controller.ResolveLink(PluginId);
+		var missing = _controller.ResolveLink("com.acme.missing");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(found.Error, Is.Null);
+			Assert.That(found.Kind, Is.EqualTo(StoreExtensionKind.Plugin));
+			Assert.That(found.Id, Is.EqualTo(PluginId));
+			Assert.That(missing.Kind, Is.Null);
+			Assert.That(missing.Error!.Code, Is.EqualTo("not_found"));
+		});
+	}
+
+	[Test]
+	public void A_share_link_before_the_registry_has_loaded_answers_registry_unavailable()
+	{
+		var response = _controller.ResolveLink(PluginId);
+
+		Assert.That(response.Error!.Code, Is.EqualTo("registry_unavailable"));
+	}
+
+	[Test]
+	public void The_detail_body_reports_the_download_size_and_the_operating_systems_a_package_supports()
+	{
+		SeedPlugin(_appleAndWindowsRids, 435318);
+
+		var response = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Extension!.DownloadSize, Is.EqualTo(435318));
+			Assert.That(response.Extension!.SupportedOperatingSystems, Is.EqualTo(_expectedOperatingSystems));
+		});
+	}
+
+	[Test]
+	public void The_detail_body_carries_the_packages_additional_links_in_order()
+	{
+		SeedPlugin(additionalLinks:
+		[
+			new StoreExtensionLink { Type = "issues", Url = "https://github.com/acme/hue/issues" },
+			new StoreExtensionLink { Type = "custom", Url = "https://acme.test/setup", Label = "Setup Guide" }
+		]);
+
+		var links = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.AdditionalLinks;
+
+		Assert.That(links.Select(link => (link.Type, link.Url, link.Label)),
+			Is.EqualTo(new (string, string, string?)[]
+			{
+				("issues", "https://github.com/acme/hue/issues", null),
+				("custom", "https://acme.test/setup", "Setup Guide")
+			}));
+	}
+
+	[Test]
+	public void The_detail_body_carries_the_packages_ai_declaration()
+	{
+		SeedPlugin(ai: new PackageAiDeclaration { GeneratedContent = true, Services = ["OpenAI"] });
+
+		var ai = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.Ai;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(ai!.Interaction, Is.False);
+			Assert.That(ai.GeneratedContent, Is.True);
+			Assert.That(ai.GeneratedAssets, Is.False);
+			Assert.That(ai.Services, Is.EqualTo(_declaredAiServices));
+		});
+	}
+
+	[Test]
+	public void The_detail_body_carries_the_packages_homepage()
+	{
+		SeedPlugin(homepage: "https://acme.test/hue");
+
+		Assert.That(_controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.Homepage,
+			Is.EqualTo("https://acme.test/hue"));
+	}
+
+	[Test]
+	public void The_categories_come_in_registry_order_with_every_name_and_how_many_packages_carry_them()
+	{
+		SeedPlugin(tags: ["music"],
+			categories:
+			[
+				new StoreCategory { Id = "streaming", Names = new Dictionary<string, string> { ["en"] = "Streaming" } },
+				new StoreCategory
+				{
+					Id = "music", Names = new Dictionary<string, string> { ["en"] = "Music", ["de"] = "Musik" }
+				}
+			]);
+
+		var categories = _controller.GetCategories([StoreExtensionKind.Plugin]).Categories;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(categories.Select(category => (category.Id, category.Count)),
+				Is.EqualTo(new[] { ("streaming", 0), ("music", 1) }));
+			Assert.That(categories[1].Names,
+				Is.EquivalentTo(new Dictionary<string, string> { ["en"] = "Music", ["de"] = "Musik" }));
+		});
+	}
+
+	[Test]
+	public void The_detail_body_carries_the_packages_tags()
+	{
+		SeedPlugin(tags: ["streaming", "obs"]);
+
+		Assert.That(_controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.Tags,
+			Is.EqualTo(_detailTags));
+	}
+
+	[Test]
+	public async Task Similar_packages_for_an_unknown_package_answer_not_found_in_the_body()
+	{
+		SeedPlugin();
+
+		var response = await _controller.GetSimilar(StoreExtensionKind.Plugin, "com.acme.missing");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items, Is.Empty);
+			Assert.That(response.Error!.Code, Is.EqualTo("not_found"));
+		});
+	}
+
+	[Test]
+	public async Task Similar_packages_of_a_lone_package_are_an_empty_list_without_error()
+	{
+		SeedPlugin();
+
+		var response = await _controller.GetSimilar(StoreExtensionKind.Plugin, PluginId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items, Is.Empty);
+			Assert.That(response.Error, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task The_catalog_filters_by_tag()
+	{
+		SeedPlugin(tags: ["streaming"]);
+
+		var tagged = await _controller.GetCatalog(null, null, StoreCatalogSection.Name, tag: "streaming");
+		var other = await _controller.GetCatalog(null, null, StoreCatalogSection.Name, tag: "music");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(tagged.Items.Select(item => item.Id), Is.EqualTo(new[] { PluginId }));
+			Assert.That(other.Items, Is.Empty);
+		});
+	}
+
+	[Test]
+	public void An_undeclared_package_has_no_ai_declaration_in_its_detail_body()
+	{
+		SeedPlugin();
+
+		Assert.That(_controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.Ai, Is.Null);
+	}
+
+	[Test]
+	public void A_package_that_declares_no_runtime_identifiers_reports_no_operating_system_restriction()
+	{
+		SeedPlugin();
+
+		var response = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId);
+
+		Assert.That(response.Extension!.SupportedOperatingSystems, Is.Empty);
+	}
+
+	[Test]
+	public async Task A_failed_uninstall_surfaces_the_service_error_as_the_response_transport_error_code()
+	{
+		_uninstallService.Next = Result.Fail<StoreUninstallError>(StoreUninstallError.DependencyInUse, "in use");
+
+		var response = await _controller.Uninstall(
+			new UninstallStoreExtensionRequest { Kind = StoreExtensionKind.Plugin, Id = PluginId },
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Success, Is.False);
+			Assert.That(response.Error!.Code, Is.EqualTo(nameof(StoreUninstallError.DependencyInUse)));
+		});
+	}
+
+	[Test]
+	public async Task A_screenshot_requested_with_its_digest_may_be_cached_for_good_and_any_other_request_revalidates()
+	{
+		var digest = SeedPluginWithScreenshots(Png(1)).Single();
+
+		var named = (FileContentResult)await _controller.GetScreenshot(StoreExtensionKind.Plugin,
+			PluginId,
+			0,
+			CancellationToken.None,
+			digest.ToUpperInvariant());
+		var namedPolicy = _controller.Response.Headers.CacheControl.ToString();
+		var unnamed = (FileContentResult)await _controller.GetScreenshot(StoreExtensionKind.Plugin,
+			PluginId,
+			0,
+			CancellationToken.None);
+		var unnamedPolicy = _controller.Response.Headers.CacheControl.ToString();
+		await _controller.GetScreenshot(StoreExtensionKind.Plugin,
+			PluginId,
+			0,
+			CancellationToken.None,
+			new string('0', 64));
+		var stalePolicy = _controller.Response.Headers.CacheControl.ToString();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(namedPolicy, Does.Contain("immutable"));
+			Assert.That(unnamedPolicy, Is.EqualTo("no-cache"));
+			Assert.That(stalePolicy, Is.EqualTo("no-cache"));
+			Assert.That(named.EntityTag?.Tag.ToString(), Is.EqualTo($"\"{digest}\""));
+			Assert.That(unnamed.EntityTag?.Tag.ToString(), Is.EqualTo($"\"{digest}\""));
+		});
+	}
+
+	[Test]
+	public async Task After_a_listing_reorders_its_screenshots_every_position_serves_and_names_the_current_image()
+	{
+		var card = Png(1);
+		var sleeping = Png(2);
+		var window = Png(3);
+		SeedPluginWithScreenshots(card, sleeping);
+		var current = SeedPluginWithScreenshots(window, card, sleeping);
+
+		var first = (FileContentResult)await _controller.GetScreenshot(StoreExtensionKind.Plugin,
+			PluginId,
+			0,
+			CancellationToken.None);
+		var detail = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(first.FileContents, Is.EqualTo(window));
+			Assert.That(detail.Extension!.Screenshots.Select(screenshot => screenshot.Sha256), Is.EqualTo(current));
+		});
+	}
+
+	[Test]
+	public void The_catalog_names_the_digest_of_the_icon_it_currently_serves()
+	{
+		var svg = global::System.Text.Encoding.UTF8.GetBytes(
+			"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"></svg>");
+		SeedPluginWithIcon(svg);
+
+		var detail = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId);
+
+		Assert.That(detail.Extension!.IconSha256,
+			Is.EqualTo(Convert.ToHexStringLower(global::System.Security.Cryptography.SHA256.HashData(svg))));
+	}
+
+	private static byte[] Png(byte marker)
+	{
+		return [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, marker];
+	}
+
+	private string[] SeedPluginWithScreenshots(params byte[][] screenshots)
+	{
+		var digests = screenshots
+			.Select(bytes => Convert.ToHexStringLower(global::System.Security.Cryptography.SHA256.HashData(bytes)))
+			.ToArray();
+		for (var index = 0; index < screenshots.Length; index++)
+		{
+			File.WriteAllBytes(Path.Combine(_paths.StoreMediaDirectory, digests[index]), screenshots[index]);
+		}
+
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Entries =
+			[
+				new StoreCatalogEntry
+				{
+					Kind = StoreExtensionKind.Plugin,
+					Id = PluginId,
+					Name = "Hue Bridge",
+					LatestVersion = "1.0.0",
+					LatestRelease = new StoreReleaseManifest
+					{
+						Version = "1.0.0",
+						ArtifactUrl = new Uri("https://cdn.example/hue.macroDeckPlugin"),
+						Sha256 = new string('a', 64),
+						Size = 16,
+						Screenshots = screenshots
+							.Select((bytes, index) => new StoreMediaAsset
+							{
+								Url = new Uri($"https://cdn.example/{digests[index]}.png"),
+								Sha256 = digests[index],
+								Size = bytes.LongLength,
+								ContentType = "image/png"
+							})
+							.ToList()
+					}
+				}
+			]
+		});
+		return digests;
+	}
+
+	[Test]
+	public async Task A_registry_icon_on_the_store_asset_host_is_fetched_without_store_download_metadata()
+	{
+		var iconBytes = "<svg xmlns=\"http://www.w3.org/2000/svg\"/>"u8.ToArray();
+		using var http = new RecordingHttpClientFactory { Body = iconBytes };
+		Directory.CreateDirectory(_paths.StoreStagingDirectory);
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Entries =
+			[
+				new StoreCatalogEntry
+				{
+					Kind = StoreExtensionKind.Plugin,
+					Id = PluginId,
+					Name = "Hue Bridge",
+					LatestVersion = "1.0.0",
+					LatestRelease = new StoreReleaseManifest
+					{
+						Version = "1.0.0",
+						ArtifactUrl = new Uri(
+							$"https://store-assets.macro-deck.app/plugins/{PluginId}/1.0.0/hue.macroDeckPlugin"),
+						Sha256 = new string('a', 64),
+						Size = 16,
+						Icon = new StoreMediaAsset
+						{
+							Url = new Uri($"https://store-assets.macro-deck.app/plugins/{PluginId}/1.0.0/icon.svg"),
+							Sha256 = Convert.ToHexStringLower(
+								global::System.Security.Cryptography.SHA256.HashData(iconBytes)),
+							Size = iconBytes.LongLength,
+							ContentType = "image/svg+xml"
+						}
+					}
+				}
+			]
+		});
+		var controller = CreateController(new FakeStoreRegistryRefresher(),
+			new StoreRegistryRefreshTracker(TimeProvider.System),
+			new StoreArtifactDownloader(http, StoreRegistryOptions.Default, _paths, TimeProvider.System));
+
+		var result = await controller.GetIcon(StoreExtensionKind.Plugin, PluginId, CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result, Is.InstanceOf<FileContentResult>());
+			Assert.That(http.Requests.Single().HasMacroDeckHeaders, Is.False);
+		});
+	}
+
+	private void SeedPluginWithIcon(byte[] iconBytes)
+	{
+		var digest = Convert.ToHexStringLower(global::System.Security.Cryptography.SHA256.HashData(iconBytes));
+		File.WriteAllBytes(Path.Combine(_paths.StoreMediaDirectory, digest), iconBytes);
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Entries =
+			[
+				new StoreCatalogEntry
+				{
+					Kind = StoreExtensionKind.Plugin,
+					Id = PluginId,
+					Name = "Hue Bridge",
+					LatestVersion = "1.0.0",
+					LatestRelease = new StoreReleaseManifest
+					{
+						Version = "1.0.0",
+						ArtifactUrl = new Uri("https://cdn.example/hue.macroDeckPlugin"),
+						Sha256 = new string('a', 64),
+						Size = 16,
+						Icon = new StoreMediaAsset
+						{
+							Url = new Uri("https://cdn.example/icon.svg"),
+							Sha256 = digest,
+							Size = iconBytes.LongLength,
+							ContentType = "image/svg+xml"
+						}
+					}
+				}
+			]
+		});
+	}
+
+	[Test]
+	public async Task The_popular_section_lists_every_package_most_installed_first()
+	{
+		SeedBrowseCatalog();
+		_reviews.Counts["p2"] = 12;
+		_reviews.Counts["t1"] = 3;
+
+		var response = await _controller.GetCatalog(null, null, StoreCatalogSection.Popular);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Items.Select(item => item.Id), Is.EqualTo(new[] { "p2", "t1", "i1", "p1" }));
+			Assert.That(response.Total, Is.EqualTo(4));
+		});
+	}
+
+	[Test]
+	public async Task Asking_for_supported_packages_only_leaves_out_and_does_not_count_the_rest()
+	{
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Entries =
+			[
+				BrowseEntry("p1", "Plugin One", StoreExtensionKind.Plugin),
+				BrowseEntry("p2", "Plugin Two", StoreExtensionKind.Plugin) with { SupportedRids = ["plan9-sparc"] }
+			]
+		});
+
+		foreach (var section in new StoreCatalogSection?[] { null, StoreCatalogSection.Popular })
+		{
+			var filtered = await _controller.GetCatalog(null, null, section, supportedOnly: true);
+			var unfiltered = await _controller.GetCatalog(null, null, section);
+
+			Assert.Multiple(() =>
+			{
+				Assert.That(filtered.Items.Select(item => item.Id), Is.EqualTo(new[] { "p1" }), section?.ToString());
+				Assert.That(filtered.Total, Is.EqualTo(1));
+				Assert.That(unfiltered.Total, Is.EqualTo(2));
+			});
+		}
+	}
+
+	[Test]
+	public async Task A_card_and_the_detail_page_name_the_first_screenshot_of_the_latest_release_as_the_preview()
+	{
+		SeedPluginVersions(["BBBB", "cccc"]);
+
+		var card = (await _controller.GetCatalog(null, null, null)).Items.Single();
+		var detail = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(card.PreviewScreenshotSha256, Is.EqualTo("bbbb"));
+			Assert.That(detail.PreviewScreenshotSha256, Is.EqualTo("bbbb"));
+		});
+	}
+
+	[Test]
+	public async Task A_package_without_screenshots_has_no_preview()
+	{
+		SeedPlugin();
+
+		var card = (await _controller.GetCatalog(null, null, null)).Items.Single();
+
+		Assert.That(card.PreviewScreenshotSha256, Is.Null);
+	}
+
+	[Test]
+	public void The_version_history_says_which_versions_can_be_installed_and_how_big_they_are()
+	{
+		SeedPluginVersions();
+
+		var history = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.History;
+
+		Assert.That(history.Select(entry => (entry.Version, entry.Size, entry.Installable, entry.UnavailableReason)),
+			Is.EqualTo(new (string, long?, bool, string?)[]
+			{
+				("2.0.0", 200, true, null),
+				("1.5.0", null, false, "Unavailable"),
+				("1.0.0", 100, true, null)
+			}));
+	}
+
+	[Test]
+	public void Each_version_carries_the_dependency_list_it_published_in_the_wire_shape()
+	{
+		SeedPluginVersions(dependencies: new StoreDependencyList
+		{
+			Ecosystem = "npm",
+			SdkVersion = "10.0.401",
+			Frameworks =
+			[
+				new StoreDependencyFramework
+				{
+					Framework = "net10.0",
+					Packages =
+					[
+						new StoreDependencyPackage
+							{ Id = "MacroDeck.Sdk", Version = "3.0.0", RequestedVersion = "3.0.0", Direct = true },
+						new StoreDependencyPackage { Id = "Serilog", Version = "4.4.0" }
+					]
+				}
+			]
+		});
+
+		var history = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.History;
+
+		var json = JsonSerializer.SerializeToElement(history, JsonSerializerOptions.Web);
+		var dependencies = json[0].GetProperty("dependencies");
+		var packages = dependencies.GetProperty("frameworks")[0].GetProperty("packages");
+		Assert.Multiple(() =>
+		{
+			Assert.That(dependencies.GetProperty("ecosystem").GetString(), Is.EqualTo("npm"));
+			Assert.That(dependencies.GetProperty("sdkVersion").GetString(), Is.EqualTo("10.0.401"));
+			Assert.That(dependencies.GetProperty("frameworks")[0].GetProperty("framework").GetString(),
+				Is.EqualTo("net10.0"));
+			Assert.That(packages.EnumerateArray()
+					.Select(package => (package.GetProperty("id").GetString(),
+						package.GetProperty("version").GetString(),
+						package.GetProperty("requestedVersion").GetString(),
+						package.GetProperty("direct").GetBoolean())),
+				Is.EqualTo(new (string?, string?, string?, bool)[]
+				{
+					("MacroDeck.Sdk", "3.0.0", "3.0.0", true),
+					("Serilog", "4.4.0", null, false)
+				}));
+			Assert.That(json[1].GetProperty("dependencies").ValueKind, Is.EqualTo(JsonValueKind.Null));
+			Assert.That(json[2].GetProperty("dependencies").ValueKind, Is.EqualTo(JsonValueKind.Null));
+		});
+	}
+
+	[TestCase("https://github.com/acme/hue",
+		SourceCommit,
+		"v2.0.0",
+		"https://github.com/acme/hue/tree/" + SourceCommit)]
+	[TestCase("https://github.com/acme/hue.git",
+		null,
+		"release/v2.0.0+build",
+		"https://github.com/acme/hue/tree/release/v2.0.0%2Bbuild")]
+	[TestCase("https://gitlab.com/acme/hue", SourceCommit, "v2.0.0", null)]
+	[TestCase(null, SourceCommit, "v2.0.0", null)]
+	public void A_version_links_to_the_repository_at_the_commit_or_tag_it_was_built_from(
+		string? repository,
+		string? commit,
+		string? tag,
+		string? expectedSourceUrl)
+	{
+		SeedPluginVersions(repository: repository, source: new StoreVersionSource { Commit = commit, Tag = tag });
+
+		var history = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.History;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(history[0].SourceUrl, Is.EqualTo(expectedSourceUrl));
+			Assert.That(history[0].Installable, Is.True);
+		});
+	}
+
+	[Test]
+	public void A_version_without_a_source_reference_has_no_source_link()
+	{
+		SeedPluginVersions(repository: "https://github.com/acme/hue");
+
+		var history = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.History;
+
+		Assert.That(history.Select(entry => entry.SourceUrl), Has.All.Null);
+	}
+
+	[Test]
+	public async Task Open_issues_are_read_from_the_repository_the_catalog_entry_names()
+	{
+		SeedPluginVersions(repository: "https://github.com/acme/hue");
+		_issues.Next = new StoreRepositoryIssueFetch
+		{
+			Status = StoreRepositoryIssueFetchStatus.Ok,
+			Issues =
+			[
+				new StoreRepositoryIssue
+					{ Number = 4, Title = "Bridge offline", Url = "https://github.com/acme/hue/issues/4", Comments = 2 }
+			]
+		};
+
+		var response = await _controller.GetIssues(StoreExtensionKind.Plugin, PluginId, CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(_issues.Requested.Select(repository => (repository.Owner, repository.Name)),
+				Is.EqualTo(new[] { ("acme", "hue") }));
+			Assert.That(response.Issues.Select(issue => (issue.Number, issue.Title, issue.Comments)),
+				Is.EqualTo(new[] { (4, "Bridge offline", 2) }));
+			Assert.That(response.OpenCount, Is.EqualTo(1));
+			Assert.That(response.NewIssueUrl, Is.EqualTo("https://github.com/acme/hue/issues/new"));
+			Assert.That(response.Error, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task A_package_the_catalog_does_not_know_or_that_names_no_repository_has_no_issues_to_read()
+	{
+		SeedPluginVersions();
+
+		var unknown = await _controller.GetIssues(StoreExtensionKind.Plugin, "com.acme.other", CancellationToken.None);
+		var withoutRepository
+			= await _controller.GetIssues(StoreExtensionKind.Plugin, PluginId, CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(unknown.Error, Is.EqualTo(StoreRepositoryIssuesError.NoRepository));
+			Assert.That(withoutRepository.Error, Is.EqualTo(StoreRepositoryIssuesError.NoRepository));
+			Assert.That(_issues.Requested, Is.Empty);
+		});
+	}
+
+	[Test]
+	public void No_version_of_a_package_this_platform_cannot_run_is_installable()
+	{
+		SeedPluginVersions(supportedRids: ["plan9-sparc"]);
+
+		var history = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.History;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(history.Select(entry => entry.Installable), Has.All.False);
+			Assert.That(history.Select(entry => entry.UnavailableReason), Has.All.EqualTo("UnsupportedPlatform"));
+		});
+	}
+
+	[Test]
+	public void A_withdrawn_version_is_listed_as_not_installable_while_the_clean_ones_stay_installable()
+	{
+		SeedPluginVersions(removed:
+			[new StoreRemovedPackage { Id = PluginId, Version = "1.0.0", Reason = "Compromised" }]);
+
+		var detail = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(detail.History.Select(entry => (entry.Version, entry.Installable, entry.UnavailableReason)),
+				Is.EqualTo(new (string, bool, string?)[]
+				{
+					("2.0.0", true, null),
+					("1.5.0", false, "Unavailable"),
+					("1.0.0", false, "Withdrawn")
+				}));
+			Assert.That(detail.Withdrawal, Is.Null);
+			Assert.That(detail.InstalledVersionWithdrawal, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task An_installed_package_whose_latest_version_is_withdrawn_offers_no_version_and_says_why()
+	{
+		SeedPluginVersions(removed:
+			[
+				new StoreRemovedPackage
+					{ Id = PluginId, Version = "2.0.0", Reason = "Malware", Replacement = "com.acme.safe" }
+			],
+			kind: StoreExtensionKind.IconPack);
+		new JsonStoreInstallationStore(_paths, Serilog.Core.Logger.None).Save(new StoreInstallationRecord
+		{
+			Origin = "https://registry.example/",
+			Kind = StoreExtensionKind.IconPack,
+			PackageId = PluginId,
+			Version = "1.0.0"
+		});
+
+		var detail = _controller.GetExtension(StoreExtensionKind.IconPack, PluginId).Extension!;
+		var installed = (await _controller.GetCatalog(null, null, null, installed: true)).Items.Single();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(detail.History.Select(entry => (entry.Version, entry.Installable, entry.UnavailableReason)),
+				Is.EqualTo(new (string, bool, string?)[]
+				{
+					("2.0.0", false, "Withdrawn"),
+					("1.5.0", false, "Unavailable"),
+					("1.0.0", false, "Unavailable")
+				}));
+			Assert.That(detail.Withdrawal?.Reason, Is.EqualTo("Malware"));
+			Assert.That(detail.Withdrawal?.Replacement, Is.EqualTo("com.acme.safe"));
+			Assert.That(detail.InstalledVersionWithdrawal, Is.Null);
+			Assert.That(installed.Withdrawal?.Reason, Is.EqualTo("Malware"));
+		});
+	}
+
+	[Test]
+	public async Task An_installed_withdrawn_version_is_reported_with_the_registrys_reason()
+	{
+		SeedPluginVersions(removed:
+			[
+				new StoreRemovedPackage
+					{ Id = PluginId, Version = "1.0.0", Reason = "Compromised", Replacement = "com.acme.safe" }
+			],
+			kind: StoreExtensionKind.IconPack);
+		new JsonStoreInstallationStore(_paths, Serilog.Core.Logger.None).Save(new StoreInstallationRecord
+		{
+			Origin = "https://registry.example/",
+			Kind = StoreExtensionKind.IconPack,
+			PackageId = PluginId,
+			Version = "1.0.0"
+		});
+
+		var card = (await _controller.GetCatalog(null, null, null)).Items.Single();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(card.InstalledVersionWithdrawal?.Reason, Is.EqualTo("Compromised"));
+			Assert.That(card.InstalledVersionWithdrawal?.Replacement, Is.EqualTo("com.acme.safe"));
+			Assert.That(card.Withdrawal, Is.Null);
+			Assert.That(card.InstallState, Is.EqualTo(StoreInstallState.UpdateAvailable));
+		});
+	}
+
+	[Test]
+	public void A_platform_that_cannot_run_the_package_is_named_before_a_withdrawn_version()
+	{
+		SeedPluginVersions(supportedRids: ["plan9-sparc"],
+			removed: [new StoreRemovedPackage { Id = PluginId, Version = "1.0.0" }]);
+
+		var history = _controller.GetExtension(StoreExtensionKind.Plugin, PluginId).Extension!.History;
+
+		Assert.That(history.Select(entry => entry.UnavailableReason), Has.All.EqualTo("UnsupportedPlatform"));
+	}
+
+	[Test]
+	public void Installing_a_version_the_registry_does_not_publish_is_refused_before_any_operation_starts()
+	{
+		SeedPluginVersions();
+
+		var response = _controller.Install(new InstallStoreExtensionRequest
+		{
+			Kind = StoreExtensionKind.Plugin,
+			PackageId = PluginId,
+			Version = "1.5.0"
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Success, Is.False);
+			Assert.That(response.Error?.Code, Is.EqualTo("VersionNotFound"));
+			Assert.That(response.Operation, Is.Null);
+			Assert.That(_tracker.Snapshot(), Is.Empty);
+		});
+	}
+
+	[Test]
+	public void Only_an_install_that_names_a_version_pins_it()
+	{
+		SeedPluginVersions();
+
+		var pinned = _controller.Install(new InstallStoreExtensionRequest
+		{
+			Kind = StoreExtensionKind.Plugin,
+			PackageId = PluginId,
+			Version = "1.0.0"
+		});
+		_installCoordinator.Cancel(pinned.Operation!.Id);
+		var latest = _controller.Install(new InstallStoreExtensionRequest
+		{
+			Kind = StoreExtensionKind.Plugin,
+			PackageId = PluginId
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(pinned.Success, Is.True);
+			Assert.That(pinned.Operation!.Version, Is.EqualTo("1.0.0"));
+			Assert.That(pinned.Operation.VersionPinned, Is.True);
+			Assert.That(latest.Operation!.Version, Is.EqualTo("2.0.0"));
+			Assert.That(latest.Operation.VersionPinned, Is.False);
+		});
+	}
+
+	private void SeedPluginVersions(
+		string[]? screenshots = null,
+		string[]? supportedRids = null,
+		IReadOnlyList<StoreRemovedPackage>? removed = null,
+		StoreExtensionKind kind = StoreExtensionKind.Plugin,
+		string? repository = null,
+		StoreDependencyList? dependencies = null,
+		StoreVersionSource? source = null)
+	{
+		StoreReleaseManifest Release(string version, long size)
+		{
+			return new StoreReleaseManifest
+			{
+				Version = version,
+				ArtifactUrl = new Uri($"https://cdn.example/hue-{version}.macroDeckPlugin"),
+				Sha256 = new string('a', 64),
+				Size = size
+			};
+		}
+
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Entries =
+			[
+				new StoreCatalogEntry
+				{
+					Kind = kind,
+					Id = PluginId,
+					Name = "Hue Bridge",
+					LatestVersion = "2.0.0",
+					Repository = repository,
+					SupportedRids = supportedRids ?? [],
+					LatestRelease = Release("2.0.0", 200) with
+					{
+						Screenshots = (screenshots ?? [])
+						.Select(sha => new StoreMediaAsset
+						{
+							Url = new Uri($"https://cdn.example/{sha}.png"),
+							Sha256 = sha,
+							Size = 4
+						})
+						.ToList()
+					},
+					Releases = [Release("2.0.0", 200), Release("1.0.0", 100)],
+					History =
+					[
+						new StoreVersionHistoryEntry
+						{
+							Version = "2.0.0",
+							Size = 200,
+							HasRelease = true,
+							Dependencies = dependencies,
+							Source = source
+						},
+						new StoreVersionHistoryEntry { Version = "1.5.0" },
+						new StoreVersionHistoryEntry { Version = "1.0.0", Size = 100, HasRelease = true }
+					]
+				}
+			],
+			RemovedPackages = removed ?? []
+		});
+	}
+
+	private void SeedBrowseCatalog()
+	{
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Entries =
+			[
+				BrowseEntry("p1", "Plugin One", StoreExtensionKind.Plugin),
+				BrowseEntry("p2", "Plugin Two", StoreExtensionKind.Plugin),
+				BrowseEntry("i1", "Icons", StoreExtensionKind.IconPack),
+				BrowseEntry("t1", "Template", StoreExtensionKind.ProfileTemplate)
+			]
+		});
+	}
+
+	private static StoreCatalogEntry BrowseEntry(string id, string name, StoreExtensionKind kind)
+	{
+		return new StoreCatalogEntry
+		{
+			Kind = kind,
+			Id = id,
+			Name = name,
+			LatestVersion = "1.0.0",
+			LatestRelease = new StoreReleaseManifest
+			{
+				Version = "1.0.0",
+				ArtifactUrl = new Uri($"https://cdn.example/{id}.bin"),
+				Sha256 = new string('a', 64),
+				Size = 16
+			}
+		};
+	}
+
+	private void SeedPlugin(
+		string[]? supportedRids = null,
+		long size = 16,
+		IReadOnlyList<StoreExtensionLink>? additionalLinks = null,
+		PackageAiDeclaration? ai = null,
+		IReadOnlyList<string>? tags = null,
+		string? homepage = null,
+		IReadOnlyList<StoreCategory>? categories = null)
+	{
+		_catalog.Swap(new StoreCatalogSnapshot
+		{
+			Sequence = 1,
+			Categories = categories ?? [],
+			Entries =
+			[
+				new StoreCatalogEntry
+				{
+					Kind = StoreExtensionKind.Plugin,
+					Id = PluginId,
+					Name = "Hue Bridge",
+					LatestVersion = "1.0.0",
+					SupportedRids = supportedRids ?? [],
+					AdditionalLinks = additionalLinks ?? [],
+					Ai = ai,
+					Tags = tags ?? [],
+					Homepage = homepage,
+					LatestRelease = new StoreReleaseManifest
+					{
+						Version = "1.0.0",
+						ArtifactUrl = new Uri("https://cdn.example/hue.macroDeckPlugin"),
+						Sha256 = new string('a', 64),
+						Size = size
+					}
+				}
+			]
+		});
+	}
+}
+
+internal sealed class FakeStoreRegistryRefresher : IStoreRegistryRefresher
+{
+	public StoreRegistryStatus Status => StoreRegistryStatus.Unavailable;
+
+	public Task<Result<RegistryRefreshError>> Refresh(CancellationToken cancellationToken = default)
+	{
+		throw new NotSupportedException();
+	}
+
+	public Task<Result<RegistryRefreshError>> Refresh(
+		StoreRegistryRefreshTrigger trigger,
+		CancellationToken cancellationToken = default)
+	{
+		throw new NotSupportedException();
+	}
+
+	public Task LoadCachedRegistry(CancellationToken cancellationToken = default)
+	{
+		return Task.CompletedTask;
+	}
+}
+
+internal sealed class FakeStoreUpdateDetector : IStoreUpdateDetector
+{
+	public int CheckCallCount { get; private set; }
+
+	public IReadOnlyList<StoreAvailableUpdate> Check()
+	{
+		CheckCallCount++;
+		return [];
+	}
+}
+
+internal sealed class ThrowingStoreArtifactDownloader : IStoreArtifactDownloader
+{
+	public Task<StoreArtifactDownloadResult> Download(
+		Uri artifactUrl,
+		string expectedSha256Hex,
+		long expectedSize,
+		Guid operationId,
+		StoreDownloadMetadata? downloadMetadata,
+		IProgress<StoreArtifactDownloadProgress>? progress,
+		CancellationToken cancellationToken = default)
+	{
+		throw new NotSupportedException();
+	}
+}
+
+internal sealed class FakeStoreUninstallService : IStoreUninstallService
+{
+	public Result<StoreUninstallError> Next { get; set; } = Result.Ok<StoreUninstallError>();
+
+	public Task<Result<StoreUninstallError>> Uninstall(
+		StoreExtensionKind kind,
+		string packageId,
+		CancellationToken cancellationToken = default)
+	{
+		return Task.FromResult(Next);
+	}
+}
+
+internal sealed class FakeStoreRepositoryIssueClient : IStoreRepositoryIssueClient
+{
+	public StoreRepositoryIssueFetch Next { get; set; }
+		= new() { Status = StoreRepositoryIssueFetchStatus.Unavailable };
+
+	public List<StoreRepository> Requested { get; } = [];
+
+	public Task<StoreRepositoryIssueFetch> GetOpenIssues(
+		StoreRepository repository,
+		string? etag,
+		CancellationToken cancellationToken)
+	{
+		Requested.Add(repository);
+		return Task.FromResult(Next);
+	}
+}

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Maps qtitpcdeck's export file names to MIME types. The .desktop file's
+  MimeType= only says which types the app handles; without this nothing on the
+  system knows that a *.qtitpcdeckProfile is one of them, so a double-click would
+  still find no application.
+
+  Each type carries both the camelCase glob and an all-lowercase one:
+  shared-mime-info's case handling for mixed-case patterns is not dependable
+  across desktops, and a name that differs only in case must still open.
+
+  The upstream application/vnd.macro-deck.* types are declared here too, with the
+  same globs, so a package downloaded from the Macro Deck store still resolves to
+  this application. Two packages declaring the same type is not a conflict:
+  shared-mime-info merges the globs and the .desktop MimeType= decides which
+  application opens them.
+
+  Installed to /usr/share/mime/packages by the DEB and RPM bundles; the
+  shared-mime-info dependency is what makes the package trigger update-mime-database.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.qtitpcdeck.profile">
+    <comment>qtitpcdeck Profile</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.qtitpcdeckProfile"/>
+    <glob pattern="*.qtitpcdeckprofile"/>
+  </mime-type>
+  <mime-type type="application/vnd.qtitpcdeck.folder">
+    <comment>qtitpcdeck Folder</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.qtitpcdeckFolder"/>
+    <glob pattern="*.qtitpcdeckfolder"/>
+  </mime-type>
+  <mime-type type="application/vnd.qtitpcdeck.widget">
+    <comment>qtitpcdeck Widget</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.qtitpcdeckWidget"/>
+    <glob pattern="*.qtitpcdeckwidget"/>
+  </mime-type>
+  <mime-type type="application/vnd.qtitpcdeck.icon-pack">
+    <comment>qtitpcdeck Icon Pack</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.qtitpcdeckIconPack"/>
+    <glob pattern="*.qtitpcdeckiconpack"/>
+  </mime-type>
+  <mime-type type="application/vnd.qtitpcdeck.plugin">
+    <comment>qtitpcdeck Plugin</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.qtitpcdeckPlugin"/>
+    <glob pattern="*.qtitpcdeckplugin"/>
+  </mime-type>
+  <mime-type type="application/vnd.macro-deck.profile">
+    <comment>qtitpcdeck Profile (Macro Deck compatible)</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.macroDeckProfile"/>
+    <glob pattern="*.macrodeckprofile"/>
+  </mime-type>
+  <mime-type type="application/vnd.macro-deck.folder">
+    <comment>qtitpcdeck Folder (Macro Deck compatible)</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.macroDeckFolder"/>
+    <glob pattern="*.macrodeckfolder"/>
+  </mime-type>
+  <mime-type type="application/vnd.macro-deck.widget">
+    <comment>qtitpcdeck Widget (Macro Deck compatible)</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.macroDeckWidget"/>
+    <glob pattern="*.macrodeckwidget"/>
+  </mime-type>
+  <mime-type type="application/vnd.macro-deck.icon-pack">
+    <comment>qtitpcdeck Icon Pack (Macro Deck compatible)</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.macroDeckIconPack"/>
+    <glob pattern="*.macrodeckiconpack"/>
+  </mime-type>
+  <mime-type type="application/vnd.macro-deck.plugin">
+    <comment>qtitpcdeck Plugin (Macro Deck compatible)</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.macroDeckPlugin"/>
+    <glob pattern="*.macrodeckplugin"/>
+  </mime-type>
+</mime-info>

@@ -1,0 +1,200 @@
+namespace MacroDeck.Ui.Components;
+
+/// <summary>
+/// The event names the widget profile ships: the pair <see cref="UiSlider" /> uses for a continuous
+/// gesture the user works and then lets go of - which <see cref="UiTextField" /> reuses verbatim for
+/// typing - the press names <see cref="UiButton" /> uses, the one <see cref="UiList" /> uses to ask for
+/// more, the recognised gestures any node can declare, and the pointer family that streams raw fingers.
+///
+/// <para>
+/// <b>Why the pair, rather than one event.</b> Splitting the gesture is what lets a producer act on the
+/// value the user landed on without giving up a display that follows their finger: every intermediate
+/// level arrives as <see cref="Adjust" />, and the one the interaction ended on arrives as
+/// <see cref="Change" />. A producer for which acting on an intermediate value is a disruption - seeking a
+/// track through every waypoint on the way to the target - acts only on <see cref="Change" /> while still
+/// showing the rest.
+/// </para>
+///
+/// <para>
+/// <b>Why <see cref="Change" /> is the final value and not the streaming one.</b> A reader that ignores
+/// <see cref="Adjust" /> still delivers a correct result and merely does not stream; a reader that ignored
+/// a differently-named terminal event would lose the value the user chose. The failure mode of the
+/// unimplemented half has to be the harmless one. It also keeps <c>change</c> meaning what
+/// <see cref="Config.UiConfigEvents.Change" /> means, since the string is shared.
+/// </para>
+///
+/// <para>
+/// <b>No IsKnown, deliberately</b>, for the reason <see cref="UiComponents" /> gives: a newer renderer
+/// sending a newer event name must be ignored rather than treated as an error, which is what
+/// <see cref="Runtime.UiView.Dispatch" /> does.
+/// </para>
+/// </summary>
+public static class UiComponentEvents
+{
+	/// <summary>The value a control ended on, sent once when the interaction ends. The payload is the new
+	/// level as a bare number. A reader that offers interaction always sends it, even when the level equals
+	/// the last <see cref="Adjust" /> - with one exception: a <see cref="UiSlider" /> in
+	/// <see cref="UiComponentSliderInteractions.Relative" /> interaction sends nothing for an interaction
+	/// whose level never moved, such as a tap.</summary>
+	public const string Change = "change";
+
+	/// <summary>An intermediate value while the user is still working the control. The payload is the same
+	/// bare number. A reader sends it no more than ten times a second, and never after the
+	/// <see cref="Change" /> that ended the interaction.</summary>
+	public const string Adjust = "adjust";
+
+	/// <summary>The press a button exists for: one the user completed without holding. Carries no payload.
+	///
+	/// <para>
+	/// <b>Why this is the primary name</b>, for the reason <see cref="Change" /> gives: a reader that
+	/// implements only one press name implements this one and runs the button's main flow correctly. A
+	/// reader that implemented only the boundaries would leave the user's press doing nothing at all,
+	/// which is the failure mode that must not be the reachable one.
+	/// </para></summary>
+	public const string Press = "press";
+
+	/// <summary>A press still held when the reader's long-press threshold elapsed. Carries no payload. Sent
+	/// at most once per interaction, and never together with <see cref="Press" /> - a held press is a
+	/// different action, not a slow one.</summary>
+	public const string LongPress = "long-press";
+
+	/// <summary>The moment a press began. Carries no payload. A boundary, not a phase of
+	/// <see cref="Press" />: it exists because a producer may drive something for as long as the finger is
+	/// down, and a reader must never infer <see cref="Press" /> from it.</summary>
+	public const string PressStart = "press-start";
+
+	/// <summary>The moment a press ended, however it ended. Carries no payload. Exactly one follows each
+	/// <see cref="PressStart" />, including when the pointer left the element or the gesture was cancelled -
+	/// so a producer holding something down always gets its release.</summary>
+	public const string PressEnd = "press-end";
+
+	/// <summary>
+	/// The user has reached the end of what a <see cref="UiList" /> currently holds. The payload is
+	/// the index of the furthest child brought into view, as a bare number.
+	///
+	/// <para>
+	/// <b>An index rather than a page.</b> Paging is the producer's arithmetic, and a reader that counted
+	/// pages would have to agree with it on a page size that only the producer knows. What a reader can
+	/// state without ambiguity is how far down its own children the user has come; what that means is the
+	/// producer's to decide.
+	/// </para>
+	///
+	/// <para>
+	/// A reader sends it no more than twice a second, and only for an index beyond the furthest one it has
+	/// already sent for the same list - so a user scrolling back up asks for nothing, and a producer that
+	/// appends nothing is not asked again for the same position. That starts over when the list's content
+	/// is replaced: it holds fewer children than before, or the child at the furthest index sent is gone or
+	/// has another id. A producer can then receive an index at or below one it has already seen.
+	/// </para>
+	/// </summary>
+	public const string Reveal = "reveal";
+
+	/// <summary>Two taps completed in quick succession. Carries no payload.
+	/// <para>On a <see cref="UiSlider" />, each tap without a drag: sent after the second tap's
+	/// <see cref="Change" />, never instead of it, so a reader that does not implement it still leaves both taps
+	/// as ordinary level changes. On a slider in <see cref="UiComponentSliderInteractions.Relative" />
+	/// interaction a tap sends no <see cref="Change" />, so there it is sent on its own.</para>
+	/// <para>On a <see cref="UiButton" /> or any other node that also declares a press name: a node declaring it
+	/// has its <see cref="Press" /> held back for 400 ms after a tap, and a second press starting in that window
+	/// and completing as a tap sends this instead of either <see cref="Press" />. A reader that does not
+	/// implement it sends <see cref="Press" /> for every tap, and so does the host for a press a hardware deck
+	/// forwards to the tree.</para></summary>
+	public const string DoublePress = "double-press";
+
+	/// <summary>A drag in progress on any node that declares it. The payload is the cumulative translation
+	/// since the gesture began, as <c>{"x":n,"y":n}</c> in fractions of the widget basis, x growing right and
+	/// y growing down. Begins once the pointer has travelled <see cref="UiComponentModifiers.GestureSlop" />,
+	/// and is sent no more often than every <see cref="UiComponentModifiers.GestureThrottleMs" />
+	/// milliseconds. A reader that does not implement it sends nothing, and the node stays inert.</summary>
+	public const string Drag = "drag";
+
+	/// <summary>The end of a drag, with the same payload as <see cref="Drag" /> carrying the final
+	/// translation. Sent at most once after a drag began: not when the node leaves the tree or becomes
+	/// disabled mid-gesture, since no event leaves a disabled region.</summary>
+	public const string DragEnd = "drag-end";
+
+	/// <summary>A quick flick, sent on release. The payload is the dominant direction as a bare string:
+	/// <c>left</c>, <c>right</c>, <c>up</c> or <c>down</c>. Only a movement of at least
+	/// <see cref="UiComponentModifiers.SwipeMinDistance" /> of the basis within
+	/// <see cref="UiComponentModifiers.SwipeMaxDurationMs" /> milliseconds counts.</summary>
+	public const string Swipe = "swipe";
+
+	/// <summary>A two-pointer pinch in progress. The payload is the scale since the gesture began as a bare
+	/// number, <c>1</c> meaning unchanged. Throttled like <see cref="Drag" />.</summary>
+	public const string Pinch = "pinch";
+
+	/// <summary>The end of a pinch, with the final scale as a bare number. Sent at most once after a pinch
+	/// began, and not when the node leaves the tree or becomes disabled mid-gesture.</summary>
+	public const string PinchEnd = "pinch-end";
+
+	/// <summary>
+	/// A finger, pen or primary mouse button went down on a node that declares any name of the pointer family
+	/// (<see cref="PointerDown" />, <see cref="PointerMove" />, <see cref="PointerUp" />, <see cref="Tap" />).
+	/// The payload is <c>{"id":n,"x":n,"y":n,"t":n,"width":n,"height":n}</c>, read with
+	/// <see cref="Dsl.UiEventData.TryGetPointerDown" />.
+	///
+	/// <para>
+	/// <c>id</c> is an opaque integer from 0 to 2^31-1, distinct for every pointer one reader reports. Each reader
+	/// starts from a random point, so two decks attached to one shared session reporting the same id is very
+	/// unlikely, though not impossible. <c>x</c> and <c>y</c> are the
+	/// position relative to the node's top-left corner in fractions of the widget basis, the unit
+	/// <see cref="Drag" /> uses, x growing right and y growing down. <c>t</c> is whole milliseconds since the
+	/// first pointer of the current contact went down on the node, so samples of different fingers line up.
+	/// <c>width</c> and <c>height</c> are the node's box in the same unit.
+	/// </para>
+	///
+	/// <para>
+	/// A node declaring any name of the family owns every pointer that starts on it: an ancestor's gesture
+	/// does not take it, the platform does not pan under it, and a deck tile does not run its own press for
+	/// it. The innermost such node wins. A reader that does not implement the family sends nothing, and the
+	/// node stays inert.
+	/// </para>
+	/// </summary>
+	public const string PointerDown = "pointer-down";
+
+	/// <summary>
+	/// Pointers moved. The payload is <c>{"samples":[{"id":n,"x":n,"y":n,"t":n}, ...]}</c>, every position
+	/// recorded since the previous one for all pointers, oldest first, at most
+	/// <see cref="UiComponentModifiers.PointerMoveMaxSamples" /> with the newest kept, read with
+	/// <see cref="Dsl.UiEventData.TryGetPointerSamples" />. Sent no more often than every
+	/// <see cref="UiComponentModifiers.PointerMoveIntervalMs" /> milliseconds, except that samples still
+	/// waiting are always sent at once before any other event of the family.
+	///
+	/// <para>
+	/// <b>A newer one may replace an older one.</b> While a pointer-move for the same node from the same client
+	/// is still waiting to be delivered, the host or the plugin runtime may drop it in favour of the newer
+	/// one, so a slow consumer receives the latest positions instead of a growing backlog. The samples are
+	/// absolute positions: a replaced event loses path detail, and a finger that appeared only in it keeps its
+	/// older position until it moves again or lifts. Read time from <c>t</c>, never from event count. Handle
+	/// it synchronously and do not rebuild the tree for each one: UI updates are rate limited.
+	/// </para>
+	/// </summary>
+	public const string PointerMove = "pointer-move";
+
+	/// <summary>
+	/// A pointer lifted. The payload is <c>{"id":n,"x":n,"y":n,"t":n}</c> plus <c>"cancelled":true</c> when the
+	/// platform cancelled the pointer instead of the finger lifting, read with
+	/// <see cref="Dsl.UiEventData.TryGetPointerUp" />. Exactly one follows each <see cref="PointerDown" />
+	/// while the node still declares it, is enabled and is in the tree. Nothing arrives once the client has
+	/// disconnected or detached, so release whatever a finger holds when the session ends, and do not keep a
+	/// button held for a finger that has sent nothing for a while.
+	/// </summary>
+	public const string PointerUp = "pointer-up";
+
+	/// <summary>
+	/// A quick touch with one or more fingers. The payload is <c>{"pointers":n}</c>, the most pointers that
+	/// were down at once, read with <see cref="Dsl.UiEventData.TryGetTap" />. Sent after the last
+	/// <see cref="PointerUp" /> of a contact that took at most <see cref="UiComponentModifiers.TapMaxDurationMs" />
+	/// from the first finger down to the last finger up, in which no pointer travelled more than
+	/// <see cref="UiComponentModifiers.GestureSlop" /> and none was cancelled. A contact in which any pointer
+	/// started on a node that declares a press name sends no tap, so one touch never sends both.
+	/// </summary>
+	public const string Tap = "tap";
+
+	/// <summary>The event names this profile ships.</summary>
+	public static readonly IReadOnlyList<string> WellKnown =
+	[
+		Change, Adjust, Press, LongPress, PressStart, PressEnd, Reveal, DoublePress, Drag, DragEnd, Swipe, Pinch,
+		PinchEnd, PointerDown, PointerMove, PointerUp, Tap
+	];
+}

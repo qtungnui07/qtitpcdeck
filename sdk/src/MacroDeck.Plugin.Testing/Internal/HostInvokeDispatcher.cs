@@ -1,0 +1,1328 @@
+using System.Text.Json;
+using MacroDeck.Plugin.Protocol.Assets;
+using MacroDeck.Plugin.Protocol.Callbacks;
+using MacroDeck.Plugin.Protocol.Callbacks.IconPacks;
+using MacroDeck.Plugin.Protocol.Callbacks.Ui;
+using MacroDeck.Plugin.Protocol.Errors;
+using MacroDeck.Plugin.Protocol.Handshake;
+using MacroDeck.Plugin.Protocol.Limits;
+using MacroDeck.Plugin.Protocol.Serialization;
+using MacroDeck.Plugin.Protocol.Versioning;
+using MacroDeck.Plugin.Testing.Fakes;
+using MacroDeck.Plugin.Protocol.Capabilities.DeviceProvider;
+using MacroDeck.Plugin.Protocol.Capabilities.FolderViewProvider;
+using MacroDeck.Plugin.Protocol.Capabilities.LayoutProvider;
+using MacroDeck.Plugin.Protocol.Capabilities.Variables;
+using MacroDeck.Plugin.Protocol.Capabilities.ScreenSaverProvider;
+using MacroDeck.Plugin.Protocol.Capabilities.VideoStreamProvider;
+using MacroDeck.Plugin.Protocol.Capabilities.WidgetTypeProvider;
+using MacroDeck.Sdk.Devices;
+using MacroDeck.Sdk.FolderViews;
+using MacroDeck.Sdk.Layouts;
+using MacroDeck.Sdk.MusicPlayer;
+using MacroDeck.Sdk.ScreenSavers;
+using MacroDeck.Sdk.VideoStreams;
+using MacroDeck.Sdk.Variables;
+using MacroDeck.Sdk.Widgets;
+using MacroDeck.Sdk.Ui;
+using MacroDeck.Ui.Model.Resources;
+
+namespace MacroDeck.Plugin.Testing.Internal;
+
+/// <summary>
+/// Answers one <c>host.invoke</c> the same way a minimal but genuine host would: by actually running it
+/// against a <see cref="FakeIntegrationContext" />, so <c>context.Variables</c>,
+/// <c>context.Config</c> and the rest of <see cref="MacroDeck.Sdk.IIntegrationContext" /> behave
+/// normally for a plugin hosted over the wire without every test having to override them by hand.
+///
+/// <para>
+/// A test that wants to assert on the fakes directly should still inject its own
+/// <see cref="FakeIntegrationContext" /> through <c>PluginHostBuilder.ConfigureServices</c> - see the
+/// package's remarks on overriding <c>IIntegrationContext</c>. This dispatcher exists so a plugin that
+/// does not is answered rather than left hanging on a call that never replies.
+/// </para>
+/// </summary>
+internal static class HostInvokeDispatcher
+{
+	/// <summary>Runs one <c>host.invoke</c> against <paramref name="context" />/<paramref name="interactions" />.
+	/// <paramref name="negotiatedVersion" /> is this session's negotiated protocol version - the same
+	/// version the plugin under test used to decide which wire shape to send for an operation whose
+	/// shape differs by version (currently only <c>widgets/apply</c>).</summary>
+	public static async Task<HostInvokeOutcome> DispatchAsync(
+		FakeIntegrationContext context,
+		FakeActionInteractions interactions,
+		HostInvokePayload payload,
+		int negotiatedVersion,
+		CancellationToken cancellationToken,
+		TestHostMessaging? messaging = null,
+		string? pluginId = null,
+		UiResourceUploads? uiResourceUploads = null,
+		UiPreviewSink? uiPreviews = null,
+		TestHostColors? colors = null,
+		IReadOnlyList<CapabilityNegotiationResult>? accepted = null)
+	{
+		ArgumentNullException.ThrowIfNull(context);
+		ArgumentNullException.ThrowIfNull(interactions);
+		ArgumentNullException.ThrowIfNull(payload);
+
+		if (!HostApis.IsKnown(payload.Api))
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.CapabilityUnsupported,
+				$"'{payload.Api}' is not a host API this test host knows.");
+		}
+
+		if (!HostOperations.IsKnown(payload.Api, payload.Operation))
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.CapabilityUnsupported,
+				$"The '{payload.Api}' host API has no operation '{payload.Operation}'.");
+		}
+
+		try
+		{
+			return payload.Api switch
+			{
+				HostApis.Variables => await VariablesAsync(context, payload).ConfigureAwait(false),
+				HostApis.UserVariables => await UserVariablesAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.Config => await ConfigAsync(context, payload, cancellationToken).ConfigureAwait(false),
+				HostApis.Deck => await DeckAsync(context, payload, cancellationToken).ConfigureAwait(false),
+				HostApis.Scripts => await ScriptsAsync(context, payload, cancellationToken).ConfigureAwait(false),
+				HostApis.Widgets => await WidgetsAsync(context, payload, negotiatedVersion, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.Notifications => await NotificationsAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.ActionInteractions => ActionInteractions(interactions, payload),
+				HostApis.Devices => await DevicesAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.VariableValues => await VariableValuesAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.Layouts => await LayoutsAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.FolderViews => await FolderViewsAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.WidgetTypes => await WidgetTypesAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.ScreenSavers => await ScreenSaversAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.VideoStreams => await VideoStreamsAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.Messaging when messaging is not null && pluginId is not null => messaging.Dispatch(pluginId,
+					payload),
+				HostApis.Colors when colors is not null && pluginId is not null => colors.Dispatch(pluginId, payload),
+				HostApis.Batteries => await BatteriesAsync(context, payload, cancellationToken).ConfigureAwait(false),
+				HostApis.Weather => await WeatherAsync(context, accepted, cancellationToken).ConfigureAwait(false),
+				HostApis.Locale => await LocaleAsync(context, cancellationToken).ConfigureAwait(false),
+				HostApis.MusicPlayers => await MusicPlayersAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.DesktopNotifications => await DesktopNotificationsAsync(context, payload, cancellationToken)
+					.ConfigureAwait(false),
+				HostApis.IconPacks when payload.Operation == HostOperations.IconPacks.GetIconResource
+					=> await PluginIconAsync(context, payload, cancellationToken).ConfigureAwait(false),
+				HostApis.IconPacks when payload.Operation == HostOperations.IconPacks.GetIcon
+					=> await IconAsync(context, payload, cancellationToken).ConfigureAwait(false),
+				HostApis.Ui when uiPreviews is { Attached: true }
+					&& payload.Operation is
+						HostOperations.Ui.Snapshot
+						or HostOperations.Ui.Patch
+						or HostOperations.Ui.Fault
+						or HostOperations.Ui.Reload
+					=> uiPreviews.Dispatch(payload),
+				HostApis.Ui when payload.Operation == HostOperations.Ui.OriginReportFailure
+					=> HostInvokeOutcome.Ok(new UiOriginReportFailureResult { Delivered = false }),
+				HostApis.Ui when payload.Operation == HostOperations.Ui.OriginShowModal
+					=> HostInvokeOutcome.Ok(new UiOriginShowModalResult { Opened = false }),
+				HostApis.Ui when payload.Operation == HostOperations.Ui.OriginOpenUrl
+					=> HostInvokeOutcome.Ok(new UiOriginOpenUrlResult { Delivered = false }),
+				HostApis.Ui when payload.Operation == HostOperations.Ui.ReportParameterValues
+					=> HostInvokeOutcome.Ok((JsonElement?)null),
+				HostApis.Ui when payload.Operation == HostOperations.Ui.RegisterMusicPlayerArtwork
+					=> await MusicPlayerArtworkAsync(context, payload, cancellationToken).ConfigureAwait(false),
+				HostApis.Ui when uiResourceUploads is not null
+					&& payload.Operation is HostOperations.Ui.RegisterResource or HostOperations.Ui.RemoveResource
+					=> await UiResourcesAsync(context, payload, uiResourceUploads, cancellationToken)
+						.ConfigureAwait(false),
+				_ => HostInvokeOutcome.Failed(ProtocolErrorCodes.CapabilityUnsupported,
+					$"'{payload.Api}' is not a host API this test host knows.")
+			};
+		}
+		catch (Exception exception) when (exception is not OutOfMemoryException)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.InternalError,
+				$"The test host's fake '{payload.Api}' threw: {exception.Message}");
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> WeatherAsync(
+		FakeIntegrationContext context,
+		IReadOnlyList<CapabilityNegotiationResult>? accepted,
+		CancellationToken cancellationToken)
+	{
+		if (accepted is not null && !accepted.Any(result => result.Kind == CapabilityKinds.Weather && result.Accepted))
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.CapabilityUnavailable,
+				"Reporting changed weather snapshots requires the weather capability.");
+		}
+
+		await context.WeatherProvider.NotifySnapshotsChangedAsync(cancellationToken).ConfigureAwait(false);
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static async Task<HostInvokeOutcome> LocaleAsync(
+		FakeIntegrationContext context,
+		CancellationToken cancellationToken)
+	{
+		var format = await context.Locale.GetTimeOfDayFormatAsync(cancellationToken).ConfigureAwait(false);
+		return HostInvokeOutcome.Ok(new LocaleTimeOfDayFormatResult
+			{ Culture = format.Culture.Name, HourCycle = format.HourCycle });
+	}
+
+	private static async Task<HostInvokeOutcome> DesktopNotificationsAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var arguments = Require<DesktopNotificationShowArguments>(payload);
+		await context.DesktopNotifications.ShowAsync(arguments.Title, arguments.Message, cancellationToken)
+			.ConfigureAwait(false);
+		return HostInvokeOutcome.Ok(null);
+	}
+
+	private static async Task<HostInvokeOutcome> MusicPlayersAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var arguments = Require<MusicPlayerAlbumColorArguments>(payload);
+		return HostInvokeOutcome.Ok(new MusicPlayerAlbumColorResult
+		{
+			Color = await context.MusicPlayers.GetAlbumColorAsync(arguments.InstanceId, cancellationToken)
+				.ConfigureAwait(false)
+		});
+	}
+
+	private static async Task<HostInvokeOutcome> BatteriesAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.Batteries.Publish:
+				{
+					var arguments = Require<BatteriesPublishArguments>(payload);
+					await context.BatteryProvider
+						.PublishAsync([.. arguments.Devices.Select(BatteryWire.ToDevice)], cancellationToken)
+						.ConfigureAwait(false);
+					break;
+				}
+
+				case HostOperations.Batteries.Remove:
+				{
+					var arguments = Require<BatteriesRemoveArguments>(payload);
+					foreach (var deviceId in arguments.DeviceIds)
+					{
+						await context.BatteryProvider.RemoveAsync(deviceId, cancellationToken).ConfigureAwait(false);
+					}
+
+					break;
+				}
+
+				case HostOperations.Batteries.Withdraw:
+					context.BatteryProvider.Withdraw();
+					break;
+
+				default:
+				{
+					var arguments = Require<BatteriesSyncArguments>(payload);
+					context.BatteryProvider.Replace([.. arguments.Devices.Select(BatteryWire.ToDevice)]);
+					break;
+				}
+			}
+
+			return HostInvokeOutcome.Ok((JsonElement?)null);
+		}
+		catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> UiResourcesAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		UiResourceUploads uploads,
+		CancellationToken cancellationToken)
+	{
+		try
+		{
+			if (string.Equals(payload.Operation, HostOperations.Ui.RemoveResource, StringComparison.Ordinal))
+			{
+				var removal = Require<UiRemoveResourceArguments>(payload);
+				await context.UiResources.RemoveAsync(removal.Name, cancellationToken).ConfigureAwait(false);
+
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			var arguments = Require<UiRegisterResourceArguments>(payload);
+
+			if (context.UiResources.Resources.TryGetValue(arguments.Name, out var existing)
+				&& string.Equals(existing.Handle.ContentHash, arguments.ContentHash, StringComparison.Ordinal)
+				&& string.Equals(existing.Handle.MediaType, arguments.MediaType, StringComparison.OrdinalIgnoreCase))
+			{
+				return HostInvokeOutcome.Ok(new UiRegisterResourceResult { Resource = ToDto(existing.Handle) });
+			}
+
+			if (!uploads.TryTake(arguments.ContentHash, out var bytes, out var mediaType))
+			{
+				return HostInvokeOutcome.Ok(new UiRegisterResourceResult { UploadRequired = true });
+			}
+
+			if (!string.Equals(mediaType, arguments.MediaType, StringComparison.OrdinalIgnoreCase))
+			{
+				return HostInvokeOutcome.Failed(ProtocolErrorCodes.InvalidPayload,
+					"The media type differs from the one the upload declared.");
+			}
+
+			var handle = await context.UiResources
+				.RegisterAsync(arguments.Name, bytes, arguments.MediaType, cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(new UiRegisterResourceResult { Resource = ToDto(handle) });
+		}
+		catch (UiResourceException exception) when (exception.ErrorCode == UiResourceErrorCode.QuotaExceeded)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.UiResourceQuotaExceeded, exception.Message);
+		}
+		catch (ArgumentException exception)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> MusicPlayerArtworkAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var arguments = Require<UiRegisterMusicPlayerArtworkArguments>(payload);
+
+		if (!UiResourceRules.IsValidName(arguments.Name))
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.InvalidPayload,
+				"A UI resource name is a letter or digit followed by up to 63 letters, digits, hyphens or underscores.");
+		}
+
+		var artwork = context.UiResources.FindMusicPlayerArtwork(arguments.InstanceId, arguments.ArtworkId);
+		if (artwork is null)
+		{
+			return HostInvokeOutcome.Ok(new UiRegisterMusicPlayerArtworkResult());
+		}
+
+		if (artwork.Content.Length > ProtocolLimits.MaxUiResourceBytes)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.AssetTooLarge,
+				$"The artwork does not fit the {ProtocolLimits.MaxUiResourceBytes} byte UI resource limit.");
+		}
+
+		if (!UiResourceRules.IsSupportedMediaType(artwork.MediaType))
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.InvalidPayload,
+				$"The artwork is of media type '{artwork.MediaType}', which is not a supported UI resource type.");
+		}
+
+		try
+		{
+			var handle = await context.UiResources
+				.RegisterMusicPlayerArtworkAsync(arguments.Name,
+					arguments.InstanceId,
+					arguments.ArtworkId,
+					cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(new UiRegisterMusicPlayerArtworkResult
+			{
+				Resource = handle is null ? null : ToDto(handle)
+			});
+		}
+		catch (UiResourceException exception) when (exception.ErrorCode == UiResourceErrorCode.QuotaExceeded)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.UiResourceQuotaExceeded, exception.Message);
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> PluginIconAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var arguments = Require<GetIconResourceArguments>(payload);
+
+		try
+		{
+			var handle = await context.UiResources.GetPluginIconAsync(arguments.Key, arguments.Name, cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(ToDto(handle));
+		}
+		catch (UiResourceException exception) when (exception.ErrorCode == UiResourceErrorCode.PluginIconNotFound)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.PluginIconNotFound, exception.Message);
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> IconAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var arguments = Require<GetIconArguments>(payload);
+
+		try
+		{
+			var handle = await context.UiResources.GetIconAsync(arguments.IconId, cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(ToDto(handle));
+		}
+		catch (UiResourceException exception) when (exception.ErrorCode == UiResourceErrorCode.IconNotFound)
+		{
+			return HostInvokeOutcome.Failed(ProtocolErrorCodes.IconNotFound, exception.Message);
+		}
+	}
+
+	private static UiResourceHandleDto ToDto(UiResource handle)
+	{
+		return new UiResourceHandleDto
+		{
+			ResourceId = handle.ResourceId,
+			ContentHash = handle.ContentHash!,
+			MediaType = handle.MediaType!,
+			ByteLength = (int)handle.ByteLength!
+		};
+	}
+
+	private static async Task<HostInvokeOutcome> DevicesAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.Devices.Register:
+			{
+				var arguments = Require<DevicesRegisterArguments>(payload);
+				var registration = await context.Devices
+					.RegisterDeviceAsync(ToDescriptor(arguments.Device), cancellationToken)
+					.ConfigureAwait(false);
+
+				return HostInvokeOutcome.Ok(new DevicesRegisterResult
+				{
+					DeviceId = registration.DeviceId, ProviderDeviceId = registration.ProviderDeviceId
+				});
+			}
+
+			case HostOperations.Devices.Update:
+			{
+				var arguments = Require<DevicesRegisterArguments>(payload);
+				await context.Devices.UpdateDeviceAsync(ToDescriptor(arguments.Device), cancellationToken)
+					.ConfigureAwait(false);
+
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			case HostOperations.Devices.Presence:
+			{
+				var arguments = Require<DevicesPresenceArguments>(payload);
+				await context.Devices
+					.SetDevicePresenceAsync(arguments.DeviceId, ToPresence(arguments.Presence), cancellationToken)
+					.ConfigureAwait(false);
+
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			case HostOperations.Devices.Interaction:
+			{
+				var arguments = Require<DevicesInteractionArguments>(payload);
+				if (context.Devices.ResolveSession(arguments.SessionId) is not { } session)
+				{
+					return UnknownSession();
+				}
+
+				var result = await session.SendInteractionAsync(new DeviceInteraction
+						{
+							Kind = Enum.TryParse<DeviceInteractionKind>(arguments.Kind, true, out var kind)
+								? kind
+								: DeviceInteractionKind.Unknown,
+							Target = new DeviceInteractionTarget
+							{
+								WidgetId = arguments.WidgetId, ControlIndex = arguments.ControlIndex
+							},
+							Value = arguments.Value,
+							SurfaceRevision = arguments.SurfaceRevision,
+							Data = arguments.Data
+						},
+						cancellationToken)
+					.ConfigureAwait(false);
+
+				return HostInvokeOutcome.Ok(new DevicesInteractionResult
+				{
+					Accepted = result.Status != DeviceInteractionStatus.Rejected,
+					Unsupported = result.Status == DeviceInteractionStatus.NotSupported,
+					ReasonCode = result.ReasonCode
+				});
+			}
+
+			case HostOperations.Devices.Icon:
+			{
+				var arguments = Require<DevicesIconArguments>(payload);
+				if (context.Devices.ResolveSession(arguments.SessionId) is not { } session)
+				{
+					return UnknownSession();
+				}
+
+				var icon = await session
+					.GetIconAsync(arguments.IconId, arguments.Size, arguments.KnownETag, cancellationToken)
+					.ConfigureAwait(false);
+
+				if (icon is null)
+				{
+					return HostInvokeOutcome.Failed(ProtocolErrorCodes.InvalidPayload,
+						$"No icon '{arguments.IconId}' is available to this device session.");
+				}
+
+				// A cache hit costs no bytes and so needs no transfer. Anything else does, and this test
+				// host has no host.asset.* channel: reported as the capability being unavailable, exactly
+				// as a real host without an asset sender reports it, rather than as a silent empty icon.
+				return icon.NotModified
+					? HostInvokeOutcome.Ok(new DevicesIconResult
+					{
+						ContentType = icon.ContentType, ETag = icon.ETag, ByteLength = 0, NotModified = true
+					})
+					: HostInvokeOutcome.Failed(ProtocolErrorCodes.CapabilityUnavailable,
+						"This test host cannot transfer icon bytes to a plugin.");
+			}
+
+			case HostOperations.Devices.Close:
+			{
+				var arguments = Require<DevicesCloseArguments>(payload);
+				if (context.Devices.ResolveSession(arguments.SessionId) is not { } session)
+				{
+					return UnknownSession();
+				}
+
+				session.Close();
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			default:
+			{
+				var arguments = Require<DevicesUnregisterArguments>(payload);
+				await context.Devices.UnregisterDeviceAsync(arguments.DeviceId, cancellationToken)
+					.ConfigureAwait(false);
+
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> FolderViewsAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (string.Equals(payload.Operation, HostOperations.FolderViews.Register, StringComparison.Ordinal))
+		{
+			var arguments = Require<FolderViewsRegisterArguments>(payload);
+			var registration = await context.FolderViews
+				.RegisterFolderViewAsync(ToDescriptor(arguments.FolderView), cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(new FolderViewsRegisterResult
+			{
+				FolderViewId = registration.FolderViewId, ProviderId = registration.ProviderId
+			});
+		}
+
+		var unregister = Require<FolderViewsUnregisterArguments>(payload);
+		await context.FolderViews
+			.UnregisterFolderViewAsync(unregister.FolderViewId, cancellationToken)
+			.ConfigureAwait(false);
+
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static FolderViewDescriptor ToDescriptor(FolderViewDescriptorDto dto)
+	{
+		return new FolderViewDescriptor(dto.Id,
+			dto.Name,
+			dto.Description,
+			dto.Navigation,
+			dto.HasConfiguration,
+			dto.Metadata);
+	}
+
+	private static async Task<HostInvokeOutcome> ScreenSaversAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (string.Equals(payload.Operation, HostOperations.ScreenSavers.Register, StringComparison.Ordinal))
+		{
+			var arguments = Require<ScreenSaversRegisterArguments>(payload);
+			var registration = await context.ScreenSavers
+				.RegisterScreenSaverAsync(ToDescriptor(arguments.ScreenSaver), cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(new ScreenSaversRegisterResult
+			{
+				ScreenSaverId = registration.ScreenSaverId, ProviderId = registration.ProviderId
+			});
+		}
+
+		var unregister = Require<ScreenSaversUnregisterArguments>(payload);
+		await context.ScreenSavers
+			.UnregisterScreenSaverAsync(unregister.ScreenSaverId, cancellationToken)
+			.ConfigureAwait(false);
+
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static async Task<HostInvokeOutcome> VideoStreamsAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var videoStreams = context.VideoStreams;
+		switch (payload.Operation)
+		{
+			case HostOperations.VideoStreams.ProvidersChanged:
+				videoStreams.RecordProvidersChanged();
+				break;
+
+			case HostOperations.VideoStreams.StreamsChanged:
+				await videoStreams
+					.NotifyStreamsChangedAsync(Require<VideoStreamsStreamsChangedArguments>(payload).ProviderId,
+						cancellationToken)
+					.ConfigureAwait(false);
+				break;
+
+			case HostOperations.VideoStreams.SessionUpdate:
+			{
+				var update = Require<VideoStreamsSessionUpdateArguments>(payload);
+				await videoStreams.UpdateSessionAsync(update.SessionId,
+						WireEnum(update.State, VideoStreamSessionState.Reconnecting),
+						update.Description is { } description ? ToDescription(description) : null,
+						WireEnum(update.Reason, VideoStreamSessionReason.None),
+						update.Message,
+						cancellationToken)
+					.ConfigureAwait(false);
+				break;
+			}
+
+			default:
+			{
+				var close = Require<VideoStreamsSessionCloseArguments>(payload);
+				await videoStreams.CloseSessionAsync(close.SessionId,
+						WireEnum(close.Reason, VideoStreamSessionReason.None),
+						close.Message,
+						cancellationToken)
+					.ConfigureAwait(false);
+				break;
+			}
+		}
+
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static VideoStreamSessionDescription ToDescription(VideoStreamSessionDescriptionDto dto)
+	{
+		return VideoStreamSessionDescription.FromUrl(dto.Transport,
+			dto.Url ?? throw new ArgumentException("The description has no url.", nameof(dto)));
+	}
+
+	private static T WireEnum<T>(string? value, T fallback)
+		where T : struct, Enum
+	{
+		return value is not null && Enum.GetNames<T>().Contains(value, StringComparer.Ordinal)
+			? Enum.Parse<T>(value)
+			: fallback;
+	}
+
+	private static ScreenSaverDescriptor ToDescriptor(ScreenSaverDescriptorDto dto)
+	{
+		return new ScreenSaverDescriptor(dto.Id,
+			dto.Name,
+			dto.Description,
+			dto.HasConfiguration,
+			dto.Interactive,
+			dto.Metadata);
+	}
+
+	private static async Task<HostInvokeOutcome> WidgetTypesAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (string.Equals(payload.Operation, HostOperations.WidgetTypes.Register, StringComparison.Ordinal))
+		{
+			var arguments = Require<WidgetTypesRegisterArguments>(payload);
+			var registration = await context.WidgetTypes
+				.RegisterWidgetTypeAsync(ToDescriptor(arguments.WidgetType), cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(new WidgetTypesRegisterResult
+			{
+				WidgetTypeId = registration.WidgetTypeId, ProviderId = registration.ProviderId
+			});
+		}
+
+		var unregister = Require<WidgetTypesUnregisterArguments>(payload);
+		await context.WidgetTypes
+			.UnregisterWidgetTypeAsync(unregister.WidgetTypeId, cancellationToken)
+			.ConfigureAwait(false);
+
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static WidgetTypeDescriptor ToDescriptor(WidgetTypeDescriptorDto dto)
+	{
+		return new WidgetTypeDescriptor(dto.Id,
+			dto.Name,
+			dto.Description,
+			dto.DefaultData,
+			dto.DataSchema,
+			dto.HasConfiguration,
+			dto.Metadata)
+		{
+			SupportsFlows = dto.SupportsFlows,
+			AppearanceProperties = dto.AppearanceProperties is { } properties
+				? [.. properties.Select(property => (WidgetAppearanceProperty)property)]
+				: null,
+			DefaultShortPressAction = dto.DefaultShortPressAction is { } action
+				? new WidgetDefaultAction(action.ActionId, action.Parameters)
+				: null
+		};
+	}
+
+	private static async Task<HostInvokeOutcome> LayoutsAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (string.Equals(payload.Operation, HostOperations.Layouts.Register, StringComparison.Ordinal))
+		{
+			var arguments = Require<LayoutsRegisterArguments>(payload);
+			var registration = await context.Layouts
+				.RegisterLayoutAsync(ToDescriptor(arguments.Layout), cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(new LayoutsRegisterResult
+			{
+				LayoutId = registration.LayoutId, ProviderId = registration.ProviderId
+			});
+		}
+
+		var unregister = Require<LayoutsUnregisterArguments>(payload);
+		await context.Layouts.UnregisterLayoutAsync(unregister.LayoutId, cancellationToken).ConfigureAwait(false);
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static LayoutDescriptor ToDescriptor(LayoutDescriptorDto dto)
+	{
+		return new LayoutDescriptor(dto.Id,
+			dto.Name,
+			[.. dto.Regions.Select(ToRegion)],
+			dto.Capabilities is { } capabilities
+				? ToCapabilities(capabilities)
+				: null,
+			dto.Metadata);
+	}
+
+	private static LayoutRegion ToRegion(LayoutRegionDto dto)
+	{
+		return new LayoutRegion
+		{
+			Id = dto.Id,
+			Kind = dto.Kind,
+			Name = dto.Name,
+			Grid = dto.Grid is { } grid ? ToGrid(grid) : null,
+			Count = dto.Count,
+			Visuals = dto.Visuals is { } visuals ? ToVisuals(visuals) : null,
+			Extra = dto.Extra
+		};
+	}
+
+	private static LayoutGrid ToGrid(LayoutGridDto dto)
+	{
+		return new LayoutGrid
+		{
+			Rows = dto.Rows,
+			Columns = dto.Columns,
+			IsConfigurable = dto.IsConfigurable,
+			MinRows = dto.MinRows,
+			MaxRows = dto.MaxRows,
+			MinColumns = dto.MinColumns,
+			MaxColumns = dto.MaxColumns,
+			SupportsRuntimeResize = dto.SupportsRuntimeResize,
+			KeySize = dto.KeySize is { } keySize ? new LayoutKeySize(keySize.Width, keySize.Height) : null
+		};
+	}
+
+	private static LayoutVisualCapabilities ToVisuals(LayoutVisualCapabilitiesDto dto)
+	{
+		return new LayoutVisualCapabilities
+		{
+			StaticIcons = dto.StaticIcons,
+			AnimatedIcons = dto.AnimatedIcons,
+			Borders = dto.Borders,
+			BackgroundColors = dto.BackgroundColors,
+			TextLabels = dto.TextLabels,
+			Transparency = dto.Transparency,
+			MaxUpdatesPerSecond = dto.MaxUpdatesPerSecond
+		};
+	}
+
+	private static LayoutCapabilities ToCapabilities(LayoutCapabilitiesDto dto)
+	{
+		return new LayoutCapabilities
+			{ Visuals = dto.Visuals is { } visuals ? ToVisuals(visuals) : null, Extra = dto.Extra };
+	}
+
+	private static HostInvokeOutcome UnknownSession()
+	{
+		return HostInvokeOutcome.Failed(ProtocolErrorCodes.SessionNotFound,
+			"No open device session has that id.");
+	}
+
+	private static async Task<HostInvokeOutcome> VariableValuesAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (string.Equals(payload.Operation, HostOperations.VariableValues.Value, StringComparison.Ordinal))
+		{
+			var arguments = Require<VariableValuesValueArguments>(payload);
+
+			var values = arguments.Values
+				.Select(value => VariableValue.Of(value.Id, FromDto(value.Reading)))
+				.ToList();
+
+			await context.VariableValues.PublishAsync(values, cancellationToken).ConfigureAwait(false);
+			return HostInvokeOutcome.Ok((JsonElement?)null);
+		}
+
+		await context.VariableValues.InvalidateCatalogAsync(cancellationToken).ConfigureAwait(false);
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static VariableReading FromDto(VariableReadingDto reading)
+	{
+		return new VariableReading
+		{
+			Value = FromDto(reading.Value), Min = reading.Min, Max = reading.Max, Step = reading.Step
+		};
+	}
+
+	private static object? FromDto(VariableValueDto value)
+	{
+		return value.Kind switch
+		{
+			"text" => value.Text,
+			"number" => value.Number,
+			"boolean" => value.Boolean,
+			_ => null
+		};
+	}
+
+	private static DeviceDescriptor ToDescriptor(DeviceDescriptorDto dto)
+	{
+		return new DeviceDescriptor(dto.Id,
+			dto.Name,
+			dto.Model,
+			dto.Manufacturer,
+			dto.LayoutReference,
+			dto.Capabilities is { } capabilities
+				? new DeviceCapabilities
+				{
+					KeyCount = capabilities.KeyCount,
+					DialCount = capabilities.DialCount,
+					DisplayCount = capabilities.DisplayCount,
+					SupportsImages = capabilities.SupportsImages,
+					SupportsText = capabilities.SupportsText,
+					Extra = capabilities.Extra
+				}
+				: null,
+			ToPresence(dto.Presence),
+			dto.Metadata);
+	}
+
+	private static DevicePresence ToPresence(string? presence)
+	{
+		return Enum.TryParse<DevicePresence>(presence, true, out var parsed)
+			? parsed
+			: DevicePresence.Unknown;
+	}
+
+	private static async Task<HostInvokeOutcome> VariablesAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.Variables.List:
+				return HostInvokeOutcome.Ok(await context.Variables.GetAllAsync().ConfigureAwait(false));
+
+			case HostOperations.Variables.Get:
+			{
+				var arguments = Require<VariablesGetArguments>(payload);
+				return HostInvokeOutcome.Ok(
+					await context.Variables.GetByNameAsync(arguments.Name).ConfigureAwait(false));
+			}
+
+			case HostOperations.Variables.Create:
+			{
+				var arguments = Require<VariablesCreateArguments>(payload);
+				var handle = await context.Variables.CreateAsync(arguments.Name,
+						Enum.Parse<VariableType>(arguments.Type),
+						arguments.InitialValue.HasValue ? (object?)arguments.InitialValue.Value : null,
+						arguments.DecimalPlaces,
+						arguments.DefinitionId)
+					.ConfigureAwait(false);
+
+				return HostInvokeOutcome.Ok(handle);
+			}
+
+			case HostOperations.Variables.Set:
+			{
+				var arguments = Require<VariablesSetArguments>(payload);
+				await context.Variables
+					.SetValueAsync(arguments.VariableId,
+						arguments.Value.HasValue ? (object?)arguments.Value.Value : null)
+					.ConfigureAwait(false);
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			case HostOperations.Variables.Refresh:
+			{
+				var definitionIds = Optional<VariablesRefreshArguments>(payload)?.DefinitionIds;
+				if (definitionIds is { Count: > 0 })
+				{
+					await context.Variables.RequestDefinitionRefreshAsync(definitionIds).ConfigureAwait(false);
+				}
+				else
+				{
+					await context.Variables.RequestRefreshAsync().ConfigureAwait(false);
+				}
+
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			case HostOperations.Variables.Bind:
+			{
+				var arguments = Require<VariablesBindArguments>(payload);
+				var requests = arguments.Bindings
+					.Select(binding => new VariableBindingRequest(binding.LocalResourceId,
+						binding.Name,
+						Enum.Parse<VariableType>(binding.Type))
+					{
+						DecimalPlaces = binding.DecimalPlaces,
+						MigratedFrom = binding.MigratedFrom
+					})
+					.ToList();
+				IReadOnlyList<VariableBindingOutcome> outcomes;
+				try
+				{
+					outcomes = await context.Variables.BindAsync(requests).ConfigureAwait(false);
+				}
+				catch (ArgumentException exception)
+				{
+					return HostInvokeOutcome.Failed(ProtocolErrorCodes.InvalidPayload, exception.Message);
+				}
+
+				return HostInvokeOutcome.Ok(new VariablesBindResult
+				{
+					Outcomes = outcomes
+						.Select(outcome => outcome == VariableBindingOutcome.AlreadyBound
+							? VariableBindingOutcomes.AlreadyBound
+							: VariableBindingOutcomes.Bound)
+						.ToList()
+				});
+			}
+
+			case HostOperations.Variables.HistoryOpen:
+			{
+				var arguments = Require<VariablesHistoryOpenArguments>(payload);
+				var windowId = await context.Variables
+					.OpenWireHistoryAsync(arguments.Name, Math.Max(1, arguments.Capacity))
+					.ConfigureAwait(false);
+				return HostInvokeOutcome.Ok(new VariablesHistoryOpenResult { WindowId = windowId });
+			}
+
+			case HostOperations.Variables.HistoryRead:
+			{
+				var arguments = Require<VariablesHistoryWindowArguments>(payload);
+				return context.Variables.ReadWireHistory(arguments.WindowId) is { } values
+					? HostInvokeOutcome.Ok(new VariablesHistoryReadResult { Values = values })
+					: HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			case HostOperations.Variables.HistoryClose:
+			{
+				var arguments = Require<VariablesHistoryWindowArguments>(payload);
+				await context.Variables.CloseWireHistoryAsync(arguments.WindowId).ConfigureAwait(false);
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			default:
+			{
+				var arguments = Require<VariablesDeleteArguments>(payload);
+				await context.Variables.DeleteAsync(arguments.VariableId).ConfigureAwait(false);
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> UserVariablesAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (payload.Operation == HostOperations.UserVariables.Create)
+		{
+			var create = Require<UserVariablesCreateArguments>(payload);
+
+			var created = await context.UserVariables.CreateInContextAsync(create.Name,
+					new UserVariableContext(create.OwnerWidgetId, create.ScriptId, create.AutomationId),
+					Enum.Parse<VariableType>(create.Type),
+					create.InitialValue,
+					create.DecimalPlaces,
+					cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostInvokeOutcome.Ok(created);
+		}
+
+		var arguments = Require<UserVariablesApplyArguments>(payload);
+
+		var result = await context.UserVariables.ApplyInContextAsync(arguments.Name,
+				new UserVariableContext(arguments.OwnerWidgetId, arguments.ScriptId, arguments.AutomationId),
+				Enum.Parse<UserVariableOperation>(arguments.Operation),
+				arguments.Value,
+				cancellationToken)
+			.ConfigureAwait(false);
+
+		return HostInvokeOutcome.Ok(result);
+	}
+
+	private static async Task<HostInvokeOutcome> ConfigAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.Config.Entries:
+				return HostInvokeOutcome.Ok(await context.Config.GetEntriesAsync(cancellationToken)
+					.ConfigureAwait(false));
+
+			case HostOperations.Config.GetString:
+			{
+				var arguments = Require<ConfigGetArguments>(payload);
+
+				return HostInvokeOutcome.Ok(await context.Config
+					.GetStringAsync(arguments.EntryId, arguments.Key, cancellationToken)
+					.ConfigureAwait(false));
+			}
+
+			case HostOperations.Config.GetSecret:
+			{
+				var arguments = Require<ConfigGetArguments>(payload);
+
+				return HostInvokeOutcome.Ok(await context.Config
+					.GetSecretAsync(arguments.EntryId, arguments.Key, cancellationToken)
+					.ConfigureAwait(false));
+			}
+
+			case HostOperations.Config.SetString:
+			{
+				var arguments = Require<ConfigSetStringArguments>(payload);
+				await context.Config
+					.SetStringAsync(arguments.EntryId, arguments.Key, arguments.Value, cancellationToken)
+					.ConfigureAwait(false);
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+
+			default:
+			{
+				var arguments = Require<ConfigSetSecretArguments>(payload);
+				await context.Config
+					.SetSecretAsync(arguments.EntryId, arguments.Key, arguments.Value, cancellationToken)
+					.ConfigureAwait(false);
+				return HostInvokeOutcome.Ok((JsonElement?)null);
+			}
+		}
+	}
+
+	private static async Task<HostInvokeOutcome> DeckAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.Deck.ChangeFolder:
+			{
+				var arguments = Require<DeckChangeFolderArguments>(payload);
+				await context.Deck.ChangeFolderAsync(arguments.FolderId, arguments.OriginClientId, cancellationToken)
+					.ConfigureAwait(false);
+				break;
+			}
+
+			case HostOperations.Deck.ChangeProfile:
+			{
+				var arguments = Require<DeckChangeProfileArguments>(payload);
+				await context.Deck.ChangeProfileAsync(arguments.ProfileId, arguments.OriginClientId, cancellationToken)
+					.ConfigureAwait(false);
+				break;
+			}
+
+			case HostOperations.Deck.Parent:
+			{
+				var arguments = Require<DeckOriginArguments>(payload);
+				await context.Deck.GoToParentAsync(arguments.OriginClientId, cancellationToken).ConfigureAwait(false);
+				break;
+			}
+
+			default:
+			{
+				var arguments = Require<DeckOriginArguments>(payload);
+				await context.Deck.GoBackAsync(arguments.OriginClientId, cancellationToken).ConfigureAwait(false);
+				break;
+			}
+		}
+
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static async Task<HostInvokeOutcome> ScriptsAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var arguments = Require<ScriptsRunArguments>(payload);
+
+		var result = await context.Scripts
+			.RunAsync(arguments.ScriptId,
+				arguments.Inputs,
+				arguments.OriginClientId,
+				arguments.OwnerWidgetId,
+				cancellationToken)
+			.ConfigureAwait(false);
+
+		return HostInvokeOutcome.Ok(result);
+	}
+
+	private static async Task<HostInvokeOutcome> WidgetsAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		int negotiatedVersion,
+		CancellationToken cancellationToken)
+	{
+		if (payload.Operation == HostOperations.Widgets.GetData)
+		{
+			var arguments = Require<WidgetsGetDataArguments>(payload);
+			var data = await context.Widgets.GetWidgetDataAsync(arguments.WidgetId, cancellationToken)
+				.ConfigureAwait(false);
+			return data is null
+				? HostInvokeOutcome.Ok((JsonElement?)null)
+				: HostInvokeOutcome.Ok(new WidgetDataDto
+				{
+					WidgetId = data.WidgetId, WidgetTypeId = data.WidgetTypeId, Data = data.Data
+				});
+		}
+
+		var request = negotiatedVersion >= 2
+			? FromWire(Require<WidgetsApplyArgumentsV2>(payload))
+			: FromWire(Require<WidgetsApplyArgumentsV1>(payload));
+
+		var applied = await context.Widgets.ApplyAsync(request, cancellationToken).ConfigureAwait(false);
+		return HostInvokeOutcome.Ok(applied);
+	}
+
+	private static WidgetAppearanceRequest FromWire(WidgetsApplyArgumentsV1 v1)
+		=> new()
+		{
+			WidgetId = v1.WidgetId,
+			Patch = ToPatch(v1.Patch),
+#pragma warning disable CS0618 // Mapping the v1 wire shape's legacy selector back into the SDK request - this fake host's own tiny mirror of the real host's wire-compatibility shim.
+			State = (WidgetStateSelector)v1.State,
+#pragma warning restore CS0618
+			ClearProperties =
+				[.. v1.ClearProperties.Select(property => (WidgetAppearanceProperty)property)]
+		};
+
+	private static WidgetAppearanceRequest FromWire(WidgetsApplyArgumentsV2 v2)
+	{
+		return new WidgetAppearanceRequest
+		{
+			WidgetId = v2.WidgetId,
+			Patch = ToPatch(v2.Patch),
+			StateIds = [.. v2.StateIds],
+			ClearProperties =
+				[.. v2.ClearProperties.Select(property => (WidgetAppearanceProperty)property)]
+		};
+	}
+
+	private static WidgetAppearancePatch ToPatch(WidgetAppearancePatchDto dto)
+	{
+		return new WidgetAppearancePatch
+		{
+			Label = dto.Label,
+			BackgroundColor = dto.BackgroundColor,
+			LabelColor = dto.LabelColor,
+			IconId = dto.IconId,
+			IconFit = dto.IconFit,
+			IconZoom = dto.IconZoom,
+			IconOffsetX = dto.IconOffsetX,
+			IconOffsetY = dto.IconOffsetY,
+			IconOpacity = dto.IconOpacity,
+			IconColor = dto.IconColor,
+			FontFaceId = dto.FontFaceId,
+			FontSize = dto.FontSize,
+			TextAlign = dto.TextAlign,
+			LabelPosition = dto.LabelPosition,
+			BorderStyle = dto.BorderStyle,
+			BorderColor = dto.BorderColor,
+			AccentColor = dto.AccentColor,
+			IconAppearance = dto.IconAppearance
+		};
+	}
+
+	private static async Task<HostInvokeOutcome> NotificationsAsync(
+		FakeIntegrationContext context,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.Notifications.Notify:
+				context.Notifications.Notify(Require<Sdk.Notifications.UserNotificationRequest>(payload));
+				break;
+
+			case HostOperations.Notifications.Dismiss:
+				context.Notifications.Dismiss(Require<NotificationsDismissArguments>(payload).Key);
+				break;
+
+			case HostOperations.Notifications.Show:
+			{
+				var handle = await context.NotificationService
+					.ShowAsync(NotificationsWireMapper.ToOptions(Require<NotificationsShowArguments>(payload)),
+						cancellationToken)
+					.ConfigureAwait(false);
+				return HostInvokeOutcome.Ok(new NotificationsShowResult { Id = handle.Id });
+			}
+
+			case HostOperations.Notifications.Update:
+			{
+				var arguments = Require<NotificationsUpdateArguments>(payload);
+				var handle = context.NotificationService.Shown.FirstOrDefault(n => n.Id == arguments.Id && n.IsOpen);
+				if (handle is null)
+				{
+					return HostInvokeOutcome.Failed(ProtocolErrorCodes.CorrelationUnknown,
+						"The notification is not open.");
+				}
+
+				await handle.UpdateAsync(NotificationsWireMapper.ToUpdate(arguments), cancellationToken)
+					.ConfigureAwait(false);
+				break;
+			}
+
+			default:
+			{
+				var arguments = Require<NotificationsCloseArguments>(payload);
+				context.NotificationService.Shown.FirstOrDefault(n => n.Id == arguments.Id)
+					?.Close(Sdk.Notifications.NotificationCloseReason.Programmatic);
+				break;
+			}
+		}
+
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static HostInvokeOutcome ActionInteractions(FakeActionInteractions interactions, HostInvokePayload payload)
+	{
+		if (string.Equals(payload.Operation,
+			HostOperations.ActionInteractions.RequestItemPicker,
+			StringComparison.Ordinal))
+		{
+			var arguments = Require<ActionInteractionsRequestItemPickerArguments>(payload);
+
+			interactions.RequestItemPicker(arguments.OriginClientId,
+				arguments.InstanceId,
+				Enum.Parse<MusicPlayerCatalogItemKind>(arguments.Kind),
+				arguments.Prompt);
+		}
+		else
+		{
+			var arguments = Require<ActionInteractionsRequestDevicePickerArguments>(payload);
+
+			interactions.RequestDevicePicker(arguments.OriginClientId,
+				arguments.InstanceId,
+				arguments.StartPlayback,
+				arguments.Prompt);
+		}
+
+		return HostInvokeOutcome.Ok((JsonElement?)null);
+	}
+
+	private static T? Optional<T>(HostInvokePayload payload)
+		where T : class
+	{
+		return payload.Arguments is { ValueKind: JsonValueKind.Object } element
+			? element.Deserialize<T>(PluginProtocolJson.Options)
+			: null;
+	}
+
+	private static T Require<T>(HostInvokePayload payload)
+	{
+		if (payload.Arguments is not { } element)
+		{
+			throw new InvalidOperationException($"'{payload.Api}/{payload.Operation}' requires arguments.");
+		}
+
+		return element.Deserialize<T>(PluginProtocolJson.Options)
+			?? throw new InvalidOperationException(
+				$"'{payload.Api}/{payload.Operation}' arguments did not parse as {typeof(T).Name}.");
+	}
+}
+
+/// <summary>What a <c>host.invoke</c> produced, before it is written onto a <c>host.result</c> envelope.</summary>
+internal readonly struct HostInvokeOutcome
+{
+	public JsonElement? Data { get; private init; }
+
+	public ProtocolError? Error { get; private init; }
+
+	public static HostInvokeOutcome Ok(JsonElement? data)
+	{
+		return new HostInvokeOutcome { Data = data };
+	}
+
+	public static HostInvokeOutcome Ok<T>(T value)
+	{
+		return new HostInvokeOutcome { Data = JsonSerializer.SerializeToElement(value, PluginProtocolJson.Options) };
+	}
+
+	public static HostInvokeOutcome Failed(string code, string message)
+	{
+		return new HostInvokeOutcome
+			{ Error = new ProtocolError { Code = code, Message = message, Retryable = false } };
+	}
+
+	public static HostInvokeOutcome Failed(ProtocolError error)
+	{
+		return new HostInvokeOutcome { Error = error };
+	}
+}

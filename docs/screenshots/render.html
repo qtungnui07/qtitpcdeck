@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="stylesheet" href="styles/tokens.css">
+<link rel="stylesheet" href="styles/reset.css">
+<link rel="stylesheet" href="styles/animations.css">
+<link rel="stylesheet" href="styles/icons.css">
+<link rel="stylesheet" href="styles/widget-metrics.css">
+<link rel="stylesheet" href="styles/renderer.css">
+<link rel="stylesheet" href="styles/widget-border.css">
+<style>
+  html, body { margin: 0; background: transparent; }
+  #box {
+    position: relative;
+    overflow: hidden;
+    box-sizing: border-box;
+    background: var(--color-bg-secondary);
+    color: var(--color-text-primary);
+    border-radius: var(--radius);
+  }
+</style>
+<div id="box"></div>
+<script type="module">
+  import { bundledTranslator, renderUiNode, VideoStreamClient } from './runtime.js';
+
+  const name = new URLSearchParams(location.search).get('scene');
+  const scene = await (await fetch(`scenes/${name}.json`)).json();
+  const box = document.getElementById('box');
+  box.style.width = `${scene.width}px`;
+  box.style.height = `${scene.height}px`;
+  box.style.setProperty('--radius', `${scene.radius}px`);
+  box.classList.toggle('light', name.endsWith('-light'));
+
+  // A fixed clock keeps time and progress components identical on every run.
+  const fixedNow = Date.UTC(2026, 8, 12, 14, 5, 30);
+
+  const listeners = [];
+  let sessions = 0;
+  const videoStreams = new VideoStreamClient({
+    request(type, payload) {
+      if (type === 'GetVideoStreams') return new Promise(() => {});
+      if (type !== 'OpenVideoStream') return Promise.resolve(null);
+      const sessionId = `session-${++sessions}`;
+      setTimeout(() => listeners.forEach(listener => listener('VideoStreamSessionChangedEvent', {
+        sessionId, revision: 1, state: 'active', reason: 'none',
+        description: { transport: 'mjpeg', url: scene.resources?.[`stream:${payload.streamId}`] },
+      })));
+      return Promise.resolve({ sessionId, revision: 0, state: 'opening' });
+    },
+    onNotification: listener => { listeners.push(listener); return () => {}; },
+    onConnectionChanged: () => () => {},
+    connected: () => true,
+  });
+  const host = {
+    localization: { translate: (scope, key, args) => bundledTranslator(`${scope}:${key}`, args) },
+    resourceUrl: resource => scene.resources?.[resource?.resourceId] ?? null,
+    now: () => fixedNow,
+    culture: () => 'en-US',
+    hourCycle: () => 'h23',
+    simpleRendering: () => false,
+    fontFamily: () => null,
+    fontReady: () => true,
+    uiFontKey: () => '',
+    emit: () => {},
+    videoStreams: () => videoStreams.surface('deck'),
+  };
+
+  const scale = scene.scale ?? 1;
+  const surface = scale === 1 ? box : box.appendChild(document.createElement('div'));
+  if (scale !== 1) {
+    surface.style.width = `${scene.width / scale}px`;
+    surface.style.height = `${scene.height / scale}px`;
+    surface.style.transform = `scale(${scale})`;
+    surface.style.transformOrigin = '0 0';
+  }
+
+  try {
+    renderUiNode(surface, scene.root, { width: scene.width / scale, height: scene.height / scale }, null,
+      (scene.basis ?? Math.min(scene.width, scene.height)) / scale, host);
+    document.title = 'ready';
+  } catch (error) {
+    document.body.textContent = String(error?.stack ?? error);
+    document.title = 'error';
+  }
+</script>

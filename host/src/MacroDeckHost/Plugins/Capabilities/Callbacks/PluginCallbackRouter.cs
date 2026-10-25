@@ -1,0 +1,2731 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using MacroDeck.Plugin.Hosting.Capabilities.VideoStreamProvider;
+using MacroDeck.Plugin.Protocol.Assets;
+using MacroDeck.Plugin.Protocol.Callbacks;
+using MacroDeck.Plugin.Protocol.Callbacks.IconPacks;
+using MacroDeck.Plugin.Protocol.Callbacks.Ui;
+using MacroDeck.Plugin.Protocol.Capabilities;
+using MacroDeck.Plugin.Protocol.Capabilities.Ui;
+using MacroDeck.Plugin.Protocol.Handshake;
+using MacroDeck.Plugin.Protocol.Errors;
+using MacroDeck.Plugin.Protocol.Limits;
+using MacroDeck.Plugin.Protocol.Serialization;
+using MacroDeckHost.Application.Applications;
+using MacroDeckHost.Application.Batteries;
+using MacroDeckHost.Application.Deck;
+using MacroDeckHost.Application.Devices;
+using MacroDeckHost.Application.Devices.Surfaces;
+using MacroDeckHost.Application.FolderViews;
+using MacroDeckHost.Application.MusicPlayer;
+using MacroDeckHost.Application.ScreenSavers;
+using MacroDeckHost.Application.VideoStreams;
+using MacroDeck.Sdk.VideoStreams;
+using MacroDeck.Sdk.Ui;
+using MacroDeckHost.Application.Ui.Transport.Messages.Modals;
+using MacroDeckHost.Application.Ui.Transport;
+using MacroDeckHost.Application.Ui.Modals;
+using MacroDeckHost.Application.Layouts;
+using MacroDeckHost.Application.Notifications;
+using MacroDeckHost.Application.Persistence;
+using MacroDeckHost.Application.Plugins;
+using MacroDeckHost.Application.Plugins.Assets;
+using MacroDeckHost.Application.Plugins.Capabilities;
+using MacroDeckHost.Application.Plugins.Capabilities.Adapters.Devices;
+using MacroDeckHost.Application.Plugins.Capabilities.Adapters.Variables;
+using MacroDeckHost.Application.Plugins.Capabilities.Mapping;
+using MacroDeckHost.Application.Plugins.IconPacks;
+using MacroDeckHost.Application.Rendering;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Application.Ui.Resources;
+using MacroDeckHost.Application.Ui.Sessions;
+using MacroDeckHost.Application.Variables;
+using MacroDeckHost.Application.Weather;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Infrastructure.Integrations;
+using MacroDeckHost.Infrastructure.Variables;
+using MacroDeck.Plugin.Packaging.Manifest;
+using MacroDeck.Sdk.Actions;
+using MacroDeck.Sdk.Batteries;
+using MacroDeck.Sdk.Decks;
+using MacroDeck.Sdk.Devices;
+using MacroDeck.Sdk.Locale;
+using MacroDeck.Sdk.MusicPlayer;
+using MacroDeck.Sdk.Notifications;
+using MacroDeckHost.Application.Variables.Colors;
+using MacroDeck.Sdk.Scripts;
+using MacroDeck.Sdk.Variables;
+using MacroDeck.Sdk.Widgets;
+using MacroDeckHost.Application.HostLocking;
+using ILogger = Serilog.ILogger;
+
+namespace MacroDeckHost.Plugins.Capabilities.Callbacks;
+
+public sealed class PluginCallbackRouter : IPluginCallbackRouter
+{
+	private const int MaxConcurrentIconTransfers = 4;
+	private const int MaxMusicPlayerArtworkIdLength = 512;
+	private static readonly TimeSpan _defaultMusicPlayerArtworkTimeout = TimeSpan.FromSeconds(20);
+
+	private readonly IPluginSessionRegistry _sessionRegistry;
+	private readonly IPluginCapabilityInvoker _invoker;
+	private readonly IServiceScopeFactory _scopeFactory;
+	private readonly IUserNotificationStore _notificationStore;
+	private readonly IDeckNavigator _deckNavigator;
+	private readonly IScriptApi _scriptApi;
+	private readonly IWidgetApi _widgetApi;
+	private readonly IWidgetIconInvalidator _widgetIconInvalidator;
+	private readonly IUserVariableApi _userVariableApi;
+	private readonly IActionInteractions _actionInteractions;
+	private readonly IUiSessionSink _uiSessions;
+	private readonly IPluginDeviceRegistry _deviceRegistry;
+	private readonly ILayoutRegistry _layoutRegistry;
+	private readonly IFolderViewRegistry _folderViewRegistry;
+	private readonly IWidgetTypeRegistry _widgetTypeRegistry;
+	private readonly IScreenSaverRegistry _screenSaverRegistry;
+	private readonly IModalInteractionCoordinator _modals;
+	private readonly IUiTransport _transport;
+	private readonly IDeviceSurfaceService? _deviceSurfaces;
+	private readonly RemoteDeviceSessionRegistry? _deviceSessions;
+	private readonly IPluginHostAssetSender? _assets;
+	private readonly RemoteVariableSubscriptions? _variableSubscriptions;
+	private readonly VariableUpdateChannel? _dynamicVariableChannel;
+	private readonly VariableCatalogInvalidationSignal? _dynamicVariableInvalidation;
+	private readonly HostCallbackThrottle _throttle;
+	private readonly VideoStreamCallbackThrottle _videoStreamThrottle;
+	private readonly VideoStreamProviderRegistry? _videoStreamProviders;
+	private readonly IVideoStreamSessionBroker? _videoStreamSessions;
+	private readonly IPluginUiResources? _uiResources;
+	private readonly UiResourceCallbackThrottle _uiResourceThrottle;
+	private readonly IMusicPlayerArtworkService? _musicPlayerArtwork;
+	private readonly MusicPlayerArtworkCallbackThrottle _musicPlayerArtworkThrottle;
+	private readonly TimeSpan _musicPlayerArtworkTimeout;
+	private readonly IPluginIconPackSync? _iconPackSync;
+	private readonly IPluginIconPackUploads? _iconPackUploads;
+	private readonly IPluginIconUiResources? _pluginIconResources;
+	private readonly IPluginIconResolver? _pluginIconResolver;
+	private readonly PluginColorWatches? _colorWatches;
+	private readonly INotificationManager? _notificationManager;
+	private readonly IVariableRefreshSignal? _variableRefresh;
+	private readonly UiEventOrigins? _eventOrigins;
+	private readonly IWidgetDataReader? _widgetData;
+	private readonly PluginVariableHistoryWindows? _variableHistory;
+	private readonly VariableHistoryReadThrottle _variableHistoryReadThrottle;
+	private readonly IBatteryRegistry? _batteries;
+	private readonly IWeatherBroadcastTrigger? _weatherTrigger;
+	private readonly ILocaleApi? _locale;
+	private readonly IMusicPlayerAlbumColor? _albumColor;
+	private readonly PluginDesktopNotificationCallbacks? _desktopNotifications;
+
+	// Rate limiting alone does not bound this: an icon transfer outlives the call that started it, so a
+	// plugin fetching a full deck's icons at once would otherwise hold every image, and its base64 chunk
+	// copies, in memory simultaneously. Concurrent transfers per plugin are capped instead; the rest
+	// queue and start as earlier ones finish.
+	private readonly ConcurrentDictionary<string, SemaphoreSlim> _iconTransfers = new(StringComparer.Ordinal);
+	private readonly IHostLockState _lockState;
+	private readonly ILogger _logger;
+
+	public PluginCallbackRouter(
+		IPluginSessionRegistry sessionRegistry,
+		IPluginCapabilityInvoker invoker,
+		IServiceScopeFactory scopeFactory,
+		IUserNotificationStore notificationStore,
+		IDeckNavigator deckNavigator,
+		IScriptApi scriptApi,
+		IWidgetApi widgetApi,
+		IWidgetIconInvalidator widgetIconInvalidator,
+		IUserVariableApi userVariableApi,
+		IActionInteractions actionInteractions,
+		IUiSessionSink uiSessions,
+		IPluginDeviceRegistry deviceRegistry,
+		ILayoutRegistry layoutRegistry,
+		IFolderViewRegistry folderViewRegistry,
+		IWidgetTypeRegistry widgetTypeRegistry,
+		IScreenSaverRegistry screenSaverRegistry,
+		IModalInteractionCoordinator modals,
+		IUiTransport transport,
+		HostCallbackThrottle throttle,
+		IHostLockState lockState,
+		ILogger logger,
+		IDeviceSurfaceService? deviceSurfaces = null,
+		RemoteDeviceSessionRegistry? deviceSessions = null,
+		IPluginHostAssetSender? assets = null,
+		RemoteVariableSubscriptions? variableSubscriptions = null,
+		VariableUpdateChannel? dynamicVariableChannel = null,
+		VariableCatalogInvalidationSignal? dynamicVariableInvalidation = null,
+		IPluginUiResources? uiResources = null,
+		UiResourceCallbackThrottle? uiResourceThrottle = null,
+		IPluginIconPackSync? iconPackSync = null,
+		IPluginIconPackUploads? iconPackUploads = null,
+		IPluginIconUiResources? pluginIconResources = null,
+		IPluginIconResolver? pluginIconResolver = null,
+		VideoStreamProviderRegistry? videoStreamProviders = null,
+		IVideoStreamSessionBroker? videoStreamSessions = null,
+		VideoStreamCallbackThrottle? videoStreamThrottle = null,
+		IMusicPlayerArtworkService? musicPlayerArtwork = null,
+		MusicPlayerArtworkCallbackThrottle? musicPlayerArtworkThrottle = null,
+		TimeSpan? musicPlayerArtworkTimeout = null,
+		PluginColorWatches? colorWatches = null,
+		INotificationManager? notificationManager = null,
+		IVariableRefreshSignal? variableRefresh = null,
+		UiEventOrigins? eventOrigins = null,
+		IWidgetDataReader? widgetData = null,
+		PluginVariableHistoryWindows? variableHistory = null,
+		VariableHistoryReadThrottle? variableHistoryReadThrottle = null,
+		IBatteryRegistry? batteries = null,
+		IWeatherBroadcastTrigger? weatherTrigger = null,
+		ILocaleApi? locale = null,
+		IMusicPlayerAlbumColor? albumColor = null,
+		PluginDesktopNotificationCallbacks? desktopNotifications = null)
+	{
+		_desktopNotifications = desktopNotifications;
+		_weatherTrigger = weatherTrigger;
+		_albumColor = albumColor;
+		_locale = locale;
+		_widgetData = widgetData;
+		_variableHistory = variableHistory;
+		_variableHistoryReadThrottle
+			= variableHistoryReadThrottle ?? new VariableHistoryReadThrottle(TimeProvider.System);
+		_notificationManager = notificationManager;
+		_variableRefresh = variableRefresh;
+		_eventOrigins = eventOrigins;
+		_colorWatches = colorWatches;
+		_batteries = batteries;
+		_musicPlayerArtworkTimeout = musicPlayerArtworkTimeout ?? _defaultMusicPlayerArtworkTimeout;
+		_videoStreamProviders = videoStreamProviders;
+		_videoStreamSessions = videoStreamSessions;
+		_videoStreamThrottle = videoStreamThrottle ?? new VideoStreamCallbackThrottle(TimeProvider.System);
+		_iconPackSync = iconPackSync;
+		_iconPackUploads = iconPackUploads;
+		_pluginIconResources = pluginIconResources;
+		_pluginIconResolver = pluginIconResolver;
+		_uiResources = uiResources;
+		_uiResourceThrottle = uiResourceThrottle ?? new UiResourceCallbackThrottle(TimeProvider.System);
+		_musicPlayerArtwork = musicPlayerArtwork;
+		_musicPlayerArtworkThrottle
+			= musicPlayerArtworkThrottle ?? new MusicPlayerArtworkCallbackThrottle(TimeProvider.System);
+		_deviceSurfaces = deviceSurfaces;
+		_deviceSessions = deviceSessions;
+		_assets = assets;
+		_variableSubscriptions = variableSubscriptions;
+		_dynamicVariableChannel = dynamicVariableChannel;
+		_dynamicVariableInvalidation = dynamicVariableInvalidation;
+		_sessionRegistry = sessionRegistry;
+		_invoker = invoker;
+		_scopeFactory = scopeFactory;
+		_notificationStore = notificationStore;
+		_deckNavigator = deckNavigator;
+		_scriptApi = scriptApi;
+		_widgetApi = widgetApi;
+		_widgetIconInvalidator = widgetIconInvalidator;
+		_userVariableApi = userVariableApi;
+		_actionInteractions = actionInteractions;
+		_uiSessions = uiSessions;
+		_deviceRegistry = deviceRegistry;
+		_layoutRegistry = layoutRegistry;
+		_folderViewRegistry = folderViewRegistry;
+		_screenSaverRegistry = screenSaverRegistry;
+		_widgetTypeRegistry = widgetTypeRegistry;
+		_modals = modals;
+		_transport = transport;
+		_throttle = throttle;
+		_lockState = lockState;
+		_logger = logger.ForContext<PluginCallbackRouter>();
+	}
+
+	public Task<HostCallbackResult> RouteAsync(
+		string pluginId,
+		string correlationId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		return RouteAsync(pluginId, null, correlationId, payload, cancellationToken);
+	}
+
+	public Task<HostCallbackResult> RouteAsync(
+		string pluginId,
+		string? sessionId,
+		string correlationId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		return RouteAsync(pluginId, sessionId, null, correlationId, payload, cancellationToken);
+	}
+
+	public async Task<HostCallbackResult> RouteAsync(
+		string pluginId,
+		string? sessionId,
+		IPluginConnection? connection,
+		string correlationId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		ArgumentException.ThrowIfNullOrEmpty(pluginId);
+		ArgumentNullException.ThrowIfNull(payload);
+
+		if (Admit(pluginId, payload) is { } refused)
+		{
+			return refused;
+		}
+
+		try
+		{
+			return payload.Api switch
+			{
+				HostApis.Variables => await RouteVariablesAsync(pluginId, payload, cancellationToken),
+				HostApis.UserVariables => await RouteUserVariablesAsync(pluginId, payload, cancellationToken),
+				HostApis.Config => await RouteConfigAsync(pluginId, payload, cancellationToken),
+				HostApis.Deck => await RouteDeckAsync(payload, cancellationToken),
+				HostApis.Scripts => await RouteScriptsAsync(payload, cancellationToken),
+				HostApis.Widgets => await RouteWidgetsAsync(pluginId, payload, cancellationToken),
+				HostApis.Notifications => await RouteNotificationsAsync(pluginId, payload, cancellationToken),
+				HostApis.ActionInteractions => RouteActionInteractions(pluginId, correlationId, payload),
+				HostApis.Ui when payload.Operation == HostOperations.Ui.RegisterMusicPlayerArtwork
+					=> await RouteMusicPlayerArtworkAsync(pluginId, sessionId, payload, cancellationToken),
+				HostApis.Ui when payload.Operation is HostOperations.Ui.OriginReportFailure
+						or HostOperations.Ui.OriginShowModal
+						or HostOperations.Ui.OriginOpenUrl
+					=> await RouteUiOriginAsync(pluginId, payload, cancellationToken),
+				HostApis.Ui => RouteUi(pluginId, sessionId, payload),
+				HostApis.Devices => await RouteDevicesAsync(pluginId, payload, cancellationToken),
+				HostApis.VariableValues => RouteVariableValues(pluginId, payload),
+				HostApis.Layouts => await RouteLayoutsAsync(pluginId, payload, cancellationToken),
+				HostApis.FolderViews => await RouteFolderViewsAsync(pluginId, payload, cancellationToken),
+				HostApis.WidgetTypes => await RouteWidgetTypesAsync(pluginId, payload, cancellationToken),
+				HostApis.ScreenSavers => await RouteScreenSaversAsync(pluginId, payload, cancellationToken),
+				HostApis.IconPacks => await RouteIconPacksAsync(pluginId, sessionId, payload, cancellationToken),
+				HostApis.VideoStreams => RouteVideoStreams(pluginId, sessionId, connection, payload),
+				HostApis.Colors => RouteColors(pluginId, payload),
+				HostApis.Batteries => RouteBatteries(pluginId, sessionId, payload),
+				HostApis.Weather => RouteWeather(pluginId, payload),
+				HostApis.Locale => await RouteLocaleAsync(cancellationToken),
+				HostApis.MusicPlayers => await RouteMusicPlayerAlbumColorAsync(payload, cancellationToken),
+				HostApis.DesktopNotifications => await RouteDesktopNotificationsAsync(pluginId,
+					payload,
+					cancellationToken),
+				_ => HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+					$"The host has no api '{payload.Api}'.")
+			};
+		}
+		catch (Exception exception) when (exception is not OutOfMemoryException)
+		{
+			// A plugin is untrusted code the same way a capability handler is, so a failure inside a
+			// host service becomes a result rather than a torn-down socket. The message is not passed
+			// through - it may carry a path, a connection string, or other host internals.
+			PluginCallbackRouterLog.CallbackFailed(_logger, payload.Api, payload.Operation, pluginId, exception);
+
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InternalError,
+				ProtocolErrorMessages.For(ProtocolErrorCodes.InternalError));
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteDesktopNotificationsAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (_desktopNotifications is null)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+				"This host cannot show desktop notifications for plugins.");
+		}
+
+		return _desktopNotifications.Admit(pluginId)
+			?? await _desktopNotifications.ExecuteAsync(payload, cancellationToken);
+	}
+
+	private async Task<HostCallbackResult> RouteLocaleAsync(CancellationToken cancellationToken)
+	{
+		if (_locale is null)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+				"This host does not report the user's time format.");
+		}
+
+		var format = await _locale.GetTimeOfDayFormatAsync(cancellationToken);
+		return HostCallbackResult.Ok(new LocaleTimeOfDayFormatResult
+		{
+			Culture = format.Culture.Name,
+			HourCycle = format.HourCycle
+		});
+	}
+
+	private async Task<HostCallbackResult> RouteMusicPlayerAlbumColorAsync(
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (_albumColor is null)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+				"This host does not report album colours.");
+		}
+
+		var arguments = Deserialize<MusicPlayerAlbumColorArguments>(payload.Arguments);
+		if (arguments is null)
+		{
+			return MissingArguments();
+		}
+
+		if (string.IsNullOrEmpty(arguments.InstanceId) || arguments.InstanceId.Length > MaxMusicPlayerArtworkIdLength)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				$"A music player instance id is 1 to {MaxMusicPlayerArtworkIdLength} characters.");
+		}
+
+		using var lookup = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+		lookup.CancelAfter(_musicPlayerArtworkTimeout);
+		try
+		{
+			return HostCallbackResult.Ok(new MusicPlayerAlbumColorResult
+			{
+				Color = await _albumColor.GetAsync(arguments.InstanceId, lookup.Token)
+			});
+		}
+		catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.Timeout,
+				"The music player did not answer the artwork lookup in time.",
+				true);
+		}
+	}
+
+	public HostCallbackResult? Admit(string pluginId, HostInvokePayload payload)
+	{
+		if (!HostApis.IsKnown(payload.Api))
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+				$"The host has no api '{payload.Api}'.");
+		}
+
+		if (!HostOperations.IsKnown(payload.Api, payload.Operation))
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+				$"The '{payload.Api}' api has no operation '{payload.Operation}'.");
+		}
+
+		// Video session traffic is signalling that a stream start depends on, so a burst of it must not
+		// starve the plugin's other callbacks; it is charged to a bucket of its own instead.
+		if (string.Equals(payload.Api, HostApis.VideoStreams, StringComparison.Ordinal))
+		{
+			return _videoStreamThrottle.TryConsume(pluginId)
+				? null
+				: HostCallbackResult.Fail(ProtocolErrorCodes.RateLimited,
+					"This plugin is reporting video session changes too quickly.",
+					true);
+		}
+
+		// History windows are polled every second, so their reads get a bucket sized by the plugin's open
+		// windows instead of draining the budget of its other callbacks.
+		if (string.Equals(payload.Api, HostApis.Variables, StringComparison.Ordinal)
+			&& payload.Operation == HostOperations.Variables.HistoryRead)
+		{
+			return _variableHistoryReadThrottle.TryConsume(pluginId, _variableHistory?.OpenCount(pluginId) ?? 0)
+				? null
+				: CallingTooQuickly();
+		}
+
+		// The ui api is deliberately exempt. Its traffic is a per-session tree and patch stream whose rate
+		// is already bounded, per session, by ProtocolLimits.MaxUiUpdatesPerSecond and the session's own
+		// token bucket. Charging it to the shared per-plugin bucket as well would let one busy view
+		// starve every other callback the plugin makes, and would drop patches under a limiter that
+		// cannot ask for the resync the session limiter asks for.
+		if (!string.Equals(payload.Api, HostApis.Ui, StringComparison.Ordinal) && !_throttle.TryConsume(pluginId))
+		{
+			return CallingTooQuickly();
+		}
+
+		return null;
+	}
+
+	private static HostCallbackResult CallingTooQuickly()
+	{
+		return HostCallbackResult.Fail(ProtocolErrorCodes.RateLimited,
+			"This plugin is calling back into the host too quickly.",
+			true);
+	}
+
+	private async Task<HostCallbackResult> RouteVariablesAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		await using var scope = _scopeFactory.CreateAsyncScope();
+		var variableApi
+			= new IntegrationVariableApi(pluginId, scope.ServiceProvider.GetRequiredService<IVariableService>());
+
+		switch (payload.Operation)
+		{
+			case HostOperations.Variables.List:
+				return HostCallbackResult.Ok(await variableApi.GetAllAsync());
+
+			case HostOperations.Variables.Get:
+			{
+				var arguments = Deserialize<VariablesGetArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				return HostCallbackResult.Ok(await variableApi.GetByNameAsync(arguments.Name));
+			}
+
+			case HostOperations.Variables.Create:
+			{
+				var arguments = Deserialize<VariablesCreateArguments>(payload.Arguments);
+				if (arguments is null || !Enum.TryParse<VariableType>(arguments.Type, out var type))
+				{
+					return MissingArguments();
+				}
+
+				var created = await variableApi.CreateAsync(arguments.Name,
+					type,
+					arguments.InitialValue,
+					arguments.DecimalPlaces,
+					arguments.DefinitionId);
+
+				return HostCallbackResult.Ok(created);
+			}
+
+			case HostOperations.Variables.Set:
+			{
+				if (_lockState.IsLocked)
+				{
+					return HostLocked();
+				}
+
+				var arguments = Deserialize<VariablesSetArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await variableApi.SetValueAsync(arguments.VariableId, arguments.Value);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Variables.Delete:
+			{
+				var arguments = Deserialize<VariablesDeleteArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await variableApi.DeleteAsync(arguments.VariableId);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Variables.Refresh:
+				return RouteVariableRefresh(pluginId, payload);
+
+			case HostOperations.Variables.Bind:
+				return await RouteVariableBindAsync(pluginId, payload, cancellationToken);
+
+			case HostOperations.Variables.HistoryOpen:
+			case HostOperations.Variables.HistoryRead:
+			case HostOperations.Variables.HistoryClose:
+				return await RouteVariableHistoryAsync(pluginId, payload);
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private HostCallbackResult RouteVariableRefresh(string pluginId, HostInvokePayload payload)
+	{
+		var definitionIds = Deserialize<VariablesRefreshArguments>(payload.Arguments)?.DefinitionIds;
+		if (definitionIds is { Count: > ProtocolLimits.MaxVariableRefreshDefinitionIds })
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				$"A refresh names at most {ProtocolLimits.MaxVariableRefreshDefinitionIds} definition ids.");
+		}
+
+		var named = definitionIds?.Where(id => !string.IsNullOrEmpty(id)).ToList() ?? [];
+		if (named.Count == 0)
+		{
+			_variableRefresh?.RequestEagerRefresh(pluginId);
+			return HostCallbackResult.Ok();
+		}
+
+		foreach (var definitionId in named)
+		{
+			_variableRefresh?.RequestDefinitionRefresh(pluginId, definitionId);
+		}
+
+		return HostCallbackResult.Ok();
+	}
+
+	private async Task<HostCallbackResult> RouteVariableBindAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var arguments = Deserialize<VariablesBindArguments>(payload.Arguments);
+		if (arguments?.Bindings is null)
+		{
+			return MissingArguments();
+		}
+
+		if (arguments.Bindings.Count > ProtocolLimits.MaxVariableBindingsPerCall)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				$"One call records at most {ProtocolLimits.MaxVariableBindingsPerCall} bindings.");
+		}
+
+		var requests = new List<VariableBindingRequest>(arguments.Bindings.Count);
+		foreach (var binding in arguments.Bindings)
+		{
+			if (binding is null || !Enum.TryParse<VariableType>(binding.Type, out var type) || !Enum.IsDefined(type))
+			{
+				return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, "A binding names no variable type.");
+			}
+
+			requests.Add(new VariableBindingRequest(binding.LocalResourceId, binding.Name, type)
+			{
+				DecimalPlaces = binding.DecimalPlaces,
+				MigratedFrom = binding.MigratedFrom
+			});
+		}
+
+		await using var scope = _scopeFactory.CreateAsyncScope();
+		var appender = new VariableBindingAppender(scope.ServiceProvider.GetRequiredService<IVariableBindingStore>());
+		try
+		{
+			var outcomes = await appender.AppendAsync(pluginId, requests, cancellationToken);
+			return HostCallbackResult.Ok(new VariablesBindResult
+			{
+				Outcomes = outcomes
+					.Select(outcome => outcome == VariableBindingOutcome.AlreadyBound
+						? VariableBindingOutcomes.AlreadyBound
+						: VariableBindingOutcomes.Bound)
+					.ToList()
+			});
+		}
+		catch (ArgumentException exception)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+		catch (InvalidOperationException exception)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InternalError, exception.Message);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteVariableHistoryAsync(string pluginId, HostInvokePayload payload)
+	{
+		if (_variableHistory is null)
+		{
+			return UnknownOperation(payload);
+		}
+
+		if (payload.Operation == HostOperations.Variables.HistoryOpen)
+		{
+			var open = Deserialize<VariablesHistoryOpenArguments>(payload.Arguments);
+			if (open is null)
+			{
+				return MissingArguments();
+			}
+
+			try
+			{
+				return HostCallbackResult.Ok(new VariablesHistoryOpenResult
+				{
+					WindowId = _variableHistory.Open(pluginId, open.Name, open.Capacity)
+				});
+			}
+			catch (VariableHistoryException exception) when (exception.ErrorCode == VariableHistoryErrorCode.NotOwned)
+			{
+				return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+					"That name is not one of this plugin's own variables.");
+			}
+			catch (VariableHistoryException exception) when (exception.ErrorCode
+				== VariableHistoryErrorCode.LimitExceeded)
+			{
+				return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnavailable,
+					"This plugin holds as many variable history windows as Macro Deck allows.");
+			}
+		}
+
+		var window = Deserialize<VariablesHistoryWindowArguments>(payload.Arguments);
+		if (window is null)
+		{
+			return MissingArguments();
+		}
+
+		if (payload.Operation == HostOperations.Variables.HistoryRead)
+		{
+			return _variableHistory.Read(pluginId, window.WindowId) is { } values
+				? HostCallbackResult.Ok(new VariablesHistoryReadResult { Values = values })
+				: HostCallbackResult.Ok();
+		}
+
+		await _variableHistory.CloseAsync(pluginId, window.WindowId);
+		return HostCallbackResult.Ok();
+	}
+
+	private async Task<HostCallbackResult> RouteUserVariablesAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (_lockState.IsLocked)
+		{
+			return HostLocked();
+		}
+
+		_ = pluginId;
+
+		switch (payload.Operation)
+		{
+			case HostOperations.UserVariables.Apply:
+			{
+				var arguments = Deserialize<UserVariablesApplyArguments>(payload.Arguments);
+				if (arguments is null || !Enum.TryParse<UserVariableOperation>(arguments.Operation, out var operation))
+				{
+					return MissingArguments();
+				}
+
+				var result = await _userVariableApi.ApplyInContextAsync(arguments.Name,
+					new UserVariableContext(arguments.OwnerWidgetId, arguments.ScriptId, arguments.AutomationId),
+					operation,
+					arguments.Value,
+					cancellationToken);
+
+				return HostCallbackResult.Ok(result);
+			}
+
+			case HostOperations.UserVariables.Create:
+			{
+				var arguments = Deserialize<UserVariablesCreateArguments>(payload.Arguments);
+				if (arguments is null || !Enum.TryParse<VariableType>(arguments.Type, out var type))
+				{
+					return MissingArguments();
+				}
+
+				var result = await _userVariableApi.CreateInContextAsync(arguments.Name,
+					new UserVariableContext(arguments.OwnerWidgetId, arguments.ScriptId, arguments.AutomationId),
+					type,
+					arguments.InitialValue,
+					arguments.DecimalPlaces,
+					cancellationToken);
+
+				return HostCallbackResult.Ok(result);
+			}
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteConfigAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var config = new IntegrationConfig(pluginId, _scopeFactory);
+
+		switch (payload.Operation)
+		{
+			case HostOperations.Config.Entries:
+				return HostCallbackResult.Ok(await config.GetEntriesAsync(cancellationToken));
+
+			case HostOperations.Config.GetString:
+			{
+				var arguments = Deserialize<ConfigGetArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				return HostCallbackResult.Ok(await config.GetStringAsync(arguments.EntryId,
+					arguments.Key,
+					cancellationToken));
+			}
+
+			case HostOperations.Config.GetSecret:
+			{
+				var arguments = Deserialize<ConfigGetArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				return HostCallbackResult.Ok(await config.GetSecretAsync(arguments.EntryId,
+					arguments.Key,
+					cancellationToken));
+			}
+
+			case HostOperations.Config.SetString:
+			{
+				var arguments = Deserialize<ConfigSetStringArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await config.SetStringAsync(arguments.EntryId, arguments.Key, arguments.Value, cancellationToken);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Config.SetSecret:
+			{
+				var arguments = Deserialize<ConfigSetSecretArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await config.SetSecretAsync(arguments.EntryId, arguments.Key, arguments.Value, cancellationToken);
+				return HostCallbackResult.Ok();
+			}
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteDeckAsync(
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (_lockState.IsLocked)
+		{
+			return HostLocked();
+		}
+
+		switch (payload.Operation)
+		{
+			case HostOperations.Deck.ChangeFolder:
+			{
+				var arguments = Deserialize<DeckChangeFolderArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await _deckNavigator.ChangeFolderAsync(arguments.FolderId,
+					ClientOrigin(arguments.OriginClientId),
+					cancellationToken);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Deck.ChangeProfile:
+			{
+				var arguments = Deserialize<DeckChangeProfileArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await _deckNavigator.ChangeProfileAsync(arguments.ProfileId,
+					ClientOrigin(arguments.OriginClientId),
+					cancellationToken);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Deck.Parent:
+			{
+				var arguments = Deserialize<DeckOriginArguments>(payload.Arguments) ?? new DeckOriginArguments();
+				await _deckNavigator.GoToParentAsync(ClientOrigin(arguments.OriginClientId), cancellationToken);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Deck.Back:
+			{
+				var arguments = Deserialize<DeckOriginArguments>(payload.Arguments) ?? new DeckOriginArguments();
+				await _deckNavigator.GoBackAsync(ClientOrigin(arguments.OriginClientId), cancellationToken);
+				return HostCallbackResult.Ok();
+			}
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteScriptsAsync(
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (payload.Operation != HostOperations.Scripts.Run)
+		{
+			return UnknownOperation(payload);
+		}
+
+		if (_lockState.IsLocked)
+		{
+			return HostLocked();
+		}
+
+		var arguments = Deserialize<ScriptsRunArguments>(payload.Arguments);
+		if (arguments is null)
+		{
+			return MissingArguments();
+		}
+
+		var result = await _scriptApi.RunAsync(arguments.ScriptId,
+			arguments.Inputs,
+			ClientOrigin(arguments.OriginClientId),
+			arguments.OwnerWidgetId,
+			cancellationToken);
+		return HostCallbackResult.Ok(result);
+	}
+
+	private async Task<HostCallbackResult> RouteWidgetsAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (payload.Operation == HostOperations.Widgets.InvalidateIcon)
+		{
+			var invalidateArguments = Deserialize<WidgetsInvalidateIconArguments>(payload.Arguments);
+			if (invalidateArguments is null)
+			{
+				return MissingArguments();
+			}
+
+			// pluginId comes from the connection, never from the payload - a plugin can only ever
+			// invalidate its own actions.
+			_widgetIconInvalidator.Invalidate(pluginId, invalidateArguments.ActionId);
+			return HostCallbackResult.Ok();
+		}
+
+		if (payload.Operation == HostOperations.Widgets.GetData)
+		{
+			var getData = Deserialize<WidgetsGetDataArguments>(payload.Arguments);
+			if (getData is null)
+			{
+				return MissingArguments();
+			}
+
+			if (_widgetData is null)
+			{
+				return UnknownOperation(payload);
+			}
+
+			// pluginId comes from the connection, so a plugin only ever reads widgets of its own types.
+			return _widgetData.Read(pluginId, getData.WidgetId) is { } data
+				? HostCallbackResult.Ok(new WidgetDataDto
+				{
+					WidgetId = data.WidgetId, WidgetTypeId = data.WidgetTypeId, Data = data.Data
+				})
+				: HostCallbackResult.Ok();
+		}
+
+		if (payload.Operation != HostOperations.Widgets.Apply)
+		{
+			return UnknownOperation(payload);
+		}
+
+		var negotiatedVersion = _sessionRegistry.GetNegotiatedVersion(pluginId);
+		WidgetAppearanceRequest request;
+
+		if (negotiatedVersion is >= 2)
+		{
+			var arguments = Deserialize<WidgetsApplyArgumentsV2>(payload.Arguments);
+			if (arguments is null)
+			{
+				return MissingArguments();
+			}
+
+			request = WidgetStateWireCompatibility.ToApplyRequest(arguments);
+		}
+		else
+		{
+			var arguments = Deserialize<WidgetsApplyArgumentsV1>(payload.Arguments);
+			if (arguments is null)
+			{
+				return MissingArguments();
+			}
+
+			var targetStates = _widgetApi.GetWidgets()
+					.FirstOrDefault(widget => string.Equals(widget.Id, arguments.WidgetId, StringComparison.Ordinal))
+					?.States
+				?? [];
+
+			request = WidgetStateWireCompatibility.ToApplyRequest(arguments, targetStates);
+		}
+
+		var applied = await _widgetApi.ApplyAsync(request, cancellationToken);
+		return HostCallbackResult.Ok(applied);
+	}
+
+	private async Task<HostCallbackResult> RouteNotificationsAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		var displayName = DisplayNameOf(pluginId);
+		var notifier = new IntegrationUserNotifier(pluginId,
+			displayName,
+			_notificationStore,
+			Serilog.Log.Logger,
+			NotificationSourceCategory.Plugin);
+
+		switch (payload.Operation)
+		{
+			case HostOperations.Notifications.Notify:
+			{
+				var request = Deserialize<UserNotificationRequest>(payload.Arguments);
+				if (request is null)
+				{
+					return MissingArguments();
+				}
+
+				notifier.Notify(request);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Notifications.Dismiss:
+			{
+				var arguments = Deserialize<NotificationsDismissArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				notifier.Dismiss(arguments.Key);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Notifications.Show
+				or HostOperations.Notifications.Update
+				or HostOperations.Notifications.Close:
+				return await RouteInteractiveNotificationAsync(pluginId, displayName, payload, cancellationToken);
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteInteractiveNotificationAsync(
+		string pluginId,
+		string displayName,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (_notificationManager is null)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+				"This host cannot show notifications.");
+		}
+
+		var owner = new NotificationOwner(NotificationSourceCategory.Plugin, pluginId, displayName);
+
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.Notifications.Show:
+				{
+					var arguments = Deserialize<NotificationsShowArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					var outcome = await _notificationManager.ShowAsync(owner,
+						NotificationWireMapper.ToOptions(arguments),
+						cancellationToken);
+					return HostCallbackResult.Ok(new NotificationsShowResult { Id = outcome.Id });
+				}
+
+				case HostOperations.Notifications.Update:
+				{
+					var arguments = Deserialize<NotificationsUpdateArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					await _notificationManager.UpdateAsync(owner,
+						arguments.Id,
+						NotificationWireMapper.ToUpdate(arguments),
+						cancellationToken);
+					return HostCallbackResult.Ok();
+				}
+
+				default:
+				{
+					var arguments = Deserialize<NotificationsCloseArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					_notificationManager.Close(owner, arguments.Id);
+					return HostCallbackResult.Ok();
+				}
+			}
+		}
+		catch (NotificationException exception)
+		{
+			return exception.ErrorCode switch
+			{
+				NotificationErrorCode.LimitExceeded => HostCallbackResult.Fail(ProtocolErrorCodes.RateLimited,
+					exception.Message,
+					false),
+				NotificationErrorCode.NotFound => HostCallbackResult.Fail(ProtocolErrorCodes.CorrelationUnknown,
+					exception.Message),
+				_ => HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message)
+			};
+		}
+	}
+
+	private HostCallbackResult RouteActionInteractions(string pluginId, string correlationId, HostInvokePayload payload)
+	{
+		_ = correlationId; // the host.invoke's own id names nothing here - see ExecuteCorrelationId below.
+
+		switch (payload.Operation)
+		{
+			case HostOperations.ActionInteractions.ShowModal:
+			{
+				var arguments = Deserialize<ActionInteractionsShowModalArguments>(payload.Arguments);
+				if (arguments is null || string.IsNullOrEmpty(arguments.ViewId))
+				{
+					return MissingArguments();
+				}
+
+				if (!_invoker.IsLiveActionExecute(pluginId, arguments.ExecuteCorrelationId))
+				{
+					return NotALiveExecute();
+				}
+
+				return HostCallbackResult.Ok(ShowModal(pluginId, arguments));
+			}
+
+			case HostOperations.ActionInteractions.RequestItemPicker:
+			{
+				var arguments = Deserialize<ActionInteractionsRequestItemPickerArguments>(payload.Arguments);
+				if (arguments is null || !Enum.TryParse<MusicPlayerCatalogItemKind>(arguments.Kind, out var kind))
+				{
+					return MissingArguments();
+				}
+
+				if (!_invoker.IsLiveActionExecute(pluginId, arguments.ExecuteCorrelationId))
+				{
+					return NotALiveExecute();
+				}
+
+				_actionInteractions.RequestItemPicker(ClientOrigin(arguments.OriginClientId),
+					arguments.InstanceId,
+					kind,
+					arguments.Prompt);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.ActionInteractions.RequestDevicePicker:
+			{
+				var arguments = Deserialize<ActionInteractionsRequestDevicePickerArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (!_invoker.IsLiveActionExecute(pluginId, arguments.ExecuteCorrelationId))
+				{
+					return NotALiveExecute();
+				}
+
+				_actionInteractions.RequestDevicePicker(ClientOrigin(arguments.OriginClientId),
+					arguments.InstanceId,
+					arguments.StartPlayback,
+					arguments.Prompt);
+				return HostCallbackResult.Ok();
+			}
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private ActionInteractionsShowModalResult ShowModal(
+		string pluginId,
+		ActionInteractionsShowModalArguments arguments)
+	{
+		// A device origin is not a client that can render a dialog, so ClientOrigin's null is a refusal
+		// here rather than a broadcast: Register turns it into "not opened".
+		var originClientId = ClientOrigin(arguments.OriginClientId);
+
+		var modalId = _modals.Register(pluginId,
+			originClientId,
+			new ModalDefinition
+			{
+				ViewId = arguments.ViewId, Title = arguments.Title, Data = arguments.Data
+			});
+
+		if (modalId is null || originClientId is null)
+		{
+			return new ActionInteractionsShowModalResult { Opened = false };
+		}
+
+		_ = _transport.SendToGroup(UiClientGroups.For(originClientId),
+			new UiModalOpenedEvent { ModalId = modalId, Title = arguments.Title ?? default },
+			CancellationToken.None);
+
+		if (arguments.AwaitResult)
+		{
+			_ = DeliverModalResultAsync(pluginId, modalId);
+		}
+
+		return new ActionInteractionsShowModalResult { Opened = true, ModalId = modalId };
+	}
+
+	// The answer is a second exchange rather than this call's own result: host.invoke carries a fixed
+	// request deadline and a person is not bound by it. The wait always ends - the coordinator settles a
+	// modal when its session ends and sweeps one nobody could still be waiting on - so this never leaks.
+	private async Task DeliverModalResultAsync(string pluginId, string modalId)
+	{
+		try
+		{
+			var outcome = await _modals.AwaitAsync(modalId, CancellationToken.None).ConfigureAwait(false);
+
+			await _invoker.InvokeAsync(pluginId,
+					new CapabilityInvokeRequest
+					{
+						Kind = CapabilityKinds.Ui,
+						LocalId = ProviderCapabilityId.LocalId,
+						Operation = CapabilityOperations.Ui.ModalResult,
+						Arguments = JsonSerializer.SerializeToElement(new UiModalResultArguments
+							{
+								ModalId = modalId,
+								Cancelled = outcome.Cancelled,
+								Value = outcome.Cancelled ? null : outcome.Value
+							},
+							PluginProtocolJson.Options)
+					},
+					CancellationToken.None)
+				.ConfigureAwait(false);
+		}
+		catch (Exception exception) when (exception is not OutOfMemoryException)
+		{
+			// The plugin's own wait is bounded by the flow it runs in, so a result that cannot be
+			// delivered - a plugin that disconnected while its modal was open - costs it a cancellation,
+			// not a hang.
+			PluginCallbackRouterLog.CallbackFailed(_logger,
+				HostApis.ActionInteractions,
+				HostOperations.ActionInteractions.ShowModal,
+				pluginId,
+				exception);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteScreenSaversAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		// The provider is the authenticated plugin, never anything the payload claims.
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.ScreenSavers.Register:
+				{
+					var arguments = Deserialize<ScreenSaversRegisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					var registration = await _screenSaverRegistry.Register(pluginId,
+						ScreenSaverDescriptorMapper.ToDescriptor(arguments.ScreenSaver),
+						cancellationToken);
+
+					return HostCallbackResult.Ok(new ScreenSaversRegisterResult
+					{
+						ScreenSaverId = registration.ScreenSaverId, ProviderId = registration.ProviderId
+					});
+				}
+
+				case HostOperations.ScreenSavers.Unregister:
+				{
+					var arguments = Deserialize<ScreenSaversUnregisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					await _screenSaverRegistry.Unregister(pluginId, arguments.ScreenSaverId, cancellationToken);
+					return HostCallbackResult.Ok();
+				}
+
+				default:
+					return UnknownOperation(payload);
+			}
+		}
+		catch (ArgumentException exception)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+	}
+
+	private HostCallbackResult RouteVideoStreams(
+		string pluginId,
+		string? sessionId,
+		IPluginConnection? connection,
+		HostInvokePayload payload)
+	{
+		if (_videoStreamProviders is null || _videoStreamSessions is null)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+				"This host does not serve video streams.");
+		}
+
+		// The provider is always the authenticated plugin: a session id names a session only within it.
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.VideoStreams.ProvidersChanged:
+					ObserveVideoStreamPull(
+						_videoStreamProviders.RequestProvidersPullAsync(pluginId, sessionId, connection),
+						pluginId);
+					return HostCallbackResult.Ok();
+
+				case HostOperations.VideoStreams.StreamsChanged:
+				{
+					var arguments = Deserialize<VideoStreamsStreamsChangedArguments>(payload.Arguments);
+					if (string.IsNullOrEmpty(arguments?.ProviderId))
+					{
+						return MissingArguments();
+					}
+
+					ObserveVideoStreamPull(
+						_videoStreamProviders.RequestStreamsPullAsync(pluginId, arguments.ProviderId),
+						pluginId);
+					return HostCallbackResult.Ok();
+				}
+
+				case HostOperations.VideoStreams.SessionUpdate:
+				{
+					var arguments = Deserialize<VideoStreamsSessionUpdateArguments>(payload.Arguments);
+					if (string.IsNullOrEmpty(arguments?.SessionId))
+					{
+						return MissingArguments();
+					}
+
+					if (arguments.Description is not null
+						&& VideoStreamWire.ValidateDescription(arguments.Description) is { } problem)
+					{
+						return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, problem);
+					}
+
+					_videoStreamSessions.ApplyProviderUpdate(pluginId,
+						arguments.SessionId,
+						VideoStreamWire.ParseSessionState(arguments.State),
+						arguments.Description,
+						VideoStreamWire.ParseReason(arguments.Reason),
+						arguments.Message);
+					return HostCallbackResult.Ok();
+				}
+
+				case HostOperations.VideoStreams.SessionClose:
+				{
+					var arguments = Deserialize<VideoStreamsSessionCloseArguments>(payload.Arguments);
+					if (string.IsNullOrEmpty(arguments?.SessionId))
+					{
+						return MissingArguments();
+					}
+
+					_videoStreamSessions.ApplyProviderClose(pluginId,
+						arguments.SessionId,
+						VideoStreamWire.ParseReason(arguments.Reason),
+						arguments.Message);
+					return HostCallbackResult.Ok();
+				}
+
+				default:
+					return UnknownOperation(payload);
+			}
+		}
+		catch (VideoStreamBrokerException exception) when (exception.Error == VideoStreamError.UnknownSession)
+		{
+			var error = VideoStreamWire.ToError(VideoStreamErrorCode.UnknownSession, exception.Message);
+			return HostCallbackResult.Fail(error.Code, error.Message, error.Retryable, error.Details);
+		}
+	}
+
+	private void ObserveVideoStreamPull(Task pull, string pluginId)
+	{
+		_ = pull.ContinueWith(task => _logger.Warning(task.Exception,
+				"Refreshing the video streams of plugin {PluginId} failed",
+				pluginId),
+			CancellationToken.None,
+			TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+			TaskScheduler.Default);
+	}
+
+	private async Task<HostCallbackResult> RouteFolderViewsAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		// The provider is the authenticated plugin, never anything the payload claims: one plugin must
+		// not be able to register or withdraw a folder view in another plugin's name.
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.FolderViews.Register:
+				{
+					var arguments = Deserialize<FolderViewsRegisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					var registration = await _folderViewRegistry.Register(pluginId,
+						FolderViewDescriptorMapper.ToDescriptor(arguments.FolderView),
+						cancellationToken);
+
+					return HostCallbackResult.Ok(new FolderViewsRegisterResult
+					{
+						FolderViewId = registration.FolderViewId, ProviderId = registration.ProviderId
+					});
+				}
+
+				case HostOperations.FolderViews.Unregister:
+				{
+					var arguments = Deserialize<FolderViewsUnregisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					await _folderViewRegistry.Unregister(pluginId, arguments.FolderViewId, cancellationToken);
+					return HostCallbackResult.Ok();
+				}
+
+				default:
+					return UnknownOperation(payload);
+			}
+		}
+		catch (ArgumentException exception)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteWidgetTypesAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		// The provider is the authenticated plugin, never anything the payload claims: one plugin must
+		// not be able to register or withdraw a widget type in another plugin's name.
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.WidgetTypes.Register:
+				{
+					var arguments = Deserialize<WidgetTypesRegisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					var registration = await _widgetTypeRegistry.Register(pluginId,
+						WidgetTypeDescriptorMapper.ToDescriptor(arguments.WidgetType),
+						cancellationToken);
+
+					return HostCallbackResult.Ok(new WidgetTypesRegisterResult
+					{
+						WidgetTypeId = registration.WidgetTypeId, ProviderId = registration.ProviderId
+					});
+				}
+
+				case HostOperations.WidgetTypes.Unregister:
+				{
+					var arguments = Deserialize<WidgetTypesUnregisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					await _widgetTypeRegistry.Unregister(pluginId, arguments.WidgetTypeId, cancellationToken);
+					return HostCallbackResult.Ok();
+				}
+
+				default:
+					return UnknownOperation(payload);
+			}
+		}
+		catch (ArgumentException exception)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteLayoutsAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		// The provider is the authenticated plugin, never anything the payload claims: one plugin must
+		// not be able to register or withdraw a layout in another plugin's name.
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.Layouts.Register:
+				{
+					var arguments = Deserialize<LayoutsRegisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					var registration = await _layoutRegistry.Register(pluginId,
+						LayoutDescriptorMapper.ToDescriptor(arguments.Layout),
+						cancellationToken);
+
+					return HostCallbackResult.Ok(new LayoutsRegisterResult
+					{
+						LayoutId = registration.LayoutId, ProviderId = registration.ProviderId
+					});
+				}
+
+				case HostOperations.Layouts.Unregister:
+				{
+					var arguments = Deserialize<LayoutsUnregisterArguments>(payload.Arguments);
+					if (arguments is null)
+					{
+						return MissingArguments();
+					}
+
+					await _layoutRegistry.Unregister(pluginId, arguments.LayoutId, cancellationToken);
+					return HostCallbackResult.Ok();
+				}
+
+				default:
+					return UnknownOperation(payload);
+			}
+		}
+		catch (ArgumentException exception)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteDevicesAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		// The provider is the authenticated plugin, never anything the payload claims: one plugin must
+		// not be able to register, move or withdraw a device in another plugin's name.
+		try
+		{
+			return await RouteDevicesCoreAsync(pluginId, payload, cancellationToken);
+		}
+		catch (ArgumentException exception)
+		{
+			// A malformed registration is the plugin's mistake to fix, so it is told what was wrong
+			// rather than being handed the generic internal-error reply the catch-all would produce.
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+		catch (DeviceSessionException exception)
+		{
+			return HostCallbackResult.Fail(ToProtocolCode(exception.ReasonCode), exception.Message);
+		}
+	}
+
+	private async Task<HostCallbackResult> RouteDevicesCoreAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.Devices.Register:
+			{
+				var arguments = Deserialize<DevicesRegisterArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (InvalidDevice(arguments) is { } invalid)
+				{
+					return invalid;
+				}
+
+				var registration = await _deviceRegistry.RegisterAsync(pluginId,
+					DeviceDescriptorMapper.ToDescriptor(arguments.Device),
+					cancellationToken);
+
+				return HostCallbackResult.Ok(new DevicesRegisterResult
+				{
+					DeviceId = registration.DeviceId, ProviderDeviceId = registration.ProviderDeviceId
+				});
+			}
+
+			case HostOperations.Devices.Update:
+			{
+				var arguments = Deserialize<DevicesRegisterArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (InvalidDevice(arguments) is { } invalid)
+				{
+					return invalid;
+				}
+
+				await _deviceRegistry.UpdateAsync(pluginId,
+					DeviceDescriptorMapper.ToDescriptor(arguments.Device),
+					cancellationToken);
+
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Devices.Presence:
+			{
+				var arguments = Deserialize<DevicesPresenceArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await _deviceRegistry.SetPresenceAsync(pluginId,
+					arguments.DeviceId,
+					DeviceDescriptorMapper.ToPresence(arguments.Presence),
+					cancellationToken);
+
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Devices.Unregister:
+			{
+				var arguments = Deserialize<DevicesUnregisterArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				await _deviceRegistry.UnregisterAsync(pluginId, arguments.DeviceId, cancellationToken);
+
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Devices.Interaction:
+			{
+				var arguments = Deserialize<DevicesInteractionArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (ResolveSession(pluginId, arguments.SessionId) is not { } deviceId)
+				{
+					return UnknownSession();
+				}
+
+				var outcome = await _deviceSurfaces!.SubmitInteractionAsync(deviceId,
+					new DeviceInteraction
+					{
+						Kind = ToInteractionKind(arguments.Kind),
+						Target = new DeviceInteractionTarget
+						{
+							WidgetId = arguments.WidgetId, ControlIndex = arguments.ControlIndex
+						},
+						Value = arguments.Value,
+						SurfaceRevision = arguments.SurfaceRevision,
+						Data = arguments.Data
+					},
+					cancellationToken);
+
+				// A refusal is a verdict, not a protocol error: it comes back as a result so a remote
+				// provider reads the same outcome an in-process one gets from the surface service.
+				return HostCallbackResult.Ok(new DevicesInteractionResult
+				{
+					Accepted = outcome.ErrorCode is null,
+					Unsupported = outcome.Unsupported,
+					ReasonCode = outcome.ErrorCode
+				});
+			}
+
+			case HostOperations.Devices.Icon:
+			{
+				var arguments = Deserialize<DevicesIconArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (ResolveSession(pluginId, arguments.SessionId) is not { } deviceId)
+				{
+					return UnknownSession();
+				}
+
+				// Parsed here rather than deeper: the icon id is a plugin-supplied string, and everything
+				// below this point treats it as an identity it may look up.
+				if (!Guid.TryParse(arguments.IconId, out _))
+				{
+					return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+						"An icon id must be a GUID.");
+				}
+
+				var icon = await _deviceSurfaces!.GetIconAsync(deviceId,
+					arguments.IconId,
+					arguments.Size,
+					arguments.KnownETag,
+					cancellationToken);
+
+				if (icon is null)
+				{
+					return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+						$"No icon '{arguments.IconId}' is available to this device session.");
+				}
+
+				return IconResult(pluginId, icon);
+			}
+
+			case HostOperations.Devices.WidgetIcon:
+			{
+				var arguments = Deserialize<DevicesWidgetIconArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (ResolveSession(pluginId, arguments.SessionId) is not { } deviceId)
+				{
+					return UnknownSession();
+				}
+
+				var icon = await _deviceSurfaces!.GetWidgetIconAsync(deviceId,
+					arguments.WidgetId,
+					arguments.KnownETag,
+					cancellationToken);
+
+				// Unlike the icon-pack Icon case above, nothing to serve for this widget right now is
+				// routine churn - the provider went inactive, answered blank, or the id fell off the
+				// surface between push and fetch - not a protocol violation, so it is answered with no
+				// value rather than a failure.
+				return icon is null ? HostCallbackResult.Ok() : WidgetIconResult(pluginId, icon);
+			}
+
+			case HostOperations.Devices.Close:
+			{
+				var arguments = Deserialize<DevicesCloseArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (ResolveSession(pluginId, arguments.SessionId) is not { } deviceId)
+				{
+					return UnknownSession();
+				}
+
+				await _deviceSurfaces!.CloseAsync(deviceId, null, cancellationToken);
+
+				return HostCallbackResult.Ok();
+			}
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private static HostCallbackResult? InvalidDevice(DevicesRegisterArguments arguments)
+	{
+		if (string.IsNullOrWhiteSpace(arguments.Device.Id))
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				"A device registration needs a stable, non-empty device id.");
+		}
+
+		return string.IsNullOrWhiteSpace(arguments.Device.Name)
+			? HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				"A device registration needs a non-empty name.")
+			: null;
+	}
+
+	// Runs before the payload validator, so size and shape checks see the bytes that are relayed.
+	private UiRawJson TranslatePluginIcons(string pluginId, UiRawJson payload)
+	{
+		return _pluginIconResolver is null
+			? payload
+			: PluginIconTreeRewriter.Rewrite(pluginId, payload, _pluginIconResolver);
+	}
+
+	private async Task<HostCallbackResult> RouteIconPacksAsync(
+		string pluginId,
+		string? sessionId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.IconPacks.SyncBundled:
+			{
+				if (_iconPackSync is null || _iconPackUploads is null)
+				{
+					return UnknownOperation(payload);
+				}
+
+				var arguments = Deserialize<IconPackSyncArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				// Only a session the user admitted with a developer token or pairing may declare packs; an
+				// installed plugin's packs come from its signed package alone.
+				if (DevelopmentSessionOf(pluginId, sessionId) is not { } session)
+				{
+					return HostCallbackResult.Fail(ProtocolErrorCodes.IconPackSyncNotAllowed,
+						ProtocolErrorMessages.For(ProtocolErrorCodes.IconPackSyncNotAllowed));
+				}
+
+				if (InvalidDeclaration(arguments) is { } invalid)
+				{
+					return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, invalid);
+				}
+
+				var packs = new List<DevelopmentIconPack>(arguments.Packs.Count);
+				var missing = new List<string>();
+				foreach (var declared in arguments.Packs)
+				{
+					if (_iconPackUploads.Find(pluginId, declared.ContentHash) is { } bytes)
+					{
+						packs.Add(new DevelopmentIconPack(declared.Key, declared.ContentHash, bytes));
+					}
+					else if (!missing.Contains(declared.ContentHash, StringComparer.Ordinal))
+					{
+						missing.Add(declared.ContentHash);
+					}
+				}
+
+				if (missing.Count > 0)
+				{
+					return HostCallbackResult.Ok(new IconPackSyncResult { UploadRequired = missing });
+				}
+
+				var result = await _iconPackSync.SyncDevelopmentAsync(pluginId,
+					session.SessionId,
+					session.DisplayName,
+					packs,
+					cancellationToken);
+
+				if (result.Status != PluginIconPackSyncStatus.Skipped)
+				{
+					_iconPackUploads.Retain(pluginId, packs.Select(pack => pack.ContentHash).ToList());
+				}
+
+				return result.Status switch
+				{
+					PluginIconPackSyncStatus.Invalid => HostCallbackResult.Fail(ProtocolErrorCodes.IconPackInvalid,
+						$"{ProtocolErrorMessages.For(ProtocolErrorCodes.IconPackInvalid)} Keys: {string.Join(", ", result.InvalidKeys ?? [])}."),
+					PluginIconPackSyncStatus.Skipped => HostCallbackResult.Fail(
+						ProtocolErrorCodes.CapabilityUnavailable,
+						"The host's icon packs are not ready yet.",
+						true),
+					_ => HostCallbackResult.Ok(new IconPackSyncResult { Changed = result.Changed })
+				};
+			}
+
+			case HostOperations.IconPacks.GetIconResource:
+			{
+				if (_pluginIconResources is null)
+				{
+					return UnknownOperation(payload);
+				}
+
+				var arguments = Deserialize<GetIconResourceArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (!PluginBundledIconPacks.IsValidKey(arguments.Key)
+					|| string.IsNullOrEmpty(arguments.Name)
+					|| arguments.Name.Contains('/'))
+				{
+					return HostCallbackResult.Fail(ProtocolErrorCodes.PluginIconNotFound,
+						ProtocolErrorMessages.For(ProtocolErrorCodes.PluginIconNotFound));
+				}
+
+				var resource = await _pluginIconResources.GetHandleAsync(pluginId,
+					arguments.Key,
+					arguments.Name,
+					cancellationToken);
+
+				return IconResourceResult(resource, ProtocolErrorCodes.PluginIconNotFound);
+			}
+
+			case HostOperations.IconPacks.GetIcon:
+			{
+				if (_pluginIconResources is null)
+				{
+					return UnknownOperation(payload);
+				}
+
+				var arguments = Deserialize<GetIconArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				var resource = await _pluginIconResources.GetHandleAsync(arguments.IconId, cancellationToken);
+
+				return IconResourceResult(resource, ProtocolErrorCodes.IconNotFound);
+			}
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private PluginSessionSnapshot? DevelopmentSessionOf(string pluginId, string? sessionId)
+	{
+		return sessionId is null
+			? null
+			: _sessionRegistry.Snapshot()
+				.FirstOrDefault(session => string.Equals(session.SessionId, sessionId, StringComparison.Ordinal)
+					&& string.Equals(session.PluginId, pluginId, StringComparison.Ordinal)
+					&& session.State == PluginSessionState.Connected
+					&& session.Origin == PluginSessionOrigin.SelfRegistered);
+	}
+
+	private static string? InvalidDeclaration(IconPackSyncArguments arguments)
+	{
+		if (arguments.Packs.Count > PluginBundledIconPacks.MaxCount)
+		{
+			return $"A plugin may declare at most {PluginBundledIconPacks.MaxCount} bundled icon packs.";
+		}
+
+		var keys = new HashSet<string>(StringComparer.Ordinal);
+		foreach (var pack in arguments.Packs)
+		{
+			if (!PluginBundledIconPacks.IsValidKey(pack.Key) || !keys.Add(pack.Key))
+			{
+				return $"'{pack.Key}' is not a usable, unique bundled icon pack key.";
+			}
+
+			if (!AssetContentHash.IsValid(pack.ContentHash)
+				|| pack.ByteLength <= 0
+				|| pack.ByteLength > ProtocolLimits.MaxAssetBytes)
+			{
+				return $"Bundled icon pack '{pack.Key}' names no valid archive.";
+			}
+		}
+
+		return null;
+	}
+
+	// The ui api is exempt from the per-plugin throttle for its tree traffic; an origin call puts something
+	// on a user's screen, so it is charged like any other callback.
+	private async Task<HostCallbackResult> RouteUiOriginAsync(
+		string pluginId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (_eventOrigins is null)
+		{
+			return UnknownOperation(payload);
+		}
+
+		if (!_throttle.TryConsume(pluginId))
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.RateLimited,
+				"This plugin is calling back into the host too quickly.",
+				true);
+		}
+
+		if (payload.Operation == HostOperations.Ui.OriginReportFailure)
+		{
+			var report = Deserialize<UiOriginReportFailureArguments>(payload.Arguments);
+			if (report is null || string.IsNullOrEmpty(report.SessionId) || report.Message.IsEmpty)
+			{
+				return MissingArguments();
+			}
+
+			var delivered = await _eventOrigins.ReportFailureAsync(pluginId,
+					report.SessionId,
+					ClientOrigin(report.ClientId),
+					report.EventName,
+					report.Message,
+					cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostCallbackResult.Ok(new UiOriginReportFailureResult { Delivered = delivered });
+		}
+
+		if (payload.Operation == HostOperations.Ui.OriginOpenUrl)
+		{
+			var link = Deserialize<UiOriginOpenUrlArguments>(payload.Arguments);
+			if (link is null || string.IsNullOrEmpty(link.SessionId) || string.IsNullOrEmpty(link.Url))
+			{
+				return MissingArguments();
+			}
+
+			if (!ExternalUrls.TryNormalizeWebUrl(link.Url, out _))
+			{
+				return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+					"Only absolute http and https URLs can be opened.");
+			}
+
+			var linked = await _eventOrigins.OpenUrlAsync(pluginId,
+					link.SessionId,
+					ClientOrigin(link.ClientId),
+					link.Url,
+					cancellationToken)
+				.ConfigureAwait(false);
+
+			return HostCallbackResult.Ok(new UiOriginOpenUrlResult { Delivered = linked });
+		}
+
+		var modal = Deserialize<UiOriginShowModalArguments>(payload.Arguments);
+		if (modal is null || string.IsNullOrEmpty(modal.SessionId) || string.IsNullOrEmpty(modal.ViewId))
+		{
+			return MissingArguments();
+		}
+
+		var clientId = ClientOrigin(modal.ClientId);
+		if (!_eventOrigins.IsClientAttached(pluginId, modal.SessionId, clientId))
+		{
+			return HostCallbackResult.Ok(new UiOriginShowModalResult { Opened = false });
+		}
+
+		var opened = ShowModal(pluginId,
+			new ActionInteractionsShowModalArguments
+			{
+				ExecuteCorrelationId = string.Empty,
+				OriginClientId = clientId,
+				ViewId = modal.ViewId,
+				Title = modal.Title,
+				Data = modal.Data,
+				AwaitResult = modal.AwaitResult
+			});
+
+		return HostCallbackResult.Ok(new UiOriginShowModalResult { Opened = opened.Opened, ModalId = opened.ModalId });
+	}
+
+	private HostCallbackResult RouteUi(string pluginId, string? sessionId, HostInvokePayload payload)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.Ui.Snapshot:
+			{
+				var arguments = Deserialize<UiSnapshotArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				return FromIngest(_uiSessions.PublishSnapshot(pluginId,
+					arguments.SessionId,
+					TranslatePluginIcons(pluginId, UiRawJson.FromElement(arguments.Tree))));
+			}
+
+			case HostOperations.Ui.Patch:
+			{
+				var arguments = Deserialize<UiPatchArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				return FromIngest(_uiSessions.PublishPatch(pluginId,
+					arguments.SessionId,
+					TranslatePluginIcons(pluginId, UiRawJson.FromElement(arguments.Patch))));
+			}
+
+			case HostOperations.Ui.Fault:
+			{
+				var arguments = Deserialize<UiFaultArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				_uiSessions.PublishFault(pluginId, arguments.SessionId, arguments.Code, arguments.Message);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Ui.Reload:
+			{
+				var arguments = Deserialize<UiReloadArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				_uiSessions.PublishReload(pluginId, arguments.SessionId);
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.Ui.ReportParameterValues:
+			{
+				var arguments = Deserialize<UiReportParameterValuesArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				return FromIngest(_uiSessions.PublishParameterValues(pluginId, arguments.SessionId, arguments.Values));
+			}
+
+			case HostOperations.Ui.RegisterResource:
+			case HostOperations.Ui.RemoveResource:
+				return RouteUiResource(pluginId, sessionId, payload);
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	/// <summary>
+	/// Handles the <c>variable-values</c> host-api callbacks a push-capable provider makes through
+	/// <c>IVariableSink</c>. <c>value</c> drops any id not currently subscribed <em>for this plugin</em>
+	/// per <see cref="RemoteVariableSubscriptions" /> before it ever reaches the update channel - an
+	/// untrusted process must never be able to write a value into another plugin's variable, or into a
+	/// resource nobody is watching. A dropped id is a race between the two ends resubscribing, not a
+	/// fault, so this always answers <c>Ok</c>.
+	/// </summary>
+	private HostCallbackResult RouteVariableValues(string pluginId, HostInvokePayload payload)
+	{
+		switch (payload.Operation)
+		{
+			case HostOperations.VariableValues.Value:
+			{
+				var arguments = Deserialize<VariableValuesValueArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				if (arguments.Values.Count > ProtocolLimits.MaxVariableValuesPerBatch)
+				{
+					return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+						$"A variable-values 'value' batch may not exceed "
+						+ $"{ProtocolLimits.MaxVariableValuesPerBatch} values.");
+				}
+
+				if (_dynamicVariableChannel is not null)
+				{
+					foreach (var value in arguments.Values)
+					{
+						if (_variableSubscriptions?.IsSubscribed(pluginId, value.Id) != true)
+						{
+							continue;
+						}
+
+						_dynamicVariableChannel.Write(pluginId,
+							value.Id,
+							VariableValueMapper.ToDomain(value.Reading.Value));
+					}
+				}
+
+				return HostCallbackResult.Ok();
+			}
+
+			case HostOperations.VariableValues.Invalidate:
+				_dynamicVariableInvalidation?.RaiseInvalidated(pluginId);
+				return HostCallbackResult.Ok();
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private HostCallbackResult RouteUiResource(string pluginId, string? sessionId, HostInvokePayload payload)
+	{
+		if (_uiResources is null)
+		{
+			return UnknownOperation(payload);
+		}
+
+		if (sessionId is null)
+		{
+			return FromUiResource(new PluginUiResourceResult(PluginUiResourceOutcome.SessionNotCurrent));
+		}
+
+		if (!_uiResourceThrottle.TryConsume(pluginId))
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.RateLimited,
+				"This plugin is registering UI resources too quickly.",
+				true);
+		}
+
+		if (payload.Operation == HostOperations.Ui.RegisterResource)
+		{
+			var arguments = Deserialize<UiRegisterResourceArguments>(payload.Arguments);
+
+			return arguments is null
+				? MissingArguments()
+				: FromUiResource(_uiResources.Register(pluginId,
+					sessionId,
+					arguments.Name,
+					arguments.ContentHash,
+					arguments.MediaType));
+		}
+
+		var removal = Deserialize<UiRemoveResourceArguments>(payload.Arguments);
+
+		return removal is null
+			? MissingArguments()
+			: FromUiResource(_uiResources.Remove(pluginId, sessionId, removal.Name));
+	}
+
+	private async Task<HostCallbackResult> RouteMusicPlayerArtworkAsync(
+		string pluginId,
+		string? sessionId,
+		HostInvokePayload payload,
+		CancellationToken cancellationToken)
+	{
+		if (_uiResources is null || _musicPlayerArtwork is null)
+		{
+			return UnknownOperation(payload);
+		}
+
+		if (sessionId is null)
+		{
+			return FromUiResource(new PluginUiResourceResult(PluginUiResourceOutcome.SessionNotCurrent));
+		}
+
+		var arguments = Deserialize<UiRegisterMusicPlayerArtworkArguments>(payload.Arguments);
+		if (arguments is null)
+		{
+			return MissingArguments();
+		}
+
+		if (string.IsNullOrEmpty(arguments.InstanceId)
+			|| string.IsNullOrEmpty(arguments.ArtworkId)
+			|| arguments.InstanceId.Length > MaxMusicPlayerArtworkIdLength
+			|| arguments.ArtworkId.Length > MaxMusicPlayerArtworkIdLength)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				$"A music player instance id and an artwork id are 1 to {MaxMusicPlayerArtworkIdLength} characters.");
+		}
+
+		if (arguments.MaxSize is <= 0)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				"A music player artwork size is a positive number of pixels.");
+		}
+
+		if (!UiResourceRules.IsValidName(arguments.Name))
+		{
+			return FromUiResource(new PluginUiResourceResult(PluginUiResourceOutcome.InvalidName));
+		}
+
+		if (!_uiResourceThrottle.TryConsume(pluginId) || !_musicPlayerArtworkThrottle.TryConsume(pluginId))
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.RateLimited,
+				"This plugin is registering music player artwork too quickly.",
+				true);
+		}
+
+		ArtworkImageResult? image;
+		using (var lookup = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+		{
+			lookup.CancelAfter(_musicPlayerArtworkTimeout);
+
+			try
+			{
+				image = await _musicPlayerArtwork.GetImage(arguments.InstanceId,
+					arguments.ArtworkId,
+					arguments.MaxSize,
+					lookup.Token);
+			}
+			catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+			{
+				return HostCallbackResult.Fail(ProtocolErrorCodes.Timeout,
+					"The music player did not answer the artwork lookup in time.",
+					true);
+			}
+		}
+
+		if (image is null || image.Content.Length == 0)
+		{
+			return HostCallbackResult.Ok(new UiRegisterMusicPlayerArtworkResult());
+		}
+
+		var result = _uiResources.RegisterContent(pluginId,
+			sessionId,
+			arguments.Name,
+			image.Content,
+			image.ContentType);
+
+		return result.Outcome switch
+		{
+			PluginUiResourceOutcome.Registered => HostCallbackResult.Ok(new UiRegisterMusicPlayerArtworkResult
+			{
+				Resource = new UiResourceHandleDto
+				{
+					ResourceId = result.Resource!.ResourceId,
+					ContentHash = result.Resource.ContentHash!,
+					MediaType = result.Resource.MediaType!,
+					ByteLength = (int)result.Resource.ByteLength!
+				}
+			}),
+			PluginUiResourceOutcome.UnsupportedMediaType => HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				$"The artwork is of media type '{image.ContentType}', which is not a supported UI resource type."),
+			_ => FromUiResource(result)
+		};
+	}
+
+	private static HostCallbackResult FromUiResource(PluginUiResourceResult result)
+	{
+		return result.Outcome switch
+		{
+			PluginUiResourceOutcome.Registered => HostCallbackResult.Ok(new UiRegisterResourceResult
+			{
+				Resource = new UiResourceHandleDto
+				{
+					ResourceId = result.Resource!.ResourceId,
+					ContentHash = result.Resource.ContentHash!,
+					MediaType = result.Resource.MediaType!,
+					ByteLength = (int)result.Resource.ByteLength!
+				}
+			}),
+			PluginUiResourceOutcome.UploadRequired => HostCallbackResult.Ok(new UiRegisterResourceResult
+				{ UploadRequired = true }),
+			PluginUiResourceOutcome.Removed => HostCallbackResult.Ok(),
+			PluginUiResourceOutcome.InvalidName => HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				"A UI resource name is a letter or digit followed by up to 63 letters, digits, hyphens or underscores."),
+			PluginUiResourceOutcome.UnsupportedMediaType => HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				"A UI resource must be one of: " + string.Join(", ", UiResourceRules.SupportedMediaTypes) + "."),
+			PluginUiResourceOutcome.MediaTypeMismatch => HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+				"The media type differs from the one the upload declared."),
+			PluginUiResourceOutcome.QuotaExceeded => HostCallbackResult.Fail(ProtocolErrorCodes.UiResourceQuotaExceeded,
+				ProtocolErrorMessages.For(ProtocolErrorCodes.UiResourceQuotaExceeded)),
+			PluginUiResourceOutcome.TooLarge => HostCallbackResult.Fail(ProtocolErrorCodes.AssetTooLarge,
+				$"A UI resource is 1 to {ProtocolLimits.MaxUiResourceBytes} bytes."),
+			_ => HostCallbackResult.Fail(ProtocolErrorCodes.SessionNotFound,
+				"This session is no longer the plugin's current session.",
+				true)
+		};
+	}
+
+	// The ingest verdict is the host.result, so a provider learns from its own reply that a payload was
+	// refused - the deterministic signal a relay that silently drops updates cannot give. Translated
+	// rather than forwarded: UiSessionErrorCodes is the host-to-client vocabulary, and only
+	// ProtocolErrorCodes is a promise to a plugin.
+	private static HostCallbackResult FromIngest(UiSessionIngestResult result)
+	{
+		if (result.Accepted)
+		{
+			return HostCallbackResult.Ok();
+		}
+
+		var code = result.Code switch
+		{
+			UiSessionErrorCodes.SessionNotFound => ProtocolErrorCodes.SessionNotFound,
+			UiSessionErrorCodes.PayloadTooLarge => ProtocolErrorCodes.PayloadTooLarge,
+			UiSessionErrorCodes.RateLimited => ProtocolErrorCodes.RateLimited,
+			_ => ProtocolErrorCodes.InvalidPayload
+		};
+
+		return HostCallbackResult.Fail(code, result.Message ?? "The host refused this UI payload.");
+	}
+
+	private string DisplayNameOf(string pluginId)
+	{
+		return _sessionRegistry.Snapshot()
+				.FirstOrDefault(session => string.Equals(session.PluginId, pluginId, StringComparison.Ordinal))
+				?.DisplayName
+			?? pluginId;
+	}
+
+	/// <summary>
+	/// Answers the icon call with metadata only and starts the bytes on their way over the
+	/// <c>host.asset.*</c> channel. The bytes cannot ride the reply: a protocol message is capped at
+	/// <see cref="ProtocolLimits.MaxMessageBytes" /> and an icon is not. A not-modified answer starts no
+	/// transfer at all, which is what makes a cache hit cost zero bytes.
+	/// </summary>
+	private HostCallbackResult IconResult(string pluginId, DeviceIconImage icon)
+	{
+		if (icon.NotModified)
+		{
+			return HostCallbackResult.Ok(new DevicesIconResult
+			{
+				ContentType = icon.ContentType,
+				ETag = icon.ETag,
+				ByteLength = 0,
+				NotModified = true
+			});
+		}
+
+		if (_assets is null)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnavailable,
+				"This host cannot transfer icon bytes to a plugin.");
+		}
+
+		var content = icon.Content;
+		var transferId = Guid.CreateVersion7().ToString();
+		var contentHash = AssetContentHash.Compute(content.Span);
+
+		// Started before the reply this result becomes is sent, and deliberately not awaited: the plugin
+		// correlates the transfer by its id rather than by arrival order, and awaiting a multi-megabyte
+		// transfer here would hold up the very reply that announces it. Its own lifetime, not the host
+		// invocation's - the invocation ends the moment its reply is written.
+		var sender = _assets;
+		var transfers = _iconTransfers.GetOrAdd(pluginId, _ => new SemaphoreSlim(MaxConcurrentIconTransfers));
+		_ = Task.Run(async () =>
+			{
+				await transfers.WaitAsync(CancellationToken.None);
+				try
+				{
+					await sender.SendAsync(pluginId,
+						transferId,
+						AssetKinds.Icon,
+						icon.ContentType,
+						content,
+						contentHash,
+						CancellationToken.None);
+				}
+				finally
+				{
+					transfers.Release();
+				}
+			},
+			CancellationToken.None);
+
+		return HostCallbackResult.Ok(new DevicesIconResult
+		{
+			ContentType = icon.ContentType,
+			ETag = icon.ETag,
+			ByteLength = content.Length,
+			ContentHash = contentHash,
+			NotModified = false,
+			TransferId = transferId
+		});
+	}
+
+	/// <summary>
+	/// The provider-icon sibling of <see cref="IconResult" />, differing only in the asset kind and the
+	/// result shape: an action-icon-provider image is never mistaken for a plugin's own catalog icon (see
+	/// <see cref="AssetKinds.ActionIcon" />'s remarks), and it shares the same per-plugin transfer bound
+	/// because both are, at bottom, icon bytes queued for the same device session.
+	/// </summary>
+	private HostCallbackResult WidgetIconResult(string pluginId, DeviceWidgetIconImage icon)
+	{
+		if (icon.NotModified)
+		{
+			return HostCallbackResult.Ok(new DevicesWidgetIconResult
+			{
+				ContentType = icon.ContentType,
+				ETag = icon.ETag,
+				ByteLength = 0,
+				NotModified = true
+			});
+		}
+
+		if (_assets is null)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnavailable,
+				"This host cannot transfer icon bytes to a plugin.");
+		}
+
+		var content = icon.Content;
+		var transferId = Guid.CreateVersion7().ToString();
+		var contentHash = AssetContentHash.Compute(content.Span);
+
+		var sender = _assets;
+		var transfers = _iconTransfers.GetOrAdd(pluginId, _ => new SemaphoreSlim(MaxConcurrentIconTransfers));
+		_ = Task.Run(async () =>
+			{
+				await transfers.WaitAsync(CancellationToken.None);
+				try
+				{
+					await sender.SendAsync(pluginId,
+						transferId,
+						AssetKinds.ActionIcon,
+						icon.ContentType,
+						content,
+						contentHash,
+						CancellationToken.None);
+				}
+				finally
+				{
+					transfers.Release();
+				}
+			},
+			CancellationToken.None);
+
+		return HostCallbackResult.Ok(new DevicesWidgetIconResult
+		{
+			ContentType = icon.ContentType,
+			ETag = icon.ETag,
+			ByteLength = content.Length,
+			ContentHash = contentHash,
+			NotModified = false,
+			TransferId = transferId
+		});
+	}
+
+	/// <summary>
+	/// The device a plugin's session id addresses, and only ever one this plugin owns. The session id
+	/// travelled out over <c>session.open</c> and comes back as an untrusted string, so it names a device
+	/// only once the ownership record agrees - a plugin must not be able to drive another plugin's device
+	/// session by quoting its id.
+	/// </summary>
+	private Guid? ResolveSession(string pluginId, string? sessionId)
+	{
+		return _deviceSurfaces is null || _deviceSessions is null
+			? null
+			: _deviceSessions.ResolveDevice(pluginId, sessionId);
+	}
+
+	private static DeviceInteractionKind ToInteractionKind(string? kind)
+	{
+		return Enum.TryParse<DeviceInteractionKind>(kind, true, out var parsed)
+			? parsed
+			: DeviceInteractionKind.Unknown;
+	}
+
+	// DeviceSurfaceErrorCodes is the host's own vocabulary; only ProtocolErrorCodes is a promise to a
+	// plugin - the same translation RouteUi's FromIngest performs for UI payloads.
+	private static string ToProtocolCode(string code)
+	{
+		return code switch
+		{
+			DeviceSurfaceErrorCodes.SessionNotFound => ProtocolErrorCodes.SessionNotFound,
+			DeviceSurfaceErrorCodes.HostLocked => ProtocolErrorCodes.CapabilityUnavailable,
+			DeviceSessionReasons.IconTooLarge => ProtocolErrorCodes.AssetTooLarge,
+			_ => ProtocolErrorCodes.InvalidPayload
+		};
+	}
+
+	private static HostCallbackResult UnknownSession()
+	{
+		return HostCallbackResult.Fail(ProtocolErrorCodes.SessionNotFound,
+			"This session id does not name an open device session of this plugin.");
+	}
+
+	// The device: prefix is minted by the host alone, for a device session acting on its own behalf. A
+	// plugin-supplied one is dropped rather than honoured: it would let a plugin address a device session
+	// it does not provide, and no real client ever produces this shape.
+	private static string? ClientOrigin(string? originClientId)
+	{
+		return DeviceOrigin.TryParse(originClientId, out _) ? null : originClientId;
+	}
+
+	private static HostCallbackResult IconResourceResult(PluginIconResourceResult resource, string notFoundCode)
+	{
+		return resource.Status switch
+		{
+			PluginIconResourceStatus.Found => HostCallbackResult.Ok(new UiResourceHandleDto
+			{
+				ResourceId = resource.Handle!.ResourceId,
+				ContentHash = resource.Handle.ContentHash!,
+				MediaType = resource.Handle.MediaType!,
+				ByteLength = (int)resource.Handle.ByteLength!
+			}),
+			PluginIconResourceStatus.TooLarge => HostCallbackResult.Fail(ProtocolErrorCodes.AssetTooLarge,
+				$"No rendition of this icon fits the {ProtocolLimits.MaxUiResourceBytes} byte UI resource limit."),
+			_ => HostCallbackResult.Fail(notFoundCode, ProtocolErrorMessages.For(notFoundCode))
+		};
+	}
+
+	private HostCallbackResult RouteColors(string pluginId, HostInvokePayload payload)
+	{
+		if (_colorWatches is null)
+		{
+			return UnknownOperation(payload);
+		}
+
+		switch (payload.Operation)
+		{
+			case HostOperations.Colors.Resolve:
+			{
+				var arguments = Deserialize<ColorsResolveArguments>(payload.Arguments);
+				return arguments is null
+					? MissingArguments()
+					: HostCallbackResult.Ok(new ColorsResolveResult
+					{
+						Color = _colorWatches.Resolve(arguments.Value, arguments.WidgetId)
+					});
+			}
+
+			case HostOperations.Colors.Watches:
+			{
+				var arguments = Deserialize<ColorsWatchesArguments>(payload.Arguments);
+				if (arguments is null)
+				{
+					return MissingArguments();
+				}
+
+				return _colorWatches.TrySetWatches(pluginId, arguments.Watches)
+					? HostCallbackResult.Ok()
+					: HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+						$"A plugin can watch at most {ProtocolLimits.MaxColorWatches} colours.");
+			}
+
+			default:
+				return UnknownOperation(payload);
+		}
+	}
+
+	private HostCallbackResult RouteWeather(string pluginId, HostInvokePayload payload)
+	{
+		if (_weatherTrigger is null || payload.Operation != HostOperations.Weather.SnapshotsChanged)
+		{
+			return UnknownOperation(payload);
+		}
+
+		if (_sessionRegistry.GetCapabilities(pluginId)?.Capabilities is not { } capabilities
+			|| !capabilities.TryGetValue(CapabilityKinds.Weather, out var negotiated)
+			|| !negotiated.Accepted)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnavailable,
+				"Reporting changed weather snapshots requires the weather capability.");
+		}
+
+		_weatherTrigger.RequestRefresh();
+		return HostCallbackResult.Ok();
+	}
+
+	private HostCallbackResult RouteBatteries(string pluginId, string? sessionId, HostInvokePayload payload)
+	{
+		if (_batteries is null)
+		{
+			return UnknownOperation(payload);
+		}
+
+		if (_sessionRegistry.GetCapabilities(pluginId)?.Capabilities is not { } capabilities
+			|| !capabilities.TryGetValue(CapabilityKinds.BatteryProvider, out var negotiated)
+			|| !negotiated.Accepted)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnavailable,
+				"Publishing battery devices requires the battery-provider capability.");
+		}
+
+		// The owner is the authenticated plugin, never anything the payload claims.
+		try
+		{
+			switch (payload.Operation)
+			{
+				case HostOperations.Batteries.Publish:
+				{
+					var arguments = Deserialize<BatteriesPublishArguments>(payload.Arguments);
+					if (arguments?.Devices is null)
+					{
+						return MissingArguments();
+					}
+
+					_batteries.Publish(pluginId, sessionId, ToBatteryDevices(arguments.Devices));
+					return HostCallbackResult.Ok();
+				}
+
+				case HostOperations.Batteries.Remove:
+				{
+					var arguments = Deserialize<BatteriesRemoveArguments>(payload.Arguments);
+					if (arguments?.DeviceIds is null)
+					{
+						return MissingArguments();
+					}
+
+					if (arguments.DeviceIds.Count > ProtocolLimits.MaxBatteryDevicesPerProvider)
+					{
+						return TooManyBatteryDevices();
+					}
+
+					_batteries.Remove(pluginId, arguments.DeviceIds);
+					return HostCallbackResult.Ok();
+				}
+
+				case HostOperations.Batteries.Sync:
+				{
+					var arguments = Deserialize<BatteriesSyncArguments>(payload.Arguments);
+					if (arguments?.Devices is null)
+					{
+						return MissingArguments();
+					}
+
+					_batteries.Sync(pluginId, sessionId, ToBatteryDevices(arguments.Devices));
+					return HostCallbackResult.Ok();
+				}
+
+				case HostOperations.Batteries.Withdraw:
+				{
+					// Scoped to the calling session so a late withdraw from an ended session cannot hide the
+					// devices its successor already published.
+					if (sessionId is null)
+					{
+						_batteries.RemoveAll(pluginId);
+					}
+					else
+					{
+						_batteries.RemoveSession(pluginId, sessionId);
+					}
+
+					return HostCallbackResult.Ok();
+				}
+
+				default:
+					return UnknownOperation(payload);
+			}
+		}
+		catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+		{
+			return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, exception.Message);
+		}
+	}
+
+	private static List<BatteryDevice> ToBatteryDevices(IReadOnlyList<BatteryDeviceDto> devices)
+	{
+		if (devices.Count > ProtocolLimits.MaxBatteryDevicesPerProvider)
+		{
+			throw new InvalidOperationException(
+				$"A battery provider can publish at most {ProtocolLimits.MaxBatteryDevicesPerProvider} devices.");
+		}
+
+		return [.. devices.Select(BatteryWire.ToDevice)];
+	}
+
+	private static HostCallbackResult TooManyBatteryDevices()
+	{
+		return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload,
+			$"A battery provider can publish at most {ProtocolLimits.MaxBatteryDevicesPerProvider} devices.");
+	}
+
+	private static HostCallbackResult MissingArguments()
+	{
+		return HostCallbackResult.Fail(ProtocolErrorCodes.InvalidPayload, "This operation requires arguments.");
+	}
+
+	private static HostCallbackResult UnknownOperation(HostInvokePayload payload)
+	{
+		return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnsupported,
+			$"The '{payload.Api}' api has no operation '{payload.Operation}'.");
+	}
+
+	private static HostCallbackResult NotALiveExecute()
+	{
+		return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnavailable,
+			"This correlation does not name a live actions/execute invocation of this plugin.");
+	}
+
+	// event.publish (a state report) is not routed through host.invoke, so it is unaffected - only the
+	// command operations checked above are refused while the host is locked.
+	private static HostCallbackResult HostLocked()
+	{
+		return HostCallbackResult.Fail(ProtocolErrorCodes.CapabilityUnavailable, "The host is locked.");
+	}
+
+	private static T? Deserialize<T>(JsonElement? element)
+	{
+		if (element is not { } value)
+		{
+			return default;
+		}
+
+		try
+		{
+			return value.Deserialize<T>(PluginProtocolJson.Options);
+		}
+		catch (JsonException)
+		{
+			return default;
+		}
+	}
+}

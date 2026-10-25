@@ -1,0 +1,127 @@
+.update-modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  height: 100%;
+}
+
+.update-modal__version {
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: var(--text-lg);
+  font-weight: var(--font-semibold);
+}
+
+.update-modal__current {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+.update-modal__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+.update-modal__changelog-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 10rem;
+}
+
+.update-modal__section-heading {
+  margin: 0 0 var(--space-2);
+  color: var(--color-text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+}
+
+.update-modal__changelog {
+  --md-font-size: var(--text-base);
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  gap: var(--space-3);
+  min-height: 0;
+  overflow-y: auto;
+  padding-inline-end: var(--space-2);
+}
+
+.update-modal__notes-section {
+  display: block;
+}
+
+.update-modal__notes-section--category {
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.update-modal__no-changelog {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+.update-modal__progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.update-modal__status {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+.update-modal__status--error {
+  color: var(--color-danger);
+}
+
+.update-modal__note {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+}
+
+.update-modal__bar {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 6px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-tertiary);
+  overflow: hidden;
+
+  &::-webkit-progress-bar {
+    background: var(--color-bg-tertiary);
+    border-radius: var(--radius-sm);
+  }
+
+  &::-webkit-progress-value {
+    background: var(--color-accent);
+    border-radius: var(--radius-sm);
+    transition: width 0.2s ease;
+  }
+
+  &::-moz-progress-bar {
+    background: var(--color-accent);
+    border-radius: var(--radius-sm);
+  }
+}
+
+.update-modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.update-modal__notes-link {
+  align-self: flex-start;
+}

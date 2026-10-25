@@ -1,0 +1,274 @@
+@use '../../../../styles/index' as ds;
+
+// The shell hands this route a fixed-height box with overflow hidden, so the page owns its own
+// scrollport - without one a catalog taller than the window simply cannot be reached.
+:host {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.store-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-4);
+}
+
+// Centring lives here rather than on the scrollport: a scroll container that is itself centred
+// fights its own margins.
+.store-page-content {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.store-page-content > app-store-page-header {
+  display: block;
+  margin-bottom: var(--space-4);
+}
+
+.store-page-content > app-store-community-notice {
+  --store-community-notice-spacing: var(--space-4);
+}
+
+.store-page-content > shared-error-banner {
+  display: block;
+  margin-bottom: var(--space-3);
+}
+
+.store-hero {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+  padding: var(--space-5) var(--space-5) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  background:
+    radial-gradient(120% 140% at 0% 0%, var(--color-accent-muted), transparent 55%),
+    radial-gradient(80% 120% at 100% 100%, var(--color-bg-hover), transparent 60%),
+    var(--color-bg-secondary);
+  container-type: inline-size;
+}
+
+.hero-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.hero-heading {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--font-bold);
+  color: var(--color-text-primary);
+}
+
+.hero-subheading {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.hero-search {
+  position: relative;
+  display: flex;
+  max-width: 640px;
+
+  shared-input {
+    flex: 1;
+    min-width: 0;
+    --input-action-inline-start-gutter: var(--space-5);
+  }
+}
+
+.hero-search-icon {
+  position: absolute;
+  inset-inline-start: var(--space-3);
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--color-text-muted);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.hero-categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.category-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--control-height-compact);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+
+  &:hover {
+    background-color: var(--color-bg-hover);
+    color: var(--color-text-primary);
+  }
+
+  &:focus-visible {
+    @include ds.focus-ring;
+  }
+
+  &.active {
+    border-color: var(--color-border-accent);
+    background-color: var(--color-accent-muted);
+    color: var(--color-text-primary);
+
+    .icon {
+      color: var(--color-accent);
+    }
+  }
+}
+
+.category-count {
+  min-width: 1.25rem;
+  padding: 0 var(--space-1);
+  border-radius: 999px;
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.store-browse {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.browse-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+
+.browse-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.browse-heading {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+  @include ds.truncate;
+}
+
+.browse-count {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.browse-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+
+.supported-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  cursor: default;
+
+  input {
+    accent-color: var(--color-accent);
+    margin: 0;
+  }
+}
+
+.store-sort {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+
+  shared-select {
+    min-width: 12rem;
+  }
+}
+
+.store-sort-label {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.hidden-note {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.link-button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-accent);
+  font-size: inherit;
+  cursor: pointer;
+
+  &:hover {
+    text-decoration: underline;
+  }
+
+  &:focus-visible {
+    @include ds.focus-ring;
+  }
+}
+
+.store-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.store-load-more {
+  display: flex;
+  justify-content: center;
+}
+
+@include ds.breakpoint-down('sm') {
+  .store-hero {
+    padding: var(--space-4);
+  }
+
+  .browse-controls,
+  .store-sort {
+    width: 100%;
+    justify-content: space-between;
+  }
+}

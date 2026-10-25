@@ -1,0 +1,14 @@
+:host {
+  --side-panel-width: 40rem;
+
+  display: contents;
+}
+
+.np-body {
+  padding-bottom: var(--space-2);
+}
+
+.np-list {
+  display: flex;
+  flex-direction: column;
+}

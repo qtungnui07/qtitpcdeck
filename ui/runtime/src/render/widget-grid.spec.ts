@@ -1,0 +1,1081 @@
+import { GridWidget } from '../domain/widget.interface';
+import { UiNode } from '../ui-framework/ui-node.interface';
+import { PRESS_FEEDBACK_MIN_VISIBLE_MS } from './press-feedback';
+import { UiRenderHost } from './ui-render-host';
+import { renderWidgetGrid } from './widget-grid';
+
+const host: UiRenderHost = {
+  localization: { translate: (scope, key) => `${scope}:${key}` },
+  resourceUrl: () => null,
+  now: () => 0,
+  culture: () => 'en-GB',
+  simpleRendering: () => false,
+  fontFamily: () => null,
+  fontReady: () => true,
+  emit: () => undefined,
+};
+
+const widget = (id: string, x: number, y: number, w = 1, h = 1): GridWidget =>
+  ({ id, folderId: 'f', x, y, w, h, type: 'action-button', data: {} }) as GridWidget;
+
+const tree = (text: string): UiNode =>
+  ({ id: `t-${text}`, type: 'ui.text', properties: { text } }) as UiNode;
+
+const pressable = (): UiNode =>
+  ({ id: 'root', type: 'ui.button', properties: { events: ['press'] } }) as UiNode;
+
+function pointer(type: string, pointerId = 1): Event {
+  const event = new Event(type) as Event & { clientX: number; clientY: number; pointerId: number; button: number };
+  event.clientX = 0;
+  event.clientY = 0;
+  event.pointerId = pointerId;
+  event.button = 0;
+  return event;
+}
+
+function press(element: HTMLElement): void {
+  element.dispatchEvent(pointer('pointerdown'));
+  element.dispatchEvent(pointer('pointerup'));
+}
+
+describe('runtime widget grid', () => {
+  let container: HTMLElement;
+
+  beforeEach(() => {
+    container = document.createElement('div');
+    // jsdom reports zero for clientWidth/Height, so the box is stated outright.
+    Object.defineProperty(container, 'clientWidth', { value: 800, configurable: true });
+    Object.defineProperty(container, 'clientHeight', { value: 480, configurable: true });
+    document.body.appendChild(container);
+  });
+
+  afterEach(() => container.remove());
+
+  const mount = (geometry = { cols: 5, rows: 3 }) =>
+    renderWidgetGrid(container, { host, geometry });
+
+  const tileOf = (id: string) =>
+    container.querySelector(`.deck-grid-tile[data-widget-id="${id}"]`) as HTMLElement;
+
+  const paintedIds = () =>
+    Array.from(container.querySelectorAll('.deck-grid-tile'))
+      .map(tile => tile.getAttribute('data-widget-id'))
+      .join(' ');
+
+  it('paints the folder background and gives it back to the theme when the folder has none', () => {
+    const handle = renderWidgetGrid(container, { host, geometry: { cols: 5, rows: 3 }, background: '#101820' });
+    const surface = container.querySelector('.deck-grid') as HTMLElement;
+
+    expect(surface.style.background).toBe('rgb(16, 24, 32)');
+
+    // Empty rather than a literal fallback colour: an inline background would outrank the sheet's,
+    // and with it every theme switch.
+    handle.setBackground(null);
+    expect(surface.style.background).toBe('');
+  });
+
+  it('rings only the focused widget, and moves the ring rather than redrawing the deck', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0), widget('b', 1, 0)], () => undefined);
+    const tileA = container.querySelector('[data-widget-id="a"]') as HTMLElement;
+
+    handle.setFocusedWidget('a');
+    expect(container.querySelectorAll('.deck-grid-tile-focused').length).toBe(1);
+    expect(tileA.classList.contains('deck-grid-tile-focused')).toBeTrue();
+
+    handle.setFocusedWidget('b');
+    expect(container.querySelectorAll('.deck-grid-tile-focused').length).toBe(1);
+    expect(tileA.classList.contains('deck-grid-tile-focused')).toBeFalse();
+
+    // Every client without hardware controls passes null, and must render exactly as before.
+    handle.setFocusedWidget(null);
+    expect(container.querySelectorAll('.deck-grid-tile-focused').length).toBe(0);
+  });
+
+  it('keeps the focus ring on the right widget when the deck is redrawn', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0), widget('b', 1, 0)], () => undefined);
+    handle.setFocusedWidget('b');
+
+    handle.update([widget('a', 0, 0), widget('b', 1, 0), widget('c', 2, 0)], () => undefined);
+
+    expect(container.querySelectorAll('.deck-grid-tile-focused').length).toBe(1);
+  });
+
+  it('answers a long press itself rather than letting the browser open its context menu', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => undefined);
+    const surface = container.querySelector('.deck-grid-tile-surface') as HTMLElement;
+
+    const event = new Event('contextmenu', { cancelable: true, bubbles: true });
+    surface.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBeTrue();
+    handle.destroy();
+  });
+
+  it('draws one cell per empty position and none under a widget', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => undefined);
+
+    expect(container.querySelectorAll('.deck-grid-cell').length).toBe(14);
+    expect(container.querySelectorAll('.deck-grid-tile').length).toBe(1);
+  });
+
+  it('leaves no cell under a widget that spans several positions', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0, 2, 2)], () => undefined);
+
+    expect(container.querySelectorAll('.deck-grid-cell').length).toBe(15 - 4);
+  });
+
+  it('positions every cell and tile absolutely rather than by grid tracks', () => {
+    const handle = mount();
+    handle.update([widget('a', 1, 1)], () => undefined);
+
+    const surface = container.querySelector('.deck-grid') as HTMLElement;
+    expect(surface.style.display).not.toBe('grid');
+
+    const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+    expect(tile.style.left.endsWith('px')).toBeTrue();
+    expect(tile.style.top.endsWith('px')).toBeTrue();
+    expect(parseFloat(tile.style.left)).toBeGreaterThan(0);
+    expect(parseFloat(tile.style.top)).toBeGreaterThan(0);
+  });
+
+  it('gives a wider widget a proportionally wider tile', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0, 1, 1), widget('b', 1, 0, 2, 1)], () => undefined);
+
+    const single = parseFloat(tileOf('a').style.width);
+    const double = parseFloat(tileOf('b').style.width);
+
+    // Two cells plus the gap they straddle, so more than twice one cell.
+    expect(double).toBeGreaterThan(single * 2);
+  });
+
+  it('lays content out in reference space and scales the wrapper', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => undefined);
+
+    const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+    const content = container.querySelector('.deck-grid-tile-content') as HTMLElement;
+
+    expect(content.style.transform).toMatch(/^scale\(/);
+    // The wrapper carries the scale, so descendants must not apply it a second time.
+    expect(content.style.getPropertyValue('--widget-scale')).toBe('1');
+
+    const scale = parseFloat(content.style.transform.replace(/[^\d.]/g, ''));
+    expect(parseFloat(content.style.width) * scale).toBeCloseTo(parseFloat(tile.style.width), 3);
+  });
+
+  it('renders each widget tree inside its own tile', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0), widget('b', 1, 0)],
+      id => tree(id === 'a' ? 'first' : 'second'));
+
+    expect(tileOf('a').querySelector('.widget-text')!.textContent).toBe('first');
+    expect(tileOf('b').querySelector('.widget-text')!.textContent).toBe('second');
+  });
+
+  it('leaves a tile empty when no tree has arrived for it yet', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => undefined);
+
+    expect(container.querySelector('.deck-grid-tile')!.querySelector('.widget-text')).toBeNull();
+  });
+
+  it('reflects a widget that moved on the next update', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => undefined);
+    const before = (container.querySelector('.deck-grid-tile') as HTMLElement).style.left;
+
+    handle.update([widget('a', 3, 0)], () => undefined);
+    const after = (container.querySelector('.deck-grid-tile') as HTMLElement).style.left;
+
+    expect(after).not.toBe(before);
+  });
+
+  it('re-solves for a container that changed size', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => undefined);
+    const before = parseFloat((container.querySelector('.deck-grid-tile') as HTMLElement).style.width);
+
+    // Both axes, because a cell is fitted to whichever constrains it - widening a container whose
+    // height already limits the cell is correctly a no-op.
+    Object.defineProperty(container, 'clientWidth', { value: 1600, configurable: true });
+    Object.defineProperty(container, 'clientHeight', { value: 960, configurable: true });
+    handle.resize();
+    const after = parseFloat((container.querySelector('.deck-grid-tile') as HTMLElement).style.width);
+
+    expect(after).toBeGreaterThan(before);
+  });
+
+  it('draws a tile at the size its widget is now, not the size it was mounted at', () => {
+    const sized = (): UiNode =>
+      ({ id: 'sized', type: 'ui.text', properties: { text: 'x', size: { basis: 0.5 } } }) as UiNode;
+    const fontSize = () =>
+      (container.querySelector('.widget-text') as HTMLElement).style.fontSize;
+
+    const grown = mount();
+    grown.update([widget('a', 0, 0)], () => sized());
+    const atOneCell = fontSize();
+    grown.update([widget('a', 0, 0, 2, 2)], () => sized());
+    const afterGrowing = fontSize();
+    grown.destroy();
+
+    // The same widget, two cells from the start. This is what a reload produces, and it is the size
+    // the reader is meant to see either way.
+    const settled = mount();
+    settled.update([widget('a', 0, 0, 2, 2)], () => sized());
+    const mountedAtTwoCells = fontSize();
+    settled.destroy();
+
+    expect(afterGrowing).toBe(mountedAtTwoCells);
+    expect(afterGrowing).not.toBe(atOneCell);
+  });
+
+  it('leaves nothing behind after destroy', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => tree('x'));
+
+    handle.destroy();
+
+    expect(container.querySelector('.deck-grid')).toBeNull();
+  });
+
+  it('says which widget an interaction came from', () => {
+    const seen: Array<{ widgetId: string; name: string }> = [];
+    const handle = renderWidgetGrid(container, {
+      host,
+      geometry: { cols: 5, rows: 3 },
+      onWidgetEvent: (widgetId, _node, name) => seen.push({ widgetId, name }),
+    });
+    handle.update([widget('a', 0, 0)], () => pressable());
+
+    press(container.querySelector('.widget-button') as HTMLElement);
+
+    // The renderer knows the node; only the grid knows the widget it sits in.
+    expect(seen).toEqual([{ widgetId: 'a', name: 'press' }]);
+  });
+
+  it('falls back to the shared host when no widget-aware handler was given', () => {
+    const seen: string[] = [];
+    const handle = renderWidgetGrid(container, {
+      host: { ...host, emit: (_node, name) => seen.push(name) },
+      geometry: { cols: 5, rows: 3 },
+    });
+    handle.update([widget('a', 0, 0)], () => pressable());
+
+    press(container.querySelector('.widget-button') as HTMLElement);
+
+    expect(seen).toEqual(['press']);
+  });
+
+  it('hands every tile the global UI font, so tile text re-fits when it changes', () => {
+    const uiFontKey = jasmine.createSpy('uiFontKey').and.returnValue('1');
+    const handle = renderWidgetGrid(container, { host: { ...host, uiFontKey }, geometry: { cols: 5, rows: 3 } });
+
+    handle.update([widget('a', 0, 0)], () => tree('Vol'));
+
+    expect(uiFontKey).toHaveBeenCalled();
+  });
+
+  it('hands each tile the hour cycle the shared host prefers', () => {
+    const handle = renderWidgetGrid(container, {
+      host: { ...host, now: () => Date.parse('2026-01-02T03:04:05Z'), hourCycle: () => 'h12' },
+      geometry: { cols: 5, rows: 3 },
+    });
+    handle.update([widget('a', 0, 0)], () => ({
+      id: 'clock', type: 'macrodeck.dynamic-text', properties: { format: 'time', value: { $time: { zone: 'UTC' } } },
+    }) as UiNode);
+
+    expect(container.querySelector('.widget-dynamic-text')!.textContent).toMatch(/^3:04\s?am$/i);
+  });
+
+  it('hands each tile the leading zero the shared host states', () => {
+    const handle = renderWidgetGrid(container, {
+      host: {
+        ...host, now: () => Date.parse('2026-01-02T03:04:05Z'), culture: () => 'es', hourCycle: () => 'h23',
+        hourPadded: () => true,
+      },
+      geometry: { cols: 5, rows: 3 },
+    });
+    handle.update([widget('a', 0, 0)], () => ({
+      id: 'clock', type: 'macrodeck.dynamic-text', properties: { format: 'time', value: { $time: { zone: 'UTC' } } },
+    }) as UiNode);
+
+    expect(container.querySelector('.widget-dynamic-text')!.textContent).toBe('03:04');
+  });
+
+  it('keeps a tile across updates instead of building it again', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => tree('before'));
+    const tile = container.querySelector('.deck-grid-tile');
+    const text = container.querySelector('.widget-text');
+
+    handle.update([widget('a', 0, 0)], () => tree('after'));
+
+    // An update arrives for every tree the host pushes - once a second for a clock. Rebuilding would
+    // restart every animation and re-decode every cover, several times a second, across the deck.
+    expect(container.querySelector('.deck-grid-tile')).toBe(tile);
+    expect(container.querySelector('.widget-text')).toBe(text);
+  });
+
+  it('paints tiles in position order, not in the order the widgets were handed over', () => {
+    const handle = mount({ cols: 2, rows: 2 });
+    handle.update([widget('d', 1, 1), widget('a', 0, 0), widget('c', 0, 1), widget('b', 1, 0)], () => undefined);
+
+    expect(paintedIds()).toBe('d c b a');
+
+    handle.update([widget('b', 1, 0), widget('c', 0, 1), widget('a', 0, 0), widget('d', 1, 1)], () => undefined);
+
+    expect(paintedIds()).toBe('d c b a');
+  });
+
+  it('reorders the tiles it already has when a widget moves, without rebuilding them', () => {
+    const handle = mount({ cols: 2, rows: 2 });
+    handle.update([widget('a', 0, 0), widget('b', 1, 1)], () => undefined);
+    const a = tileOf('a');
+    const b = tileOf('b');
+    expect(paintedIds()).toBe('b a');
+
+    handle.update([widget('a', 1, 1), widget('b', 0, 0)], () => undefined);
+
+    expect(paintedIds()).toBe('a b');
+    expect(tileOf('a')).toBe(a);
+    expect(tileOf('b')).toBe(b);
+  });
+
+  it('does not touch the tiles when an update keeps every position', () => {
+    const handle = mount({ cols: 2, rows: 2 });
+    const widgets = [widget('a', 0, 0), widget('b', 1, 0), widget('c', 0, 1)];
+    handle.update(widgets, () => undefined);
+    const surface = container.querySelector('.deck-grid') as HTMLElement;
+    const moves: MutationRecord[] = [];
+    const observer = new MutationObserver(records => moves.push(...records));
+    observer.observe(surface, { childList: true });
+
+    handle.update(widgets.slice().reverse(), () => tree('again'));
+    const seen = observer.takeRecords();
+    observer.disconnect();
+
+    expect(moves.length + seen.length).toBe(0);
+  });
+
+  it('turns the shadows off and back on', () => {
+    const handle = mount();
+    const surface = container.querySelector('.deck-grid') as HTMLElement;
+    handle.update([widget('a', 0, 0)], () => undefined);
+    expect(surface.classList.contains('deck-grid-flat')).toBeFalse();
+
+    handle.setShadows(false);
+    expect(surface.classList.contains('deck-grid-flat')).toBeTrue();
+
+    handle.setShadows(true);
+    expect(surface.classList.contains('deck-grid-flat')).toBeFalse();
+  });
+
+  it('starts flat when it is created with shadows off', () => {
+    renderWidgetGrid(container, { host, geometry: { cols: 5, rows: 3 }, shadows: false });
+
+    expect((container.querySelector('.deck-grid') as HTMLElement).classList.contains('deck-grid-flat')).toBeTrue();
+  });
+
+  it('gives every tile an opaque face of its own', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => tree('x'));
+
+    // Without it a widget is drawn straight onto the deck background - see #824's regression.
+    expect(container.querySelector('.deck-grid-tile-surface')).not.toBeNull();
+  });
+
+  it('drops the face of a tile whose widget root asks for a transparent background, and gives it back', () => {
+    const handle = mount();
+    const stack = (background?: string): UiNode =>
+      ({ id: 'root', type: 'ui.stack', properties: background === undefined ? {} : { background } }) as UiNode;
+    const tile = (): HTMLElement => container.querySelector('[data-widget-id="a"]') as HTMLElement;
+
+    handle.update([widget('a', 0, 0), widget('b', 1, 0)], id => (id === 'a' ? stack('transparent') : stack()));
+    expect(tile().classList.contains('deck-grid-tile-transparent')).toBeTrue();
+    expect(container.querySelectorAll('.deck-grid-tile-transparent').length).toBe(1);
+
+    handle.update([widget('a', 0, 0)], () => stack('#101010'));
+    expect(tile().classList.contains('deck-grid-tile-transparent')).toBeFalse();
+  });
+
+  it('marks a tile whose widget paints an opaque fill, and unmarks it when the fill goes', () => {
+    const handle = mount();
+    const stack = (background?: string): UiNode =>
+      ({ id: 'root', type: 'ui.stack', properties: background === undefined ? {} : { background } }) as UiNode;
+    const tile = (): HTMLElement => container.querySelector('[data-widget-id="a"]') as HTMLElement;
+
+    handle.update([widget('a', 0, 0)], () => stack('#ff0000'));
+    expect(tile().classList.contains('deck-grid-tile-filled')).toBeTrue();
+
+    handle.update([widget('a', 0, 0)], () => stack());
+    expect(tile().classList.contains('deck-grid-tile-filled')).toBeFalse();
+  });
+
+  it('runs its own press lifecycle for a tree that claims no gesture', () => {
+    const fired: string[] = [];
+    const handle = renderWidgetGrid(container, {
+      host,
+      geometry: { cols: 5, rows: 3 },
+      onWidgetTrigger: (widgetId, triggerType) => fired.push(`${widgetId}:${triggerType}`),
+    });
+    handle.update([widget('a', 0, 0)], () => tree('clock'));
+
+    press(container.querySelector('.deck-grid-tile-surface') as HTMLElement);
+
+    expect(fired).toEqual(['a:onTouchStart', 'a:onTouchEnd', 'a:onShortPress']);
+  });
+
+  it('leaves the press to a tree that claims the gesture itself', () => {
+    const fired: string[] = [];
+    const handle = renderWidgetGrid(container, {
+      host,
+      geometry: { cols: 5, rows: 3 },
+      onWidgetTrigger: (widgetId, triggerType) => fired.push(`${widgetId}:${triggerType}`),
+    });
+    handle.update([widget('a', 0, 0)], () => pressable());
+
+    press(container.querySelector('.deck-grid-tile-surface') as HTMLElement);
+
+    // One physical press must not run two lifecycles - the widget's flows would fire twice.
+    expect(fired).toEqual([]);
+  });
+
+  describe('a tile whose tree is a responsive layout', () => {
+    const responsiveTree = (): UiNode => ({
+      id: 'weather',
+      type: 'ui.responsive',
+      properties: { variants: [{ minWidth: 1.5 }] },
+      children: [
+        { id: 'weather.compact', type: 'ui.text', properties: { text: '21' } },
+        { id: 'weather.wide', type: 'ui.button', properties: { events: ['press'] } },
+      ],
+    }) as UiNode;
+
+    const mountResponsive = (width: number, fired: string[]) => {
+      const handle = renderWidgetGrid(container, {
+        host,
+        geometry: { cols: 5, rows: 3 },
+        onWidgetTrigger: (widgetId, triggerType) => fired.push(`${widgetId}:${triggerType}`),
+      });
+      handle.update([widget('a', 0, 0, width, 1)], () => responsiveTree());
+      return handle;
+    };
+
+    it('runs the tile flow on one cell, where only the text layout is drawn', () => {
+      const fired: string[] = [];
+      mountResponsive(1, fired);
+
+      press(container.querySelector('.deck-grid-tile-surface') as HTMLElement);
+
+      expect(container.querySelector('[data-node-id="weather.compact"]')).not.toBeNull();
+      expect(fired).toEqual(['a:onTouchStart', 'a:onTouchEnd', 'a:onShortPress']);
+    });
+
+    it('leaves the press to the button its wide layout draws on two cells, and lights the tile for it', () => {
+      const fired: string[] = [];
+      const handle = mountResponsive(2, fired);
+      const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+      const button = container.querySelector('[data-node-id="weather.wide"]') as HTMLElement;
+
+      press(container.querySelector('.deck-grid-tile-surface') as HTMLElement);
+      button.dispatchEvent(pointer('pointerdown'));
+
+      expect(fired).toEqual([]);
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeTrue();
+      expect(handle.tileBox('a')!.width! / handle.tileBox('a')!.height!).toBeGreaterThan(2);
+    });
+  });
+
+  describe('double tap', () => {
+    const doubleTapFlow = (disabled = false) =>
+      ({ flows: [{ triggerId: 'd', triggerType: 'onDoublePress', children: [{ id: 'b', disabled }] }] });
+
+    const withData = (data: object): GridWidget => ({ ...widget('a', 0, 0), data } as GridWidget);
+
+    beforeEach(() => jasmine.clock().install());
+    afterEach(() => jasmine.clock().uninstall());
+
+    const tileTriggers = (gridWidget: GridWidget) => {
+      const fired: string[] = [];
+      const handle = renderWidgetGrid(container, {
+        host,
+        geometry: { cols: 5, rows: 3 },
+        onWidgetTrigger: (_widgetId, triggerType) => fired.push(triggerType),
+      });
+      handle.update([gridWidget], () => tree('clock'));
+      return { fired, handle, surface: container.querySelector('.deck-grid-tile-surface') as HTMLElement };
+    };
+
+    it('runs only the double tap flow for two quick taps on a tile that has one', () => {
+      const { fired, surface } = tileTriggers(withData(doubleTapFlow()));
+
+      press(surface);
+      jasmine.clock().tick(200);
+      press(surface);
+      jasmine.clock().tick(1000);
+
+      expect(fired).toEqual(['onTouchStart', 'onTouchEnd', 'onTouchStart', 'onTouchEnd', 'onDoublePress']);
+    });
+
+    it('runs the short press once the double tap window has passed', () => {
+      const { fired, surface } = tileTriggers(withData(doubleTapFlow()));
+
+      press(surface);
+      jasmine.clock().tick(399);
+      expect(fired).toEqual(['onTouchStart', 'onTouchEnd']);
+
+      jasmine.clock().tick(1);
+      expect(fired).toEqual(['onTouchStart', 'onTouchEnd', 'onShortPress']);
+    });
+
+    it('runs the waiting short press before a long press that follows it', () => {
+      const { fired, surface } = tileTriggers(withData(doubleTapFlow()));
+
+      press(surface);
+      jasmine.clock().tick(100);
+      surface.dispatchEvent(pointer('pointerdown'));
+      jasmine.clock().tick(600);
+      surface.dispatchEvent(pointer('pointerup'));
+
+      expect(fired).toEqual(['onTouchStart', 'onTouchEnd', 'onTouchStart', 'onShortPress', 'onLongPress', 'onTouchEnd']);
+    });
+
+    it('keeps the short press immediate without a runnable double tap flow', () => {
+      for (const data of [{}, doubleTapFlow(true), { flows: [{ triggerId: 'd', triggerType: 'onDoublePress', children: [] }] }]) {
+        container.innerHTML = '';
+        const { fired, surface } = tileTriggers(withData(data));
+
+        press(surface);
+        press(surface);
+
+        expect(fired).toEqual(['onTouchStart', 'onTouchEnd', 'onShortPress', 'onTouchStart', 'onTouchEnd', 'onShortPress']);
+      }
+    });
+
+    it('drops a waiting short press when the tile goes away', () => {
+      const { fired, surface, handle } = tileTriggers(withData(doubleTapFlow()));
+
+      press(surface);
+      handle.update([], () => undefined);
+      jasmine.clock().tick(1000);
+
+      expect(fired).toEqual(['onTouchStart', 'onTouchEnd']);
+    });
+
+    describe('on a button that declares double-press', () => {
+      const button = (events: string[]): UiNode =>
+        ({ id: 'root', type: 'ui.button', properties: { events } }) as UiNode;
+
+      const buttonEvents = (root: () => UiNode) => {
+        const seen: string[] = [];
+        const handle = renderWidgetGrid(container, {
+          host,
+          geometry: { cols: 5, rows: 3 },
+          onWidgetEvent: (_widgetId, _node, name) => seen.push(name),
+        });
+        handle.update([widget('a', 0, 0)], root);
+        return { seen, handle, element: () => container.querySelector('.widget-button') as HTMLElement };
+      };
+
+      it('sends double-press instead of two presses', () => {
+        const { seen, element } = buttonEvents(() => button(['press', 'double-press']));
+
+        press(element());
+        jasmine.clock().tick(300);
+        press(element());
+        jasmine.clock().tick(1000);
+
+        expect(seen).toEqual(['double-press']);
+      });
+
+      it('sends a single press after the window, even when the tree was updated meanwhile', () => {
+        const { seen, element, handle } = buttonEvents(() => button(['press', 'double-press']));
+
+        press(element());
+        handle.update([widget('a', 0, 0)], () => button(['press', 'double-press']));
+        jasmine.clock().tick(400);
+
+        expect(seen).toEqual(['press']);
+      });
+
+      const at = (type: string, x: number): Event => {
+        const event = pointer(type) as Event & { clientX: number };
+        event.clientX = x;
+        return event;
+      };
+
+      it('sends the held press for the first tap when the second starts too far away, then presses again', () => {
+        const { seen, element } = buttonEvents(() => button(['press', 'double-press', 'press-start']));
+
+        element().dispatchEvent(at('pointerdown', 0));
+        element().dispatchEvent(at('pointerup', 0));
+        element().dispatchEvent(at('pointerdown', 25));
+        element().dispatchEvent(at('pointerup', 25));
+        jasmine.clock().tick(1000);
+
+        expect(seen).toEqual(['press-start', 'press', 'press-start', 'press']);
+      });
+
+      it('treats a second tap within 24 px as a double tap', () => {
+        const { seen, element } = buttonEvents(() => button(['press', 'double-press']));
+
+        element().dispatchEvent(at('pointerdown', 0));
+        element().dispatchEvent(at('pointerup', 0));
+        element().dispatchEvent(at('pointerdown', 24));
+        element().dispatchEvent(at('pointerup', 24));
+        jasmine.clock().tick(1000);
+
+        expect(seen).toEqual(['double-press']);
+      });
+
+      it('sends the held press once a second press is cancelled, after that press began', () => {
+        const { seen, element } = buttonEvents(() => button(['press', 'double-press', 'press-start', 'press-end']));
+
+        press(element());
+        element().dispatchEvent(pointer('pointerdown'));
+        element().dispatchEvent(pointer('pointercancel'));
+        jasmine.clock().tick(1000);
+
+        expect(seen).toEqual(['press-start', 'press-end', 'press-start', 'press', 'press-end']);
+      });
+
+      it('sends the held press before a long press on the second tap', () => {
+        const { seen, element } = buttonEvents(() => button(['press', 'double-press', 'long-press']));
+
+        press(element());
+        element().dispatchEvent(pointer('pointerdown'));
+        jasmine.clock().tick(600);
+        element().dispatchEvent(pointer('pointerup'));
+        jasmine.clock().tick(1000);
+
+        expect(seen).toEqual(['press', 'long-press']);
+      });
+
+      it('presses immediately on a button that does not declare double-press', () => {
+        const { seen, element } = buttonEvents(() => button(['press']));
+
+        press(element());
+        press(element());
+
+        expect(seen).toEqual(['press', 'press']);
+      });
+    });
+  });
+
+  describe('a tile whose tree claims part of it', () => {
+    const tileTriggers = (root: UiNode) => {
+      const fired: string[] = [];
+      const handle = renderWidgetGrid(container, {
+        host,
+        geometry: { cols: 5, rows: 3 },
+        onWidgetTrigger: (_widgetId, triggerType) => fired.push(triggerType),
+      });
+      handle.update([widget('a', 0, 0)], () => root);
+      return fired;
+    };
+
+    it('runs no tile flow for a press on a blank area beside an inner button', () => {
+      const fired = tileTriggers({
+        id: 'root', type: 'ui.stack', properties: {},
+        children: [{ id: 'button', type: 'ui.button', properties: { events: ['press'] } }],
+      } as UiNode);
+
+      press(container.querySelector('.deck-grid-tile-surface') as HTMLElement);
+
+      expect(fired).toEqual([]);
+    });
+
+    it('runs no tile press or long press for a tree that only drags', () => {
+      jasmine.clock().install();
+      try {
+        const fired = tileTriggers({
+          id: 'root', type: 'ui.stack', properties: {},
+          children: [{ id: 'surface', type: 'ui.modifier', properties: { events: ['drag'] }, children: [] }],
+        } as UiNode);
+        const surface = container.querySelector('.deck-grid-tile-surface') as HTMLElement;
+
+        surface.dispatchEvent(pointer('pointerdown'));
+        jasmine.clock().tick(1000);
+        surface.dispatchEvent(pointer('pointerup'));
+
+        expect(fired).toEqual([]);
+      } finally {
+        jasmine.clock().uninstall();
+      }
+    });
+
+    it('absorbs every press on a tile whose tree holds a disabled region', () => {
+      const fired = tileTriggers({
+        id: 'root', type: 'ui.stack', properties: {},
+        children: [{ id: 'region', type: 'ui.stack', properties: { modifiers: { disabled: true } } }],
+      } as UiNode);
+
+      press(container.querySelector('.deck-grid-tile-surface') as HTMLElement);
+
+      expect(fired).toEqual([]);
+    });
+  });
+
+  it('scales the tile while the tree it holds reports itself pressed', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => pressable());
+    const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+
+    (container.querySelector('.widget-button') as HTMLElement).dispatchEvent(pointer('pointerdown'));
+
+    expect(tile.classList.contains('deck-grid-tile-pressed')).toBeTrue();
+  });
+
+  it('leaves the tile alone when a button nested in the tree is pressed, and tints that button', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => ({
+      id: 'root',
+      type: 'ui.stack',
+      properties: {},
+      children: [{ id: 'nested', type: 'ui.button', properties: { events: ['press'] } }],
+    }) as UiNode);
+    const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+    const button = container.querySelector('[data-node-id="nested"]') as HTMLElement;
+
+    button.dispatchEvent(pointer('pointerdown'));
+
+    expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    expect(button.querySelector('.widget-press-tint-active')).not.toBeNull();
+  });
+
+  it('releases the tile when the pressed root is replaced mid-press', () => {
+    jasmine.clock().install();
+    jasmine.clock().mockDate();
+    try {
+      const handle = mount();
+      handle.update([widget('a', 0, 0)], () => pressable());
+      const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+      (container.querySelector('.widget-button') as HTMLElement).dispatchEvent(pointer('pointerdown'));
+
+      handle.update([widget('a', 0, 0)], () => tree('clock'));
+      jasmine.clock().tick(PRESS_FEEDBACK_MIN_VISIBLE_MS);
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    } finally {
+      jasmine.clock().uninstall();
+    }
+  });
+
+  it('releases a press the pointer dragged out of, whatever pointer the leave carries', () => {
+    jasmine.clock().install();
+    jasmine.clock().mockDate();
+    try {
+      const handle = mount();
+      handle.update([widget('a', 0, 0)], () => tree('clock'));
+      const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+      const surface = container.querySelector('.deck-grid-tile-surface') as HTMLElement;
+
+      surface.dispatchEvent(pointer('pointerdown', 1));
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeTrue();
+
+      // A different id than the press started with: filtering on it strands the tile scaled and
+      // tinted with no way back.
+      surface.dispatchEvent(pointer('pointerleave', 7));
+      jasmine.clock().tick(PRESS_FEEDBACK_MIN_VISIBLE_MS);
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    } finally {
+      jasmine.clock().uninstall();
+    }
+  });
+
+  it('holds the pressed look for long enough to be seen', () => {
+    jasmine.clock().install();
+    jasmine.clock().mockDate();
+    try {
+      const handle = mount();
+      handle.update([widget('a', 0, 0)], () => tree('clock'));
+      const tile = container.querySelector('.deck-grid-tile') as HTMLElement;
+      const surface = container.querySelector('.deck-grid-tile-surface') as HTMLElement;
+
+      // A tap can be shorter than a frame, which would otherwise leave the press unpainted (#454).
+      surface.dispatchEvent(pointer('pointerdown'));
+      surface.dispatchEvent(pointer('pointerup'));
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeTrue();
+      jasmine.clock().tick(PRESS_FEEDBACK_MIN_VISIBLE_MS);
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    } finally {
+      jasmine.clock().uninstall();
+    }
+  });
+
+  describe('a slider double tap', () => {
+    const slider = (events: string[]): UiNode =>
+      ({ id: 'slider', type: 'ui.slider', properties: { events } }) as UiNode;
+
+    const sliderTile = (events: string[]): UiNode =>
+      ({
+        id: 'root',
+        type: 'ui.stack',
+        properties: {},
+        children: [{ id: 'lead', type: 'ui.text', properties: { text: 'Volume' } }, slider(events)],
+      }) as UiNode;
+
+    const at = (type: string, x: number): Event => {
+      const event = pointer(type) as Event & { clientX: number };
+      event.clientX = x;
+      return event;
+    };
+
+    const tap = (element: HTMLElement, x = 0): void => {
+      element.dispatchEvent(at('pointerdown', x));
+      element.dispatchEvent(at('pointerup', x));
+    };
+
+    const mountSlider = (root: UiNode) => {
+      mount().update([widget('a', 0, 0)], () => root);
+      return {
+        tile: container.querySelector('.deck-grid-tile') as HTMLElement,
+        slider: container.querySelector('[data-node-id="slider"]') as HTMLElement,
+      };
+    };
+
+    beforeEach(() => {
+      jasmine.clock().install();
+      jasmine.clock().mockDate();
+    });
+
+    afterEach(() => jasmine.clock().uninstall());
+
+    it('flashes the tile like a button press when the double tap is recognised', () => {
+      const { tile, slider: element } = mountSlider(sliderTile(['adjust', 'change', 'double-press']));
+
+      tap(element);
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+      jasmine.clock().tick(200);
+      tap(element);
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeTrue();
+      jasmine.clock().tick(PRESS_FEEDBACK_MIN_VISIBLE_MS);
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    });
+
+    it('does not flash for two taps further apart than a double tap', () => {
+      const { tile, slider: element } = mountSlider(sliderTile(['adjust', 'change', 'double-press']));
+
+      tap(element);
+      jasmine.clock().tick(500);
+      tap(element);
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    });
+
+    it('does not flash when a drag is followed by a tap', () => {
+      const { tile, slider: element } = mountSlider(sliderTile(['adjust', 'change', 'double-press']));
+
+      element.dispatchEvent(at('pointerdown', 0));
+      element.dispatchEvent(at('pointermove', 40));
+      element.dispatchEvent(at('pointerup', 40));
+      jasmine.clock().tick(100);
+      tap(element, 40);
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    });
+
+    it('does not flash a slider that has no double tap action', () => {
+      const { tile, slider: element } = mountSlider(sliderTile(['adjust', 'change']));
+
+      tap(element);
+      jasmine.clock().tick(200);
+      tap(element);
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    });
+
+    it('leaves the tile alone for a slider nested after another control of the tile', () => {
+      const { tile, slider: element } = mountSlider({
+        id: 'root',
+        type: 'ui.stack',
+        properties: {},
+        children: [
+          { id: 'nested', type: 'ui.button', properties: { events: ['press'] } },
+          slider(['adjust', 'change', 'double-press']),
+        ],
+      } as UiNode);
+
+      tap(element);
+      jasmine.clock().tick(200);
+      tap(element);
+
+      expect(tile.classList.contains('deck-grid-tile-pressed')).toBeFalse();
+    });
+  });
+
+  it('re-solves for a folder with a grid of its own', () => {
+    const handle = mount();
+    handle.update([widget('a', 0, 0)], () => undefined);
+    const before = container.querySelectorAll('.deck-grid-cell').length;
+
+    handle.configure({ cols: 4, rows: 2 }, 22);
+    handle.update([widget('a', 0, 0)], () => undefined);
+
+    expect(before).toBe(14);
+    expect(container.querySelectorAll('.deck-grid-cell').length).toBe(7);
+  });
+
+  describe('empty cells', () => {
+    const surface = () => container.querySelector('.deck-grid') as HTMLElement;
+    const hidden = () => surface().classList.contains('deck-grid-empty-transparent');
+
+    it('shows empty cells unless the folder asks for transparent ones', () => {
+      mount();
+
+      expect(hidden()).toBeFalse();
+    });
+
+    it('hides empty cells from the first paint when created transparent', () => {
+      renderWidgetGrid(container, { host, geometry: { cols: 5, rows: 3 }, emptyCellStyle: 'transparent' });
+
+      expect(hidden()).toBeTrue();
+    });
+
+    it('switches the style for a folder with the same grid, without redrawing its cells', () => {
+      const handle = mount();
+      handle.update([widget('a', 0, 0)], () => undefined);
+      const firstCell = container.querySelector('.deck-grid-cell');
+
+      handle.configure({ cols: 5, rows: 3 }, undefined, 'transparent');
+      const afterTransparent = hidden();
+      handle.configure({ cols: 5, rows: 3 }, undefined, 'visible');
+
+      expect(afterTransparent).toBeTrue();
+      expect(hidden()).toBeFalse();
+      expect(container.querySelector('.deck-grid-cell')).toBe(firstCell);
+      expect(container.querySelectorAll('.deck-grid-cell').length).toBe(14);
+    });
+
+    it('goes back to visible cells when a later folder states no style', () => {
+      const handle = renderWidgetGrid(container, { host, geometry: { cols: 5, rows: 3 }, emptyCellStyle: 'transparent' });
+
+      handle.configure({ cols: 5, rows: 3 }, undefined);
+
+      expect(hidden()).toBeFalse();
+    });
+  });
+
+  describe('updateWidget', () => {
+    it('repaints one widget and leaves another tile\'s DOM untouched', () => {
+      const trees: { [id: string]: UiNode } = { a: tree('A1'), b: tree('B1') };
+      const handle = mount();
+      handle.update([widget('a', 0, 0), widget('b', 1, 0)], id => trees[id]);
+
+      const bTile = container.querySelector('[data-widget-id="b"]') as HTMLElement;
+      const bRoot = bTile.querySelector('[data-node-id]');
+
+      trees['a'] = tree('A2');
+      trees['b'] = tree('B2');
+      handle.updateWidget('a');
+
+      const aTile = container.querySelector('[data-widget-id="a"]') as HTMLElement;
+      expect(aTile.querySelector('.widget-text')!.textContent).toBe('A2');
+      expect(bTile.querySelector('.widget-text')!.textContent).toBe('B1');
+      expect(container.querySelector('[data-widget-id="b"]')).toBe(bTile);
+      expect(bTile.querySelector('[data-node-id]')).toBe(bRoot);
+    });
+
+    it('touches no attribute or child of the tile it leaves alone', async () => {
+      const trees: { [id: string]: UiNode } = { a: tree('A1'), b: tree('B1') };
+      const handle = mount();
+      handle.update([widget('a', 0, 0), widget('b', 1, 0)], id => trees[id]);
+      const bTile = container.querySelector('[data-widget-id="b"]') as HTMLElement;
+
+      const records: MutationRecord[] = [];
+      const observer = new MutationObserver(mutations => { records.push(...mutations); });
+      observer.observe(bTile, { subtree: true, attributes: true, childList: true, characterData: true });
+
+      trees['a'] = tree('A2');
+      trees['b'] = tree('B2');
+      handle.updateWidget('a');
+
+      for (let turn = 0; turn < 6; turn++) await Promise.resolve();
+      observer.disconnect();
+
+      expect(records).toEqual([]);
+    });
+
+    it('answers false for an id with no tile, and changes neither tile', () => {
+      const trees: { [id: string]: UiNode } = { a: tree('A1'), b: tree('B1') };
+      const handle = mount();
+      handle.update([widget('a', 0, 0), widget('b', 1, 0)], id => trees[id]);
+      const aTile = container.querySelector('[data-widget-id="a"]');
+      const bTile = container.querySelector('[data-widget-id="b"]');
+      const aText = aTile!.querySelector('.widget-text')!.textContent;
+      const bText = bTile!.querySelector('.widget-text')!.textContent;
+
+      expect(handle.updateWidget('nope')).toBeFalse();
+
+      expect(container.querySelector('[data-widget-id="a"]')).toBe(aTile);
+      expect(container.querySelector('[data-widget-id="b"]')).toBe(bTile);
+      expect(aTile!.querySelector('.widget-text')!.textContent).toBe(aText);
+      expect(bTile!.querySelector('.widget-text')!.textContent).toBe(bText);
+    });
+
+    it('answers false before any update() call, without throwing', () => {
+      const handle = mount();
+      expect(() => expect(handle.updateWidget('a')).toBeFalse()).not.toThrow();
+    });
+
+    it('answers true and unmounts the tree when the lookup now has none for it', () => {
+      const trees: { [id: string]: UiNode | undefined } = { a: tree('A1') };
+      const handle = mount();
+      handle.update([widget('a', 0, 0)], id => trees[id]);
+      const aTile = container.querySelector('[data-widget-id="a"]') as HTMLElement;
+      expect(aTile.querySelector('.widget-text')).not.toBeNull();
+
+      trees['a'] = undefined;
+
+      expect(handle.updateWidget('a')).toBeTrue();
+      expect(aTile.querySelector('.widget-text')).toBeNull();
+    });
+
+    it('answers true and remounts when the lookup now returns a different type', () => {
+      const trees: { [id: string]: UiNode } = { a: tree('A1') };
+      const handle = mount();
+      handle.update([widget('a', 0, 0)], id => trees[id]);
+      const aTile = container.querySelector('[data-widget-id="a"]') as HTMLElement;
+      expect(aTile.querySelector('.widget-text')).not.toBeNull();
+
+      trees['a'] = pressable();
+
+      expect(handle.updateWidget('a')).toBeTrue();
+      expect(aTile.querySelector('.widget-text')).toBeNull();
+      expect(aTile.querySelector('.widget-button')).not.toBeNull();
+    });
+
+    it('does not re-solve the deck geometry when repainting one widget', () => {
+      const trees: { [id: string]: UiNode } = { a: tree('A1'), b: tree('B1') };
+      const handle = mount();
+      handle.update([widget('a', 0, 0), widget('b', 1, 0)], id => trees[id]);
+
+      const aTile = container.querySelector('[data-widget-id="a"]') as HTMLElement;
+      const surface = container.querySelector('.deck-grid') as HTMLElement;
+      const before = {
+        left: aTile.style.left, top: aTile.style.top, width: aTile.style.width, height: aTile.style.height,
+        scale: surface.style.getPropertyValue('--widget-scale'),
+      };
+      const cellCount = container.querySelectorAll('.deck-grid-cell').length;
+
+      trees['a'] = tree('A2');
+      handle.updateWidget('a');
+
+      expect(aTile.style.left).toBe(before.left);
+      expect(aTile.style.top).toBe(before.top);
+      expect(aTile.style.width).toBe(before.width);
+      expect(aTile.style.height).toBe(before.height);
+      expect(surface.style.getPropertyValue('--widget-scale')).toBe(before.scale);
+      expect(container.querySelectorAll('.deck-grid-cell').length).toBe(cellCount);
+    });
+  });
+});

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <!-- Underscored test names, like the host test projects. -->
+        <NoWarn>$(NoWarn);CA1707</NoWarn>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="coverlet.collector" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" />
+        <PackageReference Include="NUnit" />
+        <PackageReference Include="NUnit.Analyzers" />
+        <PackageReference Include="NUnit3TestAdapter" />
+        <PackageReference Include="Spectre.Console.Testing" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\src\MacroDeck.Plugin.Cli\MacroDeck.Plugin.Cli.csproj" />
+        <ProjectReference Include="..\support\MacroDeck.Signing.TestSupport\MacroDeck.Signing.TestSupport.csproj" />
+        <ProjectReference Include="..\fixtures\MacroDeck.Plugin.Testing.Tests.WellBehavedPlugin\MacroDeck.Plugin.Testing.Tests.WellBehavedPlugin.csproj"
+                           ReferenceOutputAssembly="false" />
+        <ProjectReference Include="..\fixtures\MacroDeck.Plugin.Testing.Tests.MisbehavingPlugin\MacroDeck.Plugin.Testing.Tests.MisbehavingPlugin.csproj"
+                           ReferenceOutputAssembly="false" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Using Include="NUnit.Framework"/>
+    </ItemGroup>
+
+</Project>

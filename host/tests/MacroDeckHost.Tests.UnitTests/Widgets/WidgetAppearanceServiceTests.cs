@@ -1,0 +1,1107 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using MacroDeckHost.Application.Caching;
+using MacroDeckHost.Application.Rendering;
+using MacroDeckHost.Integrations.Streaming;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Domain.Common;
+using MacroDeckHost.Domain.Entities;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Domain.Widgets;
+using MacroDeck.Sdk.Widgets;
+using MacroDeckHost.Integrations.Twitch.Connections;
+using MacroDeckHost.Widgets.ActionButton;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using MacroDeck.Ui.Config;
+using MacroDeckHost.Integrations.Twitch;
+using MacroDeckHost.Tests.UnitTests.Twitch;
+using MacroDeckHost.Tests.UnitTests.Twitch.Chat;
+using Serilog;
+using Serilog.Core;
+
+namespace MacroDeckHost.Tests.UnitTests.Widgets;
+
+[TestFixture]
+public class WidgetAppearanceServiceTests
+{
+	private static readonly Guid _widgetId = Guid.Parse("11111111-1111-1111-1111-111111111111");
+	private static readonly string[] _offThenOn = ["off", "on"];
+	private static readonly string[] _lowMidHigh = ["low", "mid", "high"];
+
+	[Test]
+	public async Task AppearanceChange_WritesTheStoredWidget()
+	{
+		var fixture = new Fixture("""{"mode":"momentary","label":"configured"}""");
+
+		var applied = await fixture.Service.ApplyAsync(Request("changed"));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True);
+			Assert.That(fixture.Widget.Data, Does.Contain("changed").And.Not.Contain("configured"));
+			Assert.That(fixture.Widgets.Updated, Has.Count.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public async Task EveryWrite_TakesTheWidgetsDataLock()
+	{
+		var fixture = new Fixture("""{"mode":"momentary","label":"configured"}""");
+
+		await fixture.Service.ApplyAsync(Request("changed"));
+
+		Assert.That(fixture.WriteLock.Acquired, Is.EqualTo(new[] { _widgetId }));
+	}
+
+	[TestCase(true, "on")]
+	[TestCase(false, "off")]
+	public async Task CurrentState_OnABoundButton_FollowsTheDerivedState(bool derived, string expectedState)
+	{
+		var fixture = new Fixture("""
+								  {"mode":"toggle","stateBinding":{"variable":"vars.mic"},
+								  "states":{"off":{"label":"Off"},"on":{"label":"On"}}}
+								  """);
+		fixture.DerivedStates.GetAndSet(_widgetId, expectedState);
+
+		await fixture.Service.ApplyAsync(Request("changed"));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(StateLabel(fixture, expectedState), Is.EqualTo("changed"));
+			Assert.That(StateLabel(fixture, expectedState == "on" ? "off" : "on"), Is.Not.EqualTo("changed"));
+		});
+	}
+
+	// Before the reconciler has ever run for this widget, the derived store has nothing cached
+	// (issue #312). ResolveStates' documented fallback is the just-upgraded activeStateId derived from
+	// the legacy isToggled bit - the best information actually available - rather than an uninformed
+	// states[0], which is why "current" here lands on "on" (isToggled was true), not "off".
+	[Test]
+	public async Task CurrentState_OnABoundButton_FallsBackToTheStoredToggle_WhenNoDerivedStateIsKnown()
+	{
+		var fixture = new Fixture("""
+								  {"mode":"toggle","isToggled":true,"stateBinding":{"variable":"vars.mic"},
+								  "states":{"off":{"label":"Off"},"on":{"label":"On"}}}
+								  """);
+
+		await fixture.Service.ApplyAsync(Request("changed"));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(StateLabel(fixture, "on"), Is.EqualTo("changed"));
+			Assert.That(StateLabel(fixture, "off"), Is.EqualTo("Off"), "the other state must be untouched");
+		});
+	}
+
+	[Test]
+	public async Task CurrentState_OnAnUnboundButton_StillFollowsTheStoredToggle()
+	{
+		var fixture = new Fixture("""
+								  {"mode":"toggle","isToggled":true,"states":{"off":{"label":"Off"},"on":{"label":"On"}}}
+								  """);
+
+		await fixture.Service.ApplyAsync(Request("changed"));
+
+		Assert.That(StateLabel(fixture, "on"), Is.EqualTo("changed"));
+	}
+
+	[Test]
+	public async Task UnknownWidget_IsReportedRatherThanThrown()
+	{
+		var fixture = new Fixture("{}");
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = Guid.NewGuid().ToString(),
+			Patch = new WidgetAppearancePatch { Label = "x" }
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.False);
+			Assert.That(fixture.Widgets.Updated, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task TargetThatIsNotAnId_IsReportedRatherThanThrown()
+	{
+		var fixture = new Fixture("{}");
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = "not-a-guid",
+			Patch = new WidgetAppearancePatch { Label = "x" }
+		});
+
+		Assert.That(applied, Is.False);
+	}
+
+	[Test]
+	public async Task AppearanceChange_RoundTripsLineBreaksAndLiquidUnchanged()
+	{
+		const string label = "Line one\nLine two\n{{ vars.system_cpu_usage_percent }}%";
+		var fixture = new Fixture("""{"mode":"momentary","label":"configured"}""");
+
+		await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { Label = label }
+		});
+
+		var storedLabel = WidgetAppearanceJson.ReadLabel((JsonObject)JsonNode.Parse(fixture.Widget.Data!)!,
+			WidgetTypeIds.ActionButton,
+			"off");
+		Assert.That(storedLabel, Is.EqualTo(label));
+	}
+
+	[Test]
+	public void GetWidgets_QualifiesEachWidgetByProfileAndFolder()
+	{
+		var fixture = new Fixture("""{"mode":"momentary","label":"Mute"}""");
+
+		var widget = fixture.Service.GetWidgets().Single();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(widget.Label, Is.EqualTo("Mute"));
+			Assert.That(widget.Location, Is.EqualTo("Main / Home"));
+		});
+	}
+
+	[Test]
+	public void GetWidgets_FallsBackToTheTypeWhenAWidgetHasNoLabel()
+	{
+		var fixture = new Fixture("{}", WidgetTypeIds.Clock);
+
+		Assert.That(fixture.Service.GetWidgets().Single().Label, Is.EqualTo("Clock"));
+	}
+
+	// Scenario F6: States and CurrentStateId are reported for any State-Mode button, and the obsolete
+	// HasOnOffStates flag still answers - true for two or more states whatever their ids (resolution
+	// 9), not only a literal on/off pair, so an old plugin keeps the capability it has today.
+	[Test]
+	public void WidgetTargetInfo_ReportsStatesAndCurrentStateIdWhileHasOnOffStatesStillAnswers()
+	{
+		var toggle = new Fixture("""{"mode":"toggle"}""");
+		var threeState = new Fixture(
+			"""{"stateMode":true,"states":[{"id":"low","label":"Low"},{"id":"mid","label":"Mid"},{"id":"high","label":"High"}],"activeStateId":"mid"}""");
+		var momentary = new Fixture("""{"mode":"momentary"}""");
+		var nonButton = new Fixture("{}", WidgetTypeIds.Clock);
+
+#pragma warning disable CS0618 // HasOnOffStates is deprecated but must keep answering for an old plugin.
+		Assert.Multiple(() =>
+		{
+			var toggleInfo = toggle.Service.GetWidgets().Single();
+			Assert.That(toggleInfo.HasOnOffStates, Is.True);
+			Assert.That(toggleInfo.States.Select(s => s.Id), Is.EqualTo(_offThenOn));
+			Assert.That(toggleInfo.CurrentStateId, Is.EqualTo("off"));
+
+			var threeStateInfo = threeState.Service.GetWidgets().Single();
+			Assert.That(threeStateInfo.HasOnOffStates, Is.True, "two or more states, whatever their ids");
+			Assert.That(threeStateInfo.States.Select(s => s.Id), Is.EqualTo(_lowMidHigh));
+			Assert.That(threeStateInfo.CurrentStateId, Is.EqualTo("mid"));
+
+			Assert.That(momentary.Service.GetWidgets().Single().HasOnOffStates, Is.False);
+			Assert.That(momentary.Service.GetWidgets().Single().States, Is.Empty);
+			Assert.That(nonButton.Service.GetWidgets().Single().HasOnOffStates, Is.False);
+		});
+#pragma warning restore CS0618
+	}
+
+	// The compatibility guarantee WidgetAppearanceService.ApplyAsync exists for: a widget still stored
+	// in the pre-#612 mode:"toggle" + states:{off,on} shape is normalized before its states are
+	// resolved, so a plugin restyling it by state id lands on the correct state rather than failing or
+	// silently no-opping against data ApplyAsync never upgraded.
+	[Test]
+	public async Task LegacyToggleBag_RestyledByStateId_IsNormalizedBeforeApplying()
+	{
+		var fixture = new Fixture(
+			"""{"mode":"toggle","isToggled":false,"states":{"off":{"label":"Off"},"on":{"label":"On"}}}""");
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { Label = "Live" },
+			StateIds = ["on"]
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True);
+			Assert.That(StateLabel(fixture, "on"), Is.EqualTo("Live"));
+			Assert.That(StateLabel(fixture, "off"), Is.EqualTo("Off"), "the other state must be untouched");
+			Assert.That(fixture.Widget.Data, Does.Not.Contain("\"mode\""), "the legacy key must not survive the write");
+		});
+	}
+
+	// Acceptance Group B, scenario 7: Set Icon writes the typed shape through the unchanged string patch
+	// API - an object with "type" present, never a bare string, and no stray legacy iconId key beside it.
+	[Test]
+	public async Task SetIcon_WritesTheTypedIconShapeThroughTheUnchangedStringPatchApi()
+	{
+		var fixture = new Fixture(
+			"""{"stateMode":true,"states":[{"id":"off","label":"Off","appearance":{}},{"id":"on","label":"On","appearance":{}}]}""");
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { IconId = "0198bbbb-1111-2222-3333-444444444444" },
+			StateIds = ["on"]
+		});
+
+		var onAppearance = StateAppearance(fixture, "on");
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True);
+			Assert.That(onAppearance!["icon"], Is.Not.Null.And.TypeOf<JsonObject>());
+			Assert.That(onAppearance["icon"]!["type"]!.GetValue<string>(), Is.EqualTo("icon-pack"));
+			Assert.That(onAppearance["icon"]!["reference"]!.GetValue<string>(),
+				Is.EqualTo("0198bbbb-1111-2222-3333-444444444444"));
+			Assert.That(onAppearance.ContainsKey("iconId"), Is.False, "no stray legacy iconId key beside it");
+		});
+	}
+
+	// Acceptance Group B, scenario 8: the documented empty-string clear still clears - the icon key is
+	// removed outright, never a stub {"type":"icon-pack","reference":""}.
+	[Test]
+	public async Task SetIcon_EmptyStringStillClearsTheIconKeyOutright()
+	{
+		var fixture = new Fixture(
+			"""{"stateMode":true,"states":[{"id":"off","label":"Off","appearance":{}},{"id":"on","label":"On","appearance":{"icon":{"type":"icon-pack","reference":"0198aaaa-1111-2222-3333-444444444444"}}}]}""");
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { IconId = string.Empty },
+			StateIds = ["on"]
+		});
+
+		var onAppearance = StateAppearance(fixture, "on");
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True);
+			Assert.That(onAppearance!.ContainsKey("icon"), Is.False);
+		});
+
+		var rendered = ActionButtonWidgetData.Parse(JsonDocument.Parse(fixture.Widget.Data!).RootElement)
+			.ResolveIcon("on");
+		Assert.That(rendered, Is.Null, "renders no image");
+	}
+
+	// Acceptance Group A, scenario 5 (counterexample): an unknown provider type keeps the widget usable -
+	// editing an unrelated property (the label) and saving must not touch or reject the icon object.
+	[Test]
+	public async Task UnknownProviderTypeIcon_SurvivesAnUnrelatedLabelEditUnchanged()
+	{
+		var fixture = new Fixture(
+			"""{"stateMode":false,"icon":{"type":"future-provider","reference":"x"},"label":"Old"}""");
+
+		var applied = await fixture.Service.ApplyAsync(Request("Renamed"));
+
+		var data = (JsonObject)JsonNode.Parse(fixture.Widget.Data!)!;
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True);
+			Assert.That(data["label"]!.GetValue<string>(), Is.EqualTo("Renamed"));
+			Assert.That(data["icon"]!["type"]!.GetValue<string>(), Is.EqualTo("future-provider"));
+			Assert.That(data["icon"]!["reference"]!.GetValue<string>(), Is.EqualTo("x"));
+		});
+	}
+
+	// Acceptance Group A, scenario 6: an unknown icon-pack reference is never helpfully cleared by a save.
+	[Test]
+	public async Task DanglingIconPackReference_IsStillStoredAfterAnUnrelatedSave()
+	{
+		var fixture = new Fixture(
+			"""{"stateMode":false,"icon":{"type":"icon-pack","reference":"0198dddd-0000-0000-0000-000000000000"},"label":"Old"}""");
+
+		var applied = await fixture.Service.ApplyAsync(Request("Renamed"));
+
+		var data = (JsonObject)JsonNode.Parse(fixture.Widget.Data!)!;
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True);
+			Assert.That(data["label"]!.GetValue<string>(), Is.EqualTo("Renamed"));
+			Assert.That(data["icon"]!["reference"]!.GetValue<string>(),
+				Is.EqualTo("0198dddd-0000-0000-0000-000000000000"));
+		});
+	}
+
+	// Acceptance Group B, scenario 9 (counterexample): Set Icon fails on a provider-controlled button and
+	// changes nothing - the action reports failure (ApplyAsync returns false for this icon-only patch),
+	// and the stored icon is unaffected.
+	[Test]
+	public async Task SetIcon_FailsOnAProviderControlledButton_AndTheStoredIconIsUnaffected()
+	{
+		var fixture = new Fixture("""
+								  {"stateMode":true,"states":[{"id":"off","label":"Off","appearance":{}},
+								  {"id":"on","label":"On","appearance":{"icon":{"type":"icon-pack","reference":"0198aaaa-1111-2222-3333-444444444444"}}}],
+								  "iconProvider":{"blockId":"blk-1","integrationId":"spotify","actionId":"current-track"},
+								  "flows":"[{\"triggerId\":\"t\",\"triggerType\":\"onShortPress\",\"children\":[{\"id\":\"blk-1\",\"type\":\"action\",\"blockType\":\"spotify.current-track\",\"integrationId\":\"spotify\",\"actionId\":\"current-track\",\"parameters\":[]}]}]"}
+								  """);
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { IconId = "0198bbbb-1111-2222-3333-444444444444" },
+			StateIds = ["on"]
+		});
+
+		var onAppearance = StateAppearance(fixture, "on");
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.False, "Set Icon must report failure, not silent success");
+			Assert.That(onAppearance!["icon"]!["reference"]!.GetValue<string>(),
+				Is.EqualTo("0198aaaa-1111-2222-3333-444444444444"),
+				"the stored icon is unaffected");
+		});
+	}
+
+	// Acceptance Group B, scenario 9's decision-2 worked example: a mixed Label+Icon patch on a
+	// provider-controlled button applies the label, drops the icon, and returns true.
+	[Test]
+	public async Task SetIconAndLabelTogether_OnAProviderControlledButton_AppliesTheLabelButDropsTheIcon()
+	{
+		var fixture = new Fixture("""
+								  {"stateMode":true,"states":[{"id":"off","label":"Off","appearance":{}},
+								  {"id":"on","label":"On","appearance":{"label":"Old","icon":{"type":"icon-pack","reference":"0198aaaa-1111-2222-3333-444444444444"}}}],
+								  "iconProvider":{"blockId":"blk-1","integrationId":"spotify","actionId":"current-track"},
+								  "flows":"[{\"triggerId\":\"t\",\"triggerType\":\"onShortPress\",\"children\":[{\"id\":\"blk-1\",\"type\":\"action\",\"blockType\":\"spotify.current-track\",\"integrationId\":\"spotify\",\"actionId\":\"current-track\",\"parameters\":[]}]}]"}
+								  """);
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { Label = "New", IconId = "0198bbbb-1111-2222-3333-444444444444" },
+			StateIds = ["on"]
+		});
+
+		var onAppearance = StateAppearance(fixture, "on");
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True, "the label change alone still applies and is reported");
+			Assert.That(onAppearance!["label"]!.GetValue<string>(), Is.EqualTo("New"));
+			Assert.That(onAppearance["icon"]!["reference"]!.GetValue<string>(),
+				Is.EqualTo("0198aaaa-1111-2222-3333-444444444444"),
+				"the icon property is dropped from the patch exactly as an unsupported property is");
+		});
+	}
+
+	// Acceptance Group B, scenario 10 (counterexample, pairs with 9): a button with only a state provider
+	// is unaffected - a shared HasActiveProvider(widget) guard would wrongly fail this.
+	[Test]
+	public async Task SetIcon_StillSucceeds_OnAButtonThatOnlyHasAStateProvider()
+	{
+		var fixture = new Fixture("""
+								  {"stateMode":true,"states":[{"id":"off","label":"Off","appearance":{}},
+								  {"id":"on","label":"On","appearance":{"icon":{"type":"icon-pack","reference":"0198aaaa-1111-2222-3333-444444444444"}}}],
+								  "stateProvider":{"blockId":"blk-1","integrationId":"spotify","actionId":"now-playing"}}
+								  """);
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { IconId = "0198bbbb-1111-2222-3333-444444444444" },
+			StateIds = ["on"]
+		});
+
+		var onAppearance = StateAppearance(fixture, "on");
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.True);
+			Assert.That(onAppearance!["icon"]!["reference"]!.GetValue<string>(),
+				Is.EqualTo("0198bbbb-1111-2222-3333-444444444444"));
+		});
+	}
+
+	[Test]
+	public void GetWidgets_ReportsAppearanceCapabilitiesFromTheSharedJsonMapping()
+	{
+		var button = new Fixture("{}");
+		var slider = new Fixture("{}", WidgetTypeIds.Slider);
+		var clock = new Fixture("{}", WidgetTypeIds.Clock);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(button.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.Font).And.Contain(WidgetAppearanceProperty.Icon));
+			Assert.That(button.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.IconDisplay));
+			Assert.That(button.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.IconColor));
+			Assert.That(slider.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Not.Contain(WidgetAppearanceProperty.IconColor));
+			Assert.That(button.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.IconAppearance));
+			Assert.That(slider.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.IconAppearance));
+			Assert.That(slider.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.Icon).And.Not.Contain(WidgetAppearanceProperty.IconDisplay));
+			Assert.That(clock.Service.GetWidgets().Single().AppearanceProperties,
+				Is.EqualTo(new[]
+				{
+					WidgetAppearanceProperty.BackgroundColor, WidgetAppearanceProperty.Border,
+					WidgetAppearanceProperty.BorderColor
+				}));
+		});
+	}
+
+	[Test]
+	public async Task IconAppearance_IsStoredUnderItsCanonicalKey()
+	{
+		var fixture = new Fixture(
+			"""{"icon":{"type":"icon-pack","reference":"0198aaaa-1111-2222-3333-444444444444"}}""");
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+			{ IconAppearance = "motion=static;colorScheme=dark" }));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Changed));
+			Assert.That(JsonNode.Parse(fixture.Widget.Data!)!["icon"]!["appearance"]!.GetValue<string>(),
+				Is.EqualTo("colorScheme=dark;motion=static"));
+		});
+	}
+
+	[TestCase("dark")]
+	[TestCase("ColorScheme=dark")]
+	[TestCase("colorScheme=dark;colorScheme=light")]
+	public async Task IconAppearance_ThatIsNotAnAppearanceKey_IsRejected_AndNotWritten(string appearance)
+	{
+		var fixture = new Fixture(
+			"""{"icon":{"type":"icon-pack","reference":"0198aaaa-1111-2222-3333-444444444444"}}""");
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+			{ IconAppearance = appearance }));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Rejected));
+			Assert.That(fixture.Widgets.Updated, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task IconAppearance_OnAProviderControlledButton_IsDroppedLikeTheIcon()
+	{
+		var fixture = new Fixture("""
+								  {"stateMode":true,"states":[{"id":"off","label":"Off","appearance":{}},
+								  {"id":"on","label":"On","appearance":{"icon":{"type":"icon-pack","reference":"0198aaaa-1111-2222-3333-444444444444"}}}],
+								  "iconProvider":{"blockId":"blk-1","integrationId":"spotify","actionId":"current-track"},
+								  "flows":"[{\"triggerId\":\"t\",\"triggerType\":\"onShortPress\",\"children\":[{\"id\":\"blk-1\",\"type\":\"action\",\"blockType\":\"spotify.current-track\",\"integrationId\":\"spotify\",\"actionId\":\"current-track\",\"parameters\":[]}]}]"}
+								  """);
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { IconAppearance = "colorScheme=dark" },
+			StateIds = ["on"]
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.False);
+			Assert.That(StateAppearance(fixture, "on")!["icon"]!.AsObject().ContainsKey("appearance"), Is.False);
+		});
+	}
+
+	[Test]
+	public async Task AccentColor_RecoloursASliderOnce_AndTheSameColourAgainChangesNothing()
+	{
+		var fixture = new Fixture("{}", WidgetTypeIds.Slider);
+		var request = new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { AccentColor = "#ef4444" }
+		};
+
+		var first = await fixture.Service.ApplyAsync(request);
+		var second = await fixture.Service.ApplyAsync(request);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.AccentColor));
+			Assert.That(first, Is.True);
+			Assert.That(JsonNode.Parse(fixture.Widget.Data!)!["color"]!.GetValue<string>(), Is.EqualTo("#ef4444"));
+			Assert.That(second, Is.False, "an unchanged colour is reported like every other colour action's");
+			Assert.That(fixture.Widgets.Updated, Has.Count.EqualTo(1));
+		});
+	}
+
+	[Test]
+	public async Task AccentColor_IsNotAnActionButtonProperty()
+	{
+		var fixture = new Fixture("""{"mode":"momentary"}""");
+
+		var applied = await fixture.Service.ApplyAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { AccentColor = "#ef4444" }
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(applied, Is.False);
+			Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Not.Contain(WidgetAppearanceProperty.AccentColor));
+			Assert.That(fixture.Widgets.Updated, Is.Empty);
+		});
+	}
+
+	private static readonly WidgetAppearanceProperty[] _providerDeclaration =
+	[
+		WidgetAppearanceProperty.BackgroundColor, WidgetAppearanceProperty.Label,
+		WidgetAppearanceProperty.LabelColor, WidgetAppearanceProperty.Font, WidgetAppearanceProperty.AccentColor
+	];
+
+	[Test]
+	public async Task ProviderType_DeclaringAppearance_IsOfferedItAlongsideTheBorder()
+	{
+		var fixture = await Fixture.ForProviderType(Frame(_providerDeclaration));
+
+		Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+			Is.EquivalentTo(_providerDeclaration.Append(WidgetAppearanceProperty.Border)
+				.Append(WidgetAppearanceProperty.BorderColor)));
+	}
+
+	[Test]
+	public async Task ProviderType_WithoutDeclaration_KeepsBorderOnly_AsBeforeTypesCouldDeclare()
+	{
+		var fixture = await Fixture.ForProviderType(new WidgetTypeDescriptor("frame", "Frame"));
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+		{
+			BackgroundColor = "#123456", BorderStyle = "static"
+		}));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+				Is.EqualTo(new[] { WidgetAppearanceProperty.Border, WidgetAppearanceProperty.BorderColor }));
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Changed));
+			Assert.That(fixture.Widget.Data, Is.EqualTo("""{"border":{"style":"static"}}"""));
+		});
+	}
+
+	[Test]
+	public async Task ProviderType_IconPropertiesInItsDeclaration_AreNotOffered()
+	{
+		var fixture = await Fixture.ForProviderType(Frame([
+			WidgetAppearanceProperty.Icon, WidgetAppearanceProperty.IconDisplay, WidgetAppearanceProperty.IconColor
+		]));
+
+		Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+			Is.EqualTo(new[] { WidgetAppearanceProperty.Border, WidgetAppearanceProperty.BorderColor }));
+	}
+
+	[Test]
+	public async Task ProviderType_AppearanceActions_WriteTheDocumentedKeys()
+	{
+		var fixture = await Fixture.ForProviderType(Frame(_providerDeclaration));
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+		{
+			BackgroundColor = "#101010",
+			Label = "Photos",
+			LabelColor = "#202020",
+			AccentColor = "#303030",
+			FontFaceId = "inter-bold",
+			FontSize = 14,
+			TextAlign = "left",
+			LabelPosition = "bottom"
+		}));
+
+		var data = JsonNode.Parse(fixture.Widget.Data!)!.AsObject();
+		Assert.Multiple(() =>
+		{
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Changed));
+			Assert.That(data[UiWidgetAppearanceKeys.BackgroundColor]!.GetValue<string>(), Is.EqualTo("#101010"));
+			Assert.That(data[UiWidgetAppearanceKeys.Label]!.GetValue<string>(), Is.EqualTo("Photos"));
+			Assert.That(data[UiWidgetAppearanceKeys.LabelColor]!.GetValue<string>(), Is.EqualTo("#202020"));
+			Assert.That(data[UiWidgetAppearanceKeys.AccentColor]!.GetValue<string>(), Is.EqualTo("#303030"));
+			Assert.That(data[UiWidgetAppearanceKeys.FontFaceId]!.GetValue<string>(), Is.EqualTo("inter-bold"));
+			Assert.That(data[UiWidgetAppearanceKeys.FontSize]!.GetValue<double>(), Is.EqualTo(14));
+			Assert.That(data[UiWidgetAppearanceKeys.TextAlign]!.GetValue<string>(), Is.EqualTo("left"));
+			Assert.That(data[UiWidgetAppearanceKeys.LabelPosition]!.GetValue<string>(), Is.EqualTo("bottom"));
+			Assert.That(UiWidgetAppearanceKeys.FontsOptionsSource, Is.EqualTo(WidgetOptionsSources.Fonts));
+		});
+	}
+
+	[Test]
+	public async Task TwitchChat_SetBackgroundColor_WritesTheKeyItsViewPaints_AndResetRemovesIt()
+	{
+		var config = new RecordingIntegrationConfig();
+		TwitchChatTestSupport.AddAccount(config, "111", "streamer");
+		using var accounts = new TwitchAccountManager(() => new FakeTwitchOAuthClient(),
+			Logger.None,
+			(_, _) => new FakeTwitchHelixClient());
+		await accounts.ReloadAsync(config);
+		using var integration = new TwitchIntegration(accounts);
+		var chat = integration.GetWidgetTypes().Single(type => type.Id == StreamChatWidgetType.LocalId);
+		var fixture = await Fixture.ForProviderType(chat, """{"account":""}""");
+
+		var set = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+		{
+			BackgroundColor = "transparent"
+		}));
+		var stored = JsonNode.Parse(fixture.Widget.Data!)![UiWidgetAppearanceKeys.BackgroundColor]?.GetValue<string>();
+
+		var reset = await fixture.Service.ApplyWithOutcomeAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch(),
+			ClearProperties = [WidgetAppearanceProperty.BackgroundColor]
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.BackgroundColor));
+			Assert.That(set, Is.EqualTo(WidgetAppearanceOutcome.Changed));
+			Assert.That(stored, Is.EqualTo("transparent"));
+			Assert.That(reset, Is.EqualTo(WidgetAppearanceOutcome.Changed));
+			Assert.That(fixture.Widget.Data, Is.EqualTo("""{"account":""}"""));
+		});
+	}
+
+	[Test]
+	public async Task ProviderType_ResetAndEmptyValues_RemoveTheKeys()
+	{
+		var fixture = await Fixture.ForProviderType(Frame(_providerDeclaration),
+			"""{"backgroundColor":"#101010","accentColor":"#303030","label":"Photos","keep":1}""");
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { Label = string.Empty },
+			ClearProperties = [WidgetAppearanceProperty.BackgroundColor, WidgetAppearanceProperty.AccentColor]
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Changed));
+			Assert.That(fixture.Widget.Data, Is.EqualTo("""{"keep":1}"""));
+		});
+	}
+
+	[Test]
+	public async Task ProviderType_UndeclaredProperty_IsNotWritten()
+	{
+		var fixture = await Fixture.ForProviderType(Frame([WidgetAppearanceProperty.Label]));
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+		{
+			BackgroundColor = "#123456"
+		}));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Unchanged));
+			Assert.That(fixture.Widgets.Updated, Is.Empty);
+			Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Not.Contain(WidgetAppearanceProperty.BackgroundColor));
+		});
+	}
+
+	[Test]
+	public async Task ProviderType_KeyItsSchemaForbids_IsNotOffered_AndNotWritten()
+	{
+		var fixture = await Fixture.ForProviderType(Frame(
+			[WidgetAppearanceProperty.BackgroundColor, WidgetAppearanceProperty.Label],
+			"""{"type":"object","properties":{"label":{"type":"string"}},"additionalProperties":false}"""));
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+		{
+			BackgroundColor = "#123456"
+		}));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(fixture.Service.GetWidgets().Single().AppearanceProperties,
+				Does.Contain(WidgetAppearanceProperty.Label).And.Not.Contain(WidgetAppearanceProperty.BackgroundColor));
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Unchanged));
+			Assert.That(fixture.Widgets.Updated, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task ProviderType_ValueItsSchemaRejects_IsRejected_AndNotWritten()
+	{
+		var fixture = await Fixture.ForProviderType(Frame([WidgetAppearanceProperty.Label],
+			"""{"type":"object","properties":{"label":{"type":"string","pattern":"^[A-Za-z]+$"}}}"""));
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+			{ Label = "Two words" }));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Rejected));
+			Assert.That(fixture.Widgets.Updated, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task ProviderType_ClearThatBreaksARequiredKey_IsRejected()
+	{
+		var fixture = await Fixture.ForProviderType(Frame([WidgetAppearanceProperty.Font],
+				"""{"type":"object","required":["fontFaceId"]}"""),
+			"""{"fontFaceId":"inter"}""");
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch(),
+			ClearProperties = [WidgetAppearanceProperty.Font]
+		});
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Rejected));
+			Assert.That(fixture.Widget.Data, Is.EqualTo("""{"fontFaceId":"inter"}"""));
+		});
+	}
+
+	[Test]
+	public async Task ProviderType_BorderWrite_IsNotHeldAgainstItsSchema_AsBeforeTypesCouldDeclare()
+	{
+		var fixture = await Fixture.ForProviderType(new WidgetTypeDescriptor("frame",
+			"Frame",
+			DataSchema: """{"type":"object","additionalProperties":false}"""));
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+			{ BorderStyle = "static" }));
+
+		Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.Changed));
+	}
+
+	[Test]
+	public async Task ProviderType_DeclaringLabel_IsNamedByItsLabelInTheTargetList()
+	{
+		var fixture = await Fixture.ForProviderType(Frame([WidgetAppearanceProperty.Label]), """{"label":"Photos"}""");
+
+		Assert.That(fixture.Service.GetWidgets().Single().Label, Is.EqualTo("Photos"));
+	}
+
+	[Test]
+	public async Task FailedWrite_IsReportedAsSuch()
+	{
+		var fixture = await Fixture.ForProviderType(Frame([WidgetAppearanceProperty.Label]));
+		fixture.Widgets.FailWrites = true;
+
+		var outcome = await fixture.Service.ApplyWithOutcomeAsync(Patch(new WidgetAppearancePatch
+			{ Label = "Photos" }));
+
+		Assert.That(outcome, Is.EqualTo(WidgetAppearanceOutcome.WriteFailed));
+	}
+
+	private static WidgetTypeDescriptor Frame(
+		IReadOnlyList<WidgetAppearanceProperty> appearance,
+		string schema = """{"type":"object"}""")
+	{
+		return new WidgetTypeDescriptor("frame", "Frame", DataSchema: schema) { AppearanceProperties = appearance };
+	}
+
+	private static WidgetAppearanceRequest Patch(WidgetAppearancePatch patch)
+	{
+		return new WidgetAppearanceRequest { WidgetId = _widgetId.ToString(), Patch = patch };
+	}
+
+	/// <summary>Reads a state's appearance label by id from the persisted array shape.</summary>
+	private static string? StateLabel(Fixture fixture, string stateId)
+	{
+		var states = (JsonArray)((JsonObject)JsonNode.Parse(fixture.Widget.Data!)!)["states"]!;
+		var entry = states.OfType<JsonObject>().First(e => e["id"]!.GetValue<string>() == stateId);
+		return entry["appearance"]?["label"]?.GetValue<string>();
+	}
+
+	/// <summary>Reads a state's whole appearance object by id from the persisted array shape.</summary>
+	private static JsonObject? StateAppearance(Fixture fixture, string stateId)
+	{
+		var states = (JsonArray)((JsonObject)JsonNode.Parse(fixture.Widget.Data!)!)["states"]!;
+		var entry = states.OfType<JsonObject>().First(e => e["id"]!.GetValue<string>() == stateId);
+		return entry["appearance"] as JsonObject;
+	}
+
+#pragma warning disable CS0618 // Exercises the pre-existing selector-based request, not yet migrated to StateIds.
+	private static WidgetAppearanceRequest ClearRequest(
+		WidgetAppearanceProperty property,
+		WidgetStateSelector state = WidgetStateSelector.Current)
+	{
+		return new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch(),
+			ClearProperties = [property],
+			State = state
+		};
+	}
+#pragma warning restore CS0618
+
+	private static WidgetAppearanceRequest Request(string label)
+	{
+		return new WidgetAppearanceRequest
+		{
+			WidgetId = _widgetId.ToString(),
+			Patch = new WidgetAppearancePatch { Label = label }
+		};
+	}
+
+	private sealed class Fixture
+	{
+		public Fixture(string data, string type = WidgetTypeIds.ActionButton, WidgetTypeRegistry? registry = null)
+		{
+			var profileId = Guid.NewGuid();
+			Widget = new WidgetEntity { Id = _widgetId, Type = type, Data = data };
+			var folder = new FolderEntity
+			{
+				Id = Guid.NewGuid(),
+				ProfileId = profileId,
+				Name = "Home",
+				Order = 0,
+				Widgets = [Widget]
+			};
+
+			Widgets = new RecordingWidgetService();
+			WriteLock = new RecordingWriteLock();
+			DerivedStates = new WidgetDerivedStateStore();
+
+			Service = new WidgetAppearanceService(new SingleFolderCache(folder),
+				new SingleProfileCache(profileId, "Main"),
+				Widgets,
+				WriteLock,
+				DerivedStates,
+				registry ??= new WidgetTypeRegistry(new RecordingMediator()),
+				new WidgetDataSchemaProvider(registry),
+				new WidgetAppearanceSchemaProbe(),
+				new LoggerConfiguration().CreateLogger());
+		}
+
+		public static async Task<Fixture> ForProviderType(WidgetTypeDescriptor descriptor, string data = "{}")
+		{
+			var registry = new WidgetTypeRegistry(new RecordingMediator());
+			var registration = await registry.Register("com.example.frames", descriptor);
+			return new Fixture(data, registration.WidgetTypeId, registry);
+		}
+
+		public WidgetEntity Widget { get; }
+		public RecordingWidgetService Widgets { get; }
+		public RecordingWriteLock WriteLock { get; }
+		public WidgetDerivedStateStore DerivedStates { get; }
+		public WidgetAppearanceService Service { get; }
+	}
+
+	private sealed class RecordingWriteLock : IWidgetDataWriteLock
+	{
+		private readonly WidgetDataWriteLock _inner = new();
+
+		public List<Guid> Acquired { get; } = [];
+
+		public Task<IDisposable> AcquireAsync(Guid widgetId, CancellationToken cancellationToken = default)
+		{
+			Acquired.Add(widgetId);
+			return _inner.AcquireAsync(widgetId, cancellationToken);
+		}
+	}
+
+	private sealed class RecordingWidgetService : IWidgetService
+	{
+		public List<WidgetEntity> Updated { get; } = [];
+
+		public bool FailWrites { get; set; }
+
+		public Task<Result<WidgetEntity, WidgetError>> Update(WidgetEntity widget)
+		{
+			if (FailWrites)
+			{
+				return Task.FromResult(Result.Fail<WidgetEntity, WidgetError>(WidgetError.NotFound));
+			}
+
+			Updated.Add(widget);
+			return Task.FromResult(Result.Ok<WidgetEntity, WidgetError>(widget));
+		}
+
+		public Task<Result<WidgetEntity, WidgetError>> Create(
+			Guid folderId,
+			WidgetEntity widget,
+			Guid? sourceWidgetId = null)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<List<WidgetEntity>, WidgetError>> UpdatePositions(
+			Guid folderId,
+			IReadOnlyList<WidgetPlacement> placements)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<WidgetError>> Delete(Guid widgetId, Guid folderId)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<WidgetEntity, WidgetError>> SetPinned(
+			Guid folderId,
+			Guid widgetId,
+			bool pinned,
+			PinScope? scope = null)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<List<WidgetEntity>, WidgetError>> CreateMany(
+			Guid folderId,
+			IReadOnlyList<WidgetEntity> widgets,
+			IReadOnlyList<Guid>? replaceIds = null,
+			IReadOnlyList<Guid?>? sourceWidgetIds = null)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<WidgetError>> DeleteMany(Guid folderId, IReadOnlyList<Guid> widgetIds)
+		{
+			throw new NotSupportedException();
+		}
+
+		public Task<Result<List<WidgetEntity>, WidgetError>> SetPinnedMany(
+			Guid folderId,
+			IReadOnlyList<Guid> widgetIds,
+			bool pinned,
+			PinScope? scope = null)
+		{
+			throw new NotSupportedException();
+		}
+	}
+
+	private sealed class SingleFolderCache : IFolderCache
+	{
+		private readonly FolderEntity _folder;
+
+		public SingleFolderCache(FolderEntity folder)
+		{
+			_folder = folder;
+		}
+
+		public List<FolderEntity> GetAllFolders()
+		{
+			return [_folder];
+		}
+
+		public FolderEntity? GetFolderById(Guid id)
+		{
+			return id == _folder.Id ? _folder : null;
+		}
+
+		public Task InitializeCache()
+		{
+			return Task.CompletedTask;
+		}
+
+		public List<FolderEntity> GetFoldersByParentId(Guid? parentId)
+		{
+			return [_folder];
+		}
+
+		public List<FolderEntity> GetFoldersByProfileId(Guid profileId)
+		{
+			return [_folder];
+		}
+
+		public Task AddOrUpdate(FolderEntity folder)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task AddOrUpdateRange(IReadOnlyCollection<FolderEntity> folders)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task<FolderSubtreeRemoval> RemoveSubtree(Guid rootId)
+		{
+			return Task.FromResult(new FolderSubtreeRemoval(false, [], []));
+		}
+
+		public void AddWidget(Guid folderId, WidgetEntity widget)
+		{
+		}
+
+		public void AddWidgets(Guid folderId, IReadOnlyList<WidgetEntity> widgets)
+		{
+		}
+
+		public void UpdateWidget(Guid folderId, WidgetEntity widget)
+		{
+		}
+
+		public void UpdateWidgets(Guid folderId, IReadOnlyList<WidgetEntity> widgets)
+		{
+		}
+
+		public void UpdateWidgetPositions(Guid folderId, IReadOnlyList<WidgetPlacement> placements)
+		{
+		}
+
+		public void RemoveWidget(Guid folderId, Guid widgetId)
+		{
+		}
+
+		public void RemoveWidgets(Guid folderId, IReadOnlyList<Guid> widgetIds)
+		{
+		}
+
+		public void ReplaceWidgets(Guid folderId, IReadOnlyList<Guid> removeIds, IReadOnlyList<WidgetEntity> addWidgets)
+		{
+		}
+	}
+
+	private sealed class SingleProfileCache : IProfileCache
+	{
+		private readonly ProfileEntity _profile;
+
+		public SingleProfileCache(Guid id, string name)
+		{
+			_profile = new ProfileEntity { Id = id, Name = name };
+		}
+
+		public bool HadUnreadableProfiles => false;
+
+		public ProfileEntity? GetById(Guid id)
+		{
+			return id == _profile.Id ? _profile : null;
+		}
+
+		public List<ProfileEntity> GetAll()
+		{
+			return [_profile];
+		}
+
+		public Task InitializeCache()
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task AddOrUpdate(ProfileEntity profile)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task<IReadOnlyList<ProfileEntity>> ApplyOrders(IReadOnlyDictionary<Guid, int> orders)
+		{
+			return Task.FromResult<IReadOnlyList<ProfileEntity>>([]);
+		}
+
+		public Task AddOrUpdateAggregate(ProfileEntity profile, IReadOnlyCollection<FolderEntity> folders)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task Remove(Guid id)
+		{
+			return Task.CompletedTask;
+		}
+	}
+}

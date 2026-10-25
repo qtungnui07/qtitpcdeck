@@ -1,0 +1,215 @@
+using System.Globalization;
+using MacroDeckHost.Application.Ui.Transport.Messages.Variables;
+using MacroDeckHost.Application.Variables;
+using MacroDeckHost.Domain.Entities;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Localization;
+using DomainScope = MacroDeckHost.Domain.Enums.VariableScope;
+using DomainType = MacroDeckHost.Domain.Enums.VariableType;
+using DomainClassification = MacroDeckHost.Domain.Enums.VariableClassification;
+
+namespace MacroDeckHost.Application.Ui.Handlers;
+
+internal static class VariableDtoMapper
+{
+	public static Variable ToDto(VariableEntity entity, bool available, string? dynamicResourceId, bool shared)
+	{
+		return new Variable
+		{
+			Id = entity.Id.ToString(),
+			Name = entity.Name,
+			DisplayName = entity.Presentation?.DisplayName ?? default,
+			ConfigurationKey = entity.Presentation?.ConfigurationKey,
+			ConfigurationName = entity.Presentation?.ConfigurationName ?? default,
+			Scope = ScopeToWire(entity.Scope),
+			ScopeRefId = entity.ScopeRefId,
+			Type = TypeToWire(entity.Type),
+			Classification = ClassificationToWire(entity.Classification),
+			OwnerIntegrationId = entity.OwnerIntegrationId,
+			Value = entity.Value,
+			DecimalPlaces = entity.DecimalPlaces,
+			Unit = entity.Unit,
+			SemanticKind = entity.SemanticKind,
+			IsShareable = entity.IsShareable,
+			Attributes = entity.Attributes,
+			FileSource = entity.FileSource is { } source
+				? new VariableFileSourceDto { Path = source.Path, AllowWriteBack = source.AllowWriteBack }
+				: null,
+			TemplateSource = entity.TemplateSource is { } template
+				? new VariableTemplateSourceDto { Template = template.Template }
+				: null,
+			TemplateError = entity.TemplateError is { } templateError
+				? new VariableTemplateErrorDto { Code = templateError.Code, Detail = templateError.Detail }
+				: null,
+			Min = entity.Min,
+			Max = entity.Max,
+			Step = entity.Step,
+			CanWrite = entity.CanWrite,
+			CommitOnRelease = entity.CommitOnRelease,
+			Available = available,
+			DynamicResourceId = dynamicResourceId,
+			Shared = shared
+		};
+	}
+
+	public static string ScopeToWire(DomainScope s)
+	{
+		return s switch
+		{
+			DomainScope.Global => "global",
+			DomainScope.Widget => "widget",
+			DomainScope.Script => "script",
+			DomainScope.Automation => "automation",
+			_ => s.ToString().ToLowerInvariant()
+		};
+	}
+
+	public static DomainScope? ScopeFromWire(string? wire)
+	{
+		if (string.IsNullOrEmpty(wire))
+		{
+			return null;
+		}
+
+		return wire.ToLowerInvariant() switch
+		{
+			"global" => DomainScope.Global,
+			"widget" => DomainScope.Widget,
+			// The scope was called "actionButton" before it was generalized to every widget type; a client
+			// built against the old vocabulary still sends it.
+			"actionbutton" => DomainScope.Widget,
+			"script" => DomainScope.Script,
+			"automation" => DomainScope.Automation,
+			_ => null
+		};
+	}
+
+	public static string TypeToWire(DomainType t)
+	{
+		return t switch
+		{
+			DomainType.Text => "text",
+			DomainType.Numeric => "numeric",
+			DomainType.Boolean => "boolean",
+			DomainType.Color => "color",
+			_ => t.ToString().ToLowerInvariant()
+		};
+	}
+
+	public static DomainType? TypeFromWire(string? wire)
+	{
+		if (string.IsNullOrEmpty(wire))
+		{
+			return null;
+		}
+
+		return wire.ToLowerInvariant() switch
+		{
+			"text" => DomainType.Text,
+			"numeric" => DomainType.Numeric,
+			"boolean" => DomainType.Boolean,
+			"color" => DomainType.Color,
+			_ => null
+		};
+	}
+
+	public static string ClassificationToWire(DomainClassification c)
+	{
+		return c switch
+		{
+			DomainClassification.User => "user",
+			DomainClassification.Integration => "integration",
+			DomainClassification.Widget => "widget",
+			_ => c.ToString().ToLowerInvariant()
+		};
+	}
+
+	public static VariableFileSource? FileSourceFromWire(VariableFileSourceDto? dto)
+	{
+		return dto is null ? null : new VariableFileSource(dto.Path, dto.AllowWriteBack);
+	}
+
+	public static VariableTemplateSource? TemplateSourceFromWire(VariableTemplateSourceDto? dto)
+	{
+		return dto is null ? null : new VariableTemplateSource(dto.Template);
+	}
+
+	public static object? ParseInputValue(DomainType type, string? raw)
+	{
+		return type switch
+		{
+			DomainType.Text => raw ?? string.Empty,
+			DomainType.Numeric => decimal.TryParse(raw, NumberStyles.Number, CultureInfo.InvariantCulture, out var d)
+				? d
+				: 0m,
+			DomainType.Boolean => string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase),
+			_ => raw
+		};
+	}
+
+	public static Transport.Messages.TransportError ToError(VariableError error, string? message)
+	{
+		return error switch
+		{
+			VariableError.InvalidFilePath => new Transport.Messages.TransportError
+				{ Code = error.ToString(), Message = AppStrings.Errors.Variables.InvalidFilePath() },
+			VariableError.FileReadOnly => new Transport.Messages.TransportError
+				{ Code = nameof(VariableError.NotWritable), Message = AppStrings.Errors.Variables.FileReadOnly() },
+			VariableError.TemplateReadOnly => new Transport.Messages.TransportError
+				{ Code = nameof(VariableError.NotWritable), Message = AppStrings.Errors.Variables.TemplateReadOnly() },
+			VariableError.InvalidTemplate => new Transport.Messages.TransportError
+			{
+				Code = error.ToString(),
+				Message = AppStrings.Errors.Variables.InvalidTemplate(message ?? string.Empty)
+			},
+			VariableError.CircularTemplate => new Transport.Messages.TransportError
+				{ Code = error.ToString(), Message = AppStrings.Errors.Variables.CircularTemplate() },
+			_ => new Transport.Messages.TransportError
+			{
+				Code = error.ToString(),
+				Message = message ?? string.Empty
+			}
+		};
+	}
+
+	/// <summary>
+	/// The refusals a write can produce, with a message a person can read. Every other error keeps the
+	/// service's plain diagnostic text, which is what <see cref="ToError"/> has always sent.
+	/// </summary>
+	public static async Task<Transport.Messages.TransportError> ToWriteError(
+		VariableError error,
+		string? message,
+		string? ownerIntegrationId,
+		VariableOwnerNames ownerNames)
+	{
+		return error switch
+		{
+			VariableError.NotWritable => new Transport.Messages.TransportError
+				{ Code = error.ToString(), Message = AppStrings.Errors.Variables.NotWritable() },
+			VariableError.OwnerUnavailable => new Transport.Messages.TransportError
+			{
+				Code = error.ToString(),
+				Message = AppStrings.Errors.Variables.OwnerUnavailable(await ownerNames.Resolve(ownerIntegrationId))
+			},
+			VariableError.WriteFailed => new Transport.Messages.TransportError
+				{ Code = error.ToString(), Message = AppStrings.Errors.Variables.WriteFailed() },
+			_ => ToError(error, message)
+		};
+	}
+
+	public static async Task<Transport.Messages.TransportError> ToValueWriteError(
+		VariableError error,
+		string? message,
+		string? ownerIntegrationId,
+		VariableOwnerNames ownerNames)
+	{
+		return error switch
+		{
+			VariableError.InvalidValue => new Transport.Messages.TransportError
+				{ Code = error.ToString(), Message = AppStrings.Errors.Variables.ValueNotAccepted() },
+			VariableError.NotFound => new Transport.Messages.TransportError
+				{ Code = error.ToString(), Message = AppStrings.Errors.Variables.NotFound() },
+			_ => await ToWriteError(error, message, ownerIntegrationId, ownerNames)
+		};
+	}
+}

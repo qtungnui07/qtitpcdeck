@@ -1,0 +1,101 @@
+# Releasing and Packaging
+
+The release implementation is split between [`.github/workflows/build.yml`](../../.github/workflows/build.yml), which builds and packages, and [`.github/workflows/publish-release.yml`](../../.github/workflows/publish-release.yml), which publishes what that run produced. This page documents how to operate them and the constraints that are easy to miss. Do not mirror the workflow job graph here.
+
+## Start a release
+
+Run the `Build` workflow manually and provide `version`: a stable version such as `3.0.0` or a beta such as `3.0.0-beta.4`. Version validation and native package version mapping are handled by [`ci/scripts/release-version.mjs`](../../ci/scripts/release-version.mjs). Enable `sign_windows` only for a build that should be published: it spends exactly four SSL.com eSigner signatures after every other build and test has passed. An unchecked build remains available as an unsigned workflow artifact and is not published.
+
+Every release covers Windows, Linux, and macOS. There is no platform selection: publishing runs only for a fully successful build, so nothing is published unless all three packaged and the end-to-end suite passed - a channel file that advertises a version its platform never built would offer installed clients an update that 404s.
+
+Release artifacts always use the Production build identity. Beta is derived from the version; it is not a separate build channel.
+
+## What the workflow does
+
+The build workflow tests every platform, builds the Angular UI, publishes the framework-dependent single-file host for all three runtime identifiers together in one Ubuntu job with a bundled .NET runtime in each `runtime/` folder (the official ASP.NET Core runtime archives, resolved from Microsoft's release metadata at the runtime patch of the exact SDK the workflows pin and checksum-verified, see [`ci/scripts/stage-dotnet-runtime.sh`](../../ci/scripts/stage-dotnet-runtime.sh)), packages the Tauri application on the target operating systems, runs the end-to-end suite against a production host staged from the same revision, and packs the NuGet package family. Linux and macOS package in parallel with the tests. Windows compiles and signs only after they all pass, protecting the eSigner quota. A final collection job exposes the complete platform artifact set atomically. The build publishes nothing externally; everything it produces is a workflow artifact.
+
+Publishing then happens in one order, because each step depends on the one before it:
+
+1. The GitHub release is created and carries the installers, the checksums and the signed updater payloads.
+2. The channel manifests are repointed at the assets that release actually got, since GitHub sanitizes asset names on upload.
+3. Those manifests - and only those - are uploaded to the R2 feed installed clients poll.
+4. The NuGet packages are pushed, last, because a published package cannot be taken back and must never exist for a release that failed to be created. This is the one publishing step allowed to fail: the release is already out, and a failed push is reported as a warning so the packages can be pushed afterwards from the manual NuGet workflow at the same version.
+
+The Tauri bootstrapper is the installed entry point. The published host and Angular output are staged into its application bundle before packaging.
+
+Relevant implementation files:
+
+- [`.github/workflows/build.yml`](../../.github/workflows/build.yml) - build and packaging.
+- [`.github/workflows/publish-release.yml`](../../.github/workflows/publish-release.yml) - publishing order.
+- [`ci/scripts/point-manifests-at-release.mjs`](../../ci/scripts/point-manifests-at-release.mjs) - repointing channel manifests at release assets.
+- [`ci/scripts/stage-host.sh`](../../ci/scripts/stage-host.sh) - local host staging for the bootstrapper.
+- [`ci/scripts/release-version.mjs`](../../ci/scripts/release-version.mjs) - release version validation/mapping.
+- [`ci/scripts/make-update-manifest.mjs`](../../ci/scripts/make-update-manifest.mjs) - updater metadata.
+- [`ui/bootstrapper/tauri.conf.json`](../../ui/bootstrapper/tauri.conf.json) and platform overrides - package configuration.
+
+These files are the source of truth for exact job dependencies, artifact names, runner versions, command flags, and bundle layout.
+
+## Signing and publishing
+
+Official packages may require platform signing/notarization, updater signing, and release storage credentials. The workflow owns the exact secret names and guards.
+
+All signing, notarization and deployment credentials remain in the manually protected GitHub `production` environment. In particular, the Windows eSigner integration uses `ES_USERNAME`, `ES_PASSWORD`, `ES_CREDENTIAL_ID`, and `ES_TOTP_SECRET` from that existing environment. GitHub does not forward environment secrets or an environment approval between jobs on different runners, so reducing the number of approvals further would require an explicit repository/environment configuration change rather than moving secrets implicitly in workflow code.
+
+The Windows signer covers `MacroDeckHost.exe`, `MacroDeck.exe`, the generated NSIS uninstaller, and the final NSIS installer. Its wrapper refuses unexpected file types and skips Tauri's NSIS plugin DLLs so they do not consume signing quota. The job fails unless exactly those four signing roles were recorded and successfully verified.
+
+Code that runs in these jobs is pinned, because every step of a job shares one runner user and a secret is only as safe as the least trusted thing that ran before it. Every GitHub Action is referenced by commit SHA. The tools the packaging steps fetch at build time (Tauri's linuxdeploy tools, the AppImage runtime and SSL.com's CodeSignTool with its bundled JDK) come only from the URLs and SHA-256 hashes in [`ci/scripts/pinned-tools.mjs`](../../ci/scripts/pinned-tools.mjs) and [`ci/scripts/appimage-library-notices.mjs`](../../ci/scripts/appimage-library-notices.mjs). Tauri would otherwise download its linuxdeploy tools unverified, so the Linux job seeds them into Tauri's tools cache before building and fails afterwards if the cache holds anything else, which is what a Tauri update that renames a tool looks like. The gtk and gstreamer plugin scripts are the exception: Tauri writes them from its own npm package, which the lockfile pins. A hash mismatch fails the job on purpose. Re-pinning means reviewing the new upstream file first, never just copying the new hash.
+
+A release should not be considered production-ready merely because an unsigned contributor build succeeded. Check the package/signing steps for every platform and confirm the expected assets reached the GitHub release.
+
+## Install manifest
+
+Every signed package carries `host/install-manifest.json`: the version, commit, size and SHA-256 of each file it installs under `host/`, signed with the updater key into `install-manifest.json.sig`. On startup the bootstrapper checks the installation against it and tells the user when files are missing or do not match, which is what an interrupted update or antivirus software holding back files leaves behind. Builds without the updater key carry no manifest and skip the check; builds with it fail the check when the manifest itself is missing.
+
+The manifest is written after the last step that changes the host files and before bundling, and every package is verified against it after bundling. The AppImage gets its own manifest, because linuxdeploy may patch the host's libraries. A failing verify step blocks the release on purpose: shipping it would show every user of that package a damaged-installation notice.
+
+- [`ci/scripts/make-install-manifest.mjs`](../../ci/scripts/make-install-manifest.mjs) - write, rewrite and verify.
+- [`ci/scripts/sign-install-manifest.sh`](../../ci/scripts/sign-install-manifest.sh) - signing.
+- [`ui/bootstrapper/src/install_integrity.rs`](../../ui/bootstrapper/src/install_integrity.rs) - the startup check.
+
+## Update channels
+
+Stable and beta updater metadata are generated from the normalized release version. Do not manually invent channel file contents. When update behaviour changes, update the updater implementation and manifest-generation script together.
+
+The feed hosts the channel manifests only. The payload each one names is the asset on the corresponding GitHub release, so a release whose assets are deleted breaks updates for every client still on an older version.
+
+Publishing a release to a feed does not mean every install downloads it automatically: whether a periodic check downloads a new release, only asks first, or never runs at all now depends on the user's own auto-update mode (see [ADR 0015](../decisions/0015-installation-and-update-delivery.md)).
+
+## NuGet packages
+
+The SDK/plugin package family is packed from the release revision and version during the build, and pushed after the GitHub release exists. The reusable workflows are:
+
+- [`.github/workflows/nuget-pack.yml`](../../.github/workflows/nuget-pack.yml)
+- [`.github/workflows/nuget-publish.yml`](../../.github/workflows/nuget-publish.yml)
+- [`.github/workflows/nuget.yml`](../../.github/workflows/nuget.yml)
+
+Package validation is implemented in [`ci/scripts/verify-nuget-packages.mjs`](../../ci/scripts/verify-nuget-packages.mjs).
+
+Each package project owns a `README.md` that is packed as its NuGet readme and displayed on nuget.org. These files are package assets. Do not remove, merge, or move them as part of general documentation cleanup unless the package metadata is changed at the same time and the resulting `.nupkg` is verified.
+
+## Local release-like packaging
+
+Build the Angular production output first, then stage the host for the required RID:
+
+```bash
+cd ui/angular
+npm ci
+npm run build:prod
+cd ../..
+
+ci/scripts/stage-host.sh <rid> <version> Production
+```
+
+Then use the bootstrapper packaging command appropriate for the current operating system from `ui/bootstrapper/`.
+
+Local packaging is useful for verifying bundle shape. It does not replace official signing/notarization or the release workflow.
+
+## Before publishing
+
+Confirm the release version is correct, all intended platform jobs succeeded, tests passed, expected signed packages exist, updater metadata points at the correct artifacts, and NuGet packages were produced from the intended revision/version.
+
+If a release step changes, prefer updating the workflow/script itself and keep this page limited to operator-facing behaviour and non-obvious constraints.

@@ -1,0 +1,77 @@
+@use '../../../styles/index' as ds;
+@use '../variables/variable-list' as list;
+
+:host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  height: 100%;
+  min-height: 0;
+  padding: var(--space-4);
+}
+
+.tvt-search {
+  flex: 0 0 auto;
+}
+
+.tvt-empty {
+  flex: 1 1 auto;
+}
+
+.tvt-list {
+  @include list.list;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+// The cdk wrapper is positioned with `left` alone, so it is shrink-to-fit and grows to its widest
+// row instead of being bounded by the scrollport. A long identifier then widened the pane into
+// scrolling sideways, and the rows' trailing padding was measured against that wider box, which put
+// the copy button back under the scrollbar. Binding the wrapper to the scrollport is what lets the
+// identifier truncate and makes the row padding mean what it says.
+.tvt-list ::ng-deep .cdk-virtual-scroll-content-wrapper {
+  width: 100%;
+}
+
+.tvt-row-slot {
+  @include list.slot;
+}
+
+.tvt-state-row {
+  @include list.state-row;
+}
+
+.tvt-link-row {
+  @include list.link-row;
+}
+
+// A hovered overlay scrollbar is drawn on top of the content at about 15px wide and would land on
+// the copy button. A literal because it is sized to that scrollbar, not to the spacing scale.
+.tvt-var-row {
+  padding-inline-end: 1rem;
+}
+
+.tvt-var-copy {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-text-muted);
+  opacity: 0;
+  transition: opacity var(--transition-fast), background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.tvt-var-row:hover .tvt-var-copy,
+.tvt-var-copy:focus-visible {
+  opacity: 1;
+}
+
+.tvt-var-copy:hover {
+  background-color: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}

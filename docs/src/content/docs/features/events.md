@@ -1,0 +1,370 @@
+---
+title: Events
+description: Declare events with IEventProvider, publish occurrences with IEventPublisher, and let users filter them with configuration parameters and dynamic options.
+---
+
+An integration tells Macro Deck "this just happened" with events. `IEventProvider` declares which events
+exist; `IEventPublisher`, handed to you on the integration context, publishes an occurrence. Users react
+to them with triggers.
+
+These events are for the user's automation. To tell other plugins that something happened, publish on
+the [message channel](/features/messaging/) instead: its events reach plugins, not triggers.
+
+## Quick start
+
+```csharp
+using MacroDeck.Sdk;
+using MacroDeck.Sdk.Actions;
+using MacroDeck.Sdk.Events;
+
+public sealed class StreamStudioIntegration : IPluginIntegration, IEventProvider
+{
+	private StudioClient? _client;
+
+	public IReadOnlyList<EventDefinition> EventDefinitions { get; } =
+	[
+		new()
+		{
+			Id = "scene-changed",
+			Name = Strings.Events.SceneChanged(),
+			Category = Strings.Events.ScenesCategory(),
+			ConfigurationParameters =
+			[
+				ActionParameter.DynamicChoice("sceneId",
+					label: Strings.Parameters.Scene(),
+					placeholder: Strings.Parameters.AnyScene())
+			],
+			PayloadParameters =
+			[
+				ActionParameter.DynamicChoice("sceneId", label: Strings.Parameters.SceneId()),
+				ActionParameter.Text("sceneName", label: Strings.Parameters.Scene())
+			]
+		}
+	];
+
+	public Task InitializeAsync(IIntegrationContext context)
+	{
+		var events = context.Events; // safe to keep for the process lifetime
+		_client = new StudioClient();
+		_client.SceneChanged += scene => events.Publish("scene-changed", new Dictionary<string, object?>
+		{
+			["sceneId"] = scene.Id,
+			["sceneName"] = scene.Name
+		});
+		return Task.CompletedTask;
+	}
+
+	// Remaining IPluginIntegration members omitted.
+}
+```
+
+The user now finds "Scene changed" in the trigger editor, can narrow it to one scene, and can use
+`sceneId` and `sceneName` in the flow it runs.
+
+Things to know:
+
+- **`Id` is persisted** in every trigger that uses the event. Treat it as a public identity: never
+  rename it once shipped. It must be unique within your integration; the host namespaces it as
+  `integrationId::eventId`.
+- **`Publish` is fire-and-forget.** It never throws into the caller and has no reply, so it is safe to
+  call from a socket callback or polling loop. An occurrence nobody subscribed to is simply dropped.
+- **Payload keys must match the declaration.** Publish the names you listed in `PayloadParameters` -
+  those are what the user can pick and filter on.
+
+## Defining an event
+
+| Property | What it does | Example |
+| --- | --- | --- |
+| `Id` | Provider-local id, stable across releases. | `"scene-changed"` |
+| `Name`, `Description` | Localized text in the event picker. | `Strings.Events.SceneChanged()` |
+| `Category` | Groups events in the picker. Optional. | `Strings.Events.ScenesCategory()` |
+| `IconName` | An icon the UI already ships. No image data. | `"movie"` |
+| `ConfigurationParameters` | What the user authors on the trigger - see below. | `ActionParameter.DynamicChoice("sceneId", ...)` |
+| `PayloadParameters` | What an occurrence carries. Never rendered as an input. | `ActionParameter.Text("sceneName", ...)` |
+| `DeliveryKind` | `Push` (default): you publish. `Scheduled`: the host produces occurrences from the configuration. | `EventDeliveryKind.Push` |
+
+`ProviderName` on `IEventProvider` is optional; leave it empty and the event picker shows your
+integration's name (for a plugin, the `manifest.json` name).
+
+`EventDefinitions` is read whenever the host builds the event catalogue, so it may change after a
+reconfigure. An out-of-process plugin must tell the host to re-read it:
+
+```csharp
+using MacroDeck.Plugin.Hosting.Integrations.HostApis; // IPluginCatalogNotifier, injected
+using MacroDeck.Plugin.Protocol.Handshake;             // CapabilityKinds
+
+catalogNotifier.CatalogChanged(CapabilityKinds.Events);
+```
+
+## Configuration parameters vs payload parameters
+
+```csharp
+ConfigurationParameters =
+[
+	ActionParameter.DynamicChoice("trackId", label: Strings.Parameters.Track(), placeholder: Strings.Parameters.AnyTrack())
+],
+PayloadParameters =
+[
+	ActionParameter.DynamicChoice("trackId", label: Strings.Parameters.TrackId()),
+	ActionParameter.Text("trackName", label: Strings.Parameters.Track()),
+	ActionParameter.Toggle("muted", label: Strings.Parameters.Muted())
+]
+```
+
+Both lists use the ordinary `ActionParameter` schema, so any control the action builder renders is
+available.
+
+- **Configuration parameters** are what the user fills in on the trigger. When one shares its name with
+  a payload parameter, the host compares the two and only fires the trigger on a match. Left empty, it
+  matches any occurrence - "any track" above.
+- **Payload parameters** describe what an occurrence carries. They populate the picker that inserts
+  `{ "$event": "trackName" }` references into the triggered flow and label values in the live preview.
+  When a user writes a condition against `$event`, the comparison value is authored with the control the
+  payload parameter's type implies, while the condition still stores the raw value the occurrence
+  carries. So declare an enumerable payload value the same way as its matching filter (a `DynamicChoice`
+  here): the user picks a track name instead of pasting an id.
+
+## Publishing values
+
+```csharp
+_events.Publish("hotkey-pressed", new Dictionary<string, object?>
+{
+	["key"] = "F3",                                                  // string
+	["repeat"] = 2,                                                  // number
+	["held"] = false,                                                // boolean
+	["combo"] = new { modifiers = new[] { "Ctrl", "Shift" }, key = "F3" } // object
+});
+```
+
+| Published value | What triggers, templates and conditions see |
+| --- | --- |
+| string, number, boolean | the value itself |
+| object or array | its compact JSON text: `{"modifiers":["Ctrl","Shift"],"key":"F3"}` |
+
+A condition on an object or array value compares that text. Publishing without parameters is fine for
+events that carry nothing:
+
+```csharp
+_events.Publish("connected");
+```
+
+## Keyboard combos
+
+A `KeyboardCombo` or `Hotkey` value is an object with a `key` name and a `modifiers` list:
+`{"modifiers":["Ctrl","Shift"],"key":"Minus"}`. The combo editor stores these names, and Press Key,
+Key Down and Key Up read them. Publish the same names from a keyboard hook and every trigger the user
+set up in the editor matches.
+
+| Key | Name | Means |
+| --- | --- | --- |
+| Letters | `A` to `Z` | The key labeled with that letter on the active layout: `Z` is the Z key on QWERTZ too. |
+| Digits | `0` to `9` | The key in the digit row, also on AZERTY where it types `&`, `é` and so on without Shift. |
+| Punctuation | `Minus`, `Equal`, `BracketLeft`, `BracketRight`, `Backslash`, `Semicolon`, `Quote`, `Comma`, `Period`, `Slash`, `Backquote` | A physical position, named after the key at that position on a US keyboard, like the browser's `KeyboardEvent.code`. On German, `Minus` is the `ß` key and `BracketLeft` the `ü` key. |
+| ISO key | `IntlBackslash` | The extra key that ISO keyboards have next to left Shift (`<` on German). |
+| Other keys | `F1` to `F24`, `Enter`, `Escape`, `Tab`, `Space`, `Backspace`, `Delete`, `Insert`, `CapsLock`, `Home`, `End`, `PageUp`, `PageDown`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `PrintScreen`, `ScrollLock`, `Pause`, `NumLock`, `Numpad0` to `Numpad9`, `NumpadAdd`, `NumpadSubtract`, `NumpadMultiply`, `NumpadDivide`, `NumpadDecimal`, `NumpadEnter`, `MediaPlayPause`, `MediaStop`, `MediaTrackNext`, `MediaTrackPrevious`, `AudioVolumeUp`, `AudioVolumeDown`, `AudioVolumeMute` | The same key on every layout. |
+
+Modifiers are `Ctrl`, `Shift`, `Alt` and `Meta` (Command on macOS, Windows key on Windows), plus
+`RightCtrl`, `RightShift`, `RightAlt` and `RightMeta` when only the right-hand key counts.
+
+The host also accepts older spellings, and trigger matching treats them as the name they stand for:
+`-` for `Minus` (and the other unshifted US characters), `Esc`, `Return`, `Del`, `Ins`, `PgUp`, `PgDn`,
+`Up`/`Down`/`Left`/`Right` and `5` as well as `D5` for keys, `Control`, `Cmd`, `Command`, `Win`, `Super`,
+`Option` and `AltGr` (which counts as `Alt`) for modifiers. Names are case-insensitive. A name the host
+does not know is compared as text, so two plugins can still agree on a key Macro Deck has no name for.
+
+Only configuration parameters of type `KeyboardCombo` or `Hotkey` match this way. A trigger filter or a
+flow condition on `$event` compares the published JSON text, as described above.
+
+### From a native keyboard hook
+
+`MacroDeck.Sdk.Input` turns the codes a keyboard hook delivers into the names above, so a plugin needs no
+table of its own:
+
+```csharp
+using MacroDeck.Sdk.Input;
+
+KeyCode key = NativeKeys.FromWindows(virtualKey, scanCode, isExtended); // or FromMacOs(code), FromLinux(code)
+
+if (KeyNames.TryGetModifier(key, out var modifier))
+{
+    held = isKeyDown ? held | modifier : held & ~modifier;   // track the modifier keys yourself
+    return;
+}
+
+if (isKeyDown && key != KeyCode.None)
+{
+    events.Publish("hotkey-pressed", new Dictionary<string, object?>
+    {
+        ["combo"] = new { modifiers = KeyNames.ToModifierNames(held), key = KeyNames.ToName(key) }
+    });
+}
+```
+
+`KeyNames.ToName` returns the one name the editor stores, and `KeyNames.TryParse` and `TryParseModifier` accept
+every older spelling listed above. A key without a `KeyCode`, or a number that is no key code, comes back as
+`KeyCode.None`: do not publish it. The methods never throw and can be called from any thread.
+
+`ToModifierNames` names a modifier `Ctrl` when the left key is held, alone or together with the right one, and
+`RightCtrl` only when just the right key is held, like the editor records it. Trigger matching compares the two
+as different modifiers, so a trigger bound as `Ctrl` does not fire for `RightCtrl`.
+
+| Platform | Method | Notes |
+| --- | --- | --- |
+| Windows | `NativeKeys.FromWindows(virtualKey, scanCode, isExtended)` | Pass the extended flag: it tells `NumpadEnter` from `Enter` and a navigation key from the numpad key that reports the same virtual key while NumLock is off. The scan code (without the extended prefix) names a punctuation key's position exactly. The overload without it reads the foreground window's layout instead. |
+| macOS | `NativeKeys.FromMacOs(keyCode)` | Letters are resolved through the active input source, so key code 6 is `Y` on German. A letter position whose key types no Latin letter (Cyrillic) keeps its US letter. Key code 10 is `IntlBackslash` and 50 is `Backquote`, as Safari and the combo editor report them; on ISO Apple keyboards those two are swapped relative to the key's position. Function keys above `F20`, the Fn key and media keys have no key code and return `None`. |
+| Linux | `NativeKeys.FromLinux(evdevCode)` | An evdev code is a position, so letters follow US positions on every layout: the Z-labeled key of a German layout is `Y`. |
+
+`FromMacOs` reads the input source with the Text Input Sources API, which Apple documents for the main thread. It
+has been exercised from a thread-pool thread, not from an event tap callback.
+
+To send a key the other way, from a `KeyCode` to the native code a synthetic key event needs, the letter,
+digit and punctuation keys of the main block have their US position on each platform:
+
+```csharp
+if (NativeKeys.IsPositional(key) && NativeKeys.TryGetWindowsScanCode(key, out var scan))
+{
+	// SendInput with KEYEVENTF_SCANCODE, so the key lands on the same position on any layout
+}
+```
+
+| Method | Answers |
+| --- | --- |
+| `NativeKeys.IsPositional(key)` | `true` for the punctuation keys, which type a different character on each layout and are best sent by position |
+| `NativeKeys.TryGetWindowsScanCode(key, out scan)` | The PC set-1 scan code; Linux evdev numbers these keys the same way |
+| `NativeKeys.TryGetMacOsKeyCode(key, out code)` | The `kVK_*` key code, with WebKit's ISO naming (`IntlBackslash` 10, `Backquote` 50) |
+| `NativeKeys.TryFromWindowsScanCode(scan, out key)` | The key at a scan code's US position, the inverse of `TryGetWindowsScanCode` |
+
+Each `TryGet` method returns `false` for keys outside that block (function, navigation, media and modifier
+keys), which a hook sends by their virtual key or key code instead.
+
+`GetBindings()` returns values exactly as the editor stored them, so a hook that swallows bound combos has
+to accept the older spellings too, not only the names in the table.
+
+## Reading what is bound
+
+A hotkey plugin that wants to swallow a bound combo, or an integration that only subscribes upstream to
+what the user actually uses, can read the triggers bound to its own events instead of asking the user
+to enter the same values twice:
+
+```csharp
+public Task InitializeAsync(IIntegrationContext context)
+{
+	_events = context.Events;
+	_events.BindingsChanged -= ApplyBoundCombos;
+	_events.BindingsChanged += ApplyBoundCombos;
+	ApplyBoundCombos();
+	return Task.CompletedTask;
+}
+
+private void ApplyBoundCombos()
+{
+	var combos = _events.GetBindings()
+		.Where(binding => binding.EventId == "hotkey-pressed")
+		.Select(binding => binding.Parameters.GetValueOrDefault("combo"))
+		.Where(value => value is { Operator: "==", Value.ValueKind: JsonValueKind.Object })
+		.Select(value => value!.Value!.Value)
+		.ToList();
+
+	_hook.Swallow(combos);
+}
+```
+
+`InitializeAsync` runs again after a reconnect or a config change, on the same publisher, so remove the
+handler before adding it or it fires once per initialization. Remove it in `ShutdownAsync` as well, so a
+stopped integration stops reacting.
+
+Each `EventBinding` is one widget flow or one enabled automation triggered by one of your events. You
+see only your own events, never which widget or automation holds the trigger.
+
+| Member | Meaning |
+| --- | --- |
+| `EventId` | Provider-local event id, without the `integrationId::` prefix. |
+| `Parameters` | The configuration parameters the user set, by name. A parameter left empty is absent. |
+| `EventBindingValue.Value` | The value as the editor stored it: a scalar, an object for a `KeyboardCombo`, or a variable reference the host resolves only when it matches an occurrence. `null` for the state operators. |
+| `EventBindingValue.Operator` | `==`, `!=`, `>`, `<`, `>=`, `<=`, or one of `isEmpty`, `isNotEmpty`, `isAvailable`, `isNotAvailable`. |
+
+A trigger can also carry a filter the host evaluates on its own, so a value in `GetBindings()` does not
+guarantee the trigger fires for it.
+
+`BindingsChanged` fires on a thread-pool thread after the list changed for your integration, and only
+then: moving a widget or editing another plugin's trigger does not raise it. Out of process,
+`GetBindings()` serves the host's last `event-bindings` push, so it is empty until the first push
+arrives. Against a host that predates this API it stays empty and `BindingsChanged` never fires, so treat
+an empty list as "nothing bound", never as an error.
+
+## Dynamic options
+
+```csharp
+public sealed class StreamStudioIntegration : IPluginIntegration, IEventProvider, IDynamicEventOptionsProvider
+{
+	public Task<DynamicOptionsResult> GetEventOptionsAsync(EventOptionsContext context,
+		CancellationToken cancellationToken)
+	{
+		var session = _client?.Session ?? StudioSession.Empty;
+
+		IReadOnlyList<ActionParameterOption> options = context.ParameterName switch
+		{
+			"sceneId" => session.Scenes.Select(s => new ActionParameterOption { Value = s.Id, Label = s.Name }).ToList(),
+			_ => []
+		};
+
+		return Task.FromResult(new DynamicOptionsResult
+		{
+			Options = options,
+			AllowsCustomValue = true,
+			CacheSeconds = 30
+		});
+	}
+}
+```
+
+Implement `IDynamicEventOptionsProvider` when a choice is only known at edit time - a scene list, a
+device, a channel. It answers configuration and payload parameters alike and never changes the event
+definition itself. `EventOptionsContext` carries:
+
+| Member | Meaning |
+| --- | --- |
+| `EventId` | Provider-local event id, without the `integrationId::` prefix. |
+| `ParameterName` | The parameter being edited. |
+| `Filter` | Text the user typed, for a filterable autocomplete. |
+| `CurrentParameters` | The other configuration values, so options can depend on an earlier choice. |
+
+The context names only the event and the parameter, so a request for the configuration parameter
+`sceneId` looks exactly like one for the payload parameter `sceneId`. Declare the same name in both lists
+only where the same options answer for both - as in every example on this page.
+
+## Testing
+
+```csharp
+var context = new FakeIntegrationContext();
+await integration.InitializeAsync(context);
+
+studio.RaiseSceneChanged(new Scene("s1", "Intro"));
+
+var published = context.Events.Published.Single();
+Assert.That(published.EventId, Is.EqualTo("scene-changed"));
+Assert.That(published.Parameters!.Value.GetProperty("sceneName").GetString(), Is.EqualTo("Intro"));
+```
+
+`FakeEventPublisher` serializes parameters exactly as the wire protocol does, and like the real one it
+never throws. `SetBindings(...)` replaces what `GetBindings()` returns and raises
+`BindingsChanged`, standing in for a user who binds or edits a trigger. `PluginTestHarness.Events` calls `describe` and `options` over the protocol. See
+[testing](/features/testing/).
+
+## Over the plugin protocol
+
+Events are one provider-shaped capability per plugin: `describe` returns the merged catalogue of every
+`IEventProvider` in the process, `options` routes to `IDynamicEventOptionsProvider`. The catalogue is
+snapshot-backed. Occurrences travel as the fire-and-forget
+[`event.publish`](/reference/websocket/#events-logs-and-state) message; the host qualifies the id with
+the authenticated plugin id. What the user bound arrives as the push-only
+[`host.state`](/reference/websocket/#host-callbacks) api `event-bindings`, scoped to the plugin's own
+events and sent on registration and whenever that list changes. See
+[capability parity](/reference/capability-parity/).
+
+## See also
+
+- [Actions](/features/actions/) - the `ActionParameter` schema both parameter lists use.
+- [Variables](/features/variables/) - for state that is read rather than announced.
+- [Localization](/features/localization/#the-generated-api) - where `Strings.*` comes from.
+- [WebSocket reference](/reference/websocket/#capabilities)

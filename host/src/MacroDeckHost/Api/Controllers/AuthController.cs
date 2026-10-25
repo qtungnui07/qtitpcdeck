@@ -1,0 +1,611 @@
+using System.Globalization;
+using System.Text.Json.Serialization;
+using MacroDeck.Localization;
+using MacroDeckHost.Application.Auth;
+using MacroDeckHost.Application.Notifications;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Auth;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Localization;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+
+namespace MacroDeckHost.Api.Controllers;
+
+public record AuthStatusResponse(
+	bool SetupComplete,
+	bool Authenticated,
+	bool Trusted,
+	string? Scope,
+	string? Username,
+	string Version,
+	string MinimumCompanionVersion);
+
+public record SetupRequest(string Username, string Password);
+
+public record DeviceLoginInfo(
+	string? DeviceId,
+	string? DeviceSecret,
+	string? ClientType,
+	string? ProposedName,
+	string? Platform,
+	string? Browser,
+	string? FormFactor,
+	string? AppVersion);
+
+public record DeviceCredential(string DeviceId, string? DeviceSecret, string? StartupProfileId = null);
+
+public record DeviceEnrollmentResponse(string Token, string ExpiresAt);
+
+public record PairingCodeResponse(string Code, string ExpiresAt);
+
+public record RedeemDeviceEnrollmentRequest(string Token, DeviceLoginInfo? Device);
+
+public record LoginRequest(
+	string Username,
+	string Password,
+	string Scope,
+	DeviceLoginInfo? Device = null);
+
+public record TokenResponse(
+	string AccessToken,
+	int ExpiresInSeconds,
+	string Scope,
+	string Username,
+	DeviceCredential? Device = null,
+	[property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+	string? HostKey = null);
+
+public record HostIdentityChallenge(string? Nonce);
+
+public record HostIdentityProof(string PublicKey, string Endpoint, string Signature);
+
+public record ChangePasswordRequest(string CurrentPassword, string NewPassword);
+
+public record ChangeUsernameRequest(string CurrentPassword, string NewUsername);
+
+public record ResetPasswordRequest(string NewPassword);
+
+[ApiController]
+[Route("api/auth")]
+public class AuthController : ControllerBase
+{
+	private const string FailedLoginDedupeKey = "login-failed";
+	private const int MaxAttemptedUsernameLength = 64;
+
+	// No address in the key: a LAN caller can switch addresses freely, so guesses at the six digit
+	// pairing code are limited across all callers at once.
+	private const string PairingCodeThrottleKey = "pairing-code";
+
+	private readonly IAuthService _authService;
+	private readonly LoginThrottle _loginThrottle;
+	private readonly PairingCodeStore _pairingCodes;
+	private readonly TimeProvider _timeProvider;
+	private readonly IUserNotificationStore _userNotificationStore;
+	private readonly FailedLoginNotificationTracker _failedLoginTracker;
+	private readonly IAppPreferenceService _preferences;
+	private readonly ILocalizationResolver _localization;
+	private readonly IHostIdentityKeyProvider _hostIdentity;
+
+	public AuthController(
+		IAuthService authService,
+		LoginThrottle loginThrottle,
+		PairingCodeStore pairingCodes,
+		TimeProvider timeProvider,
+		IUserNotificationStore userNotificationStore,
+		FailedLoginNotificationTracker failedLoginTracker,
+		IAppPreferenceService preferences,
+		ILocalizationResolver localization,
+		IHostIdentityKeyProvider hostIdentity)
+	{
+		_authService = authService;
+		_loginThrottle = loginThrottle;
+		_pairingCodes = pairingCodes;
+		_timeProvider = timeProvider;
+		_userNotificationStore = userNotificationStore;
+		_failedLoginTracker = failedLoginTracker;
+		_preferences = preferences;
+		_localization = localization;
+		_hostIdentity = hostIdentity;
+	}
+
+	[HttpGet("status")]
+	[AllowAnonymous]
+	public async Task<AuthStatusResponse> Status()
+	{
+		var setupComplete = await _authService.IsSetupComplete();
+		var authenticated = User.Identity?.IsAuthenticated ?? false;
+		// Trusted = authenticated by the loopback scheme itself (desktop UI). A cookie- or
+		// token-authenticated status is NOT trusted: those clients still manage tokens.
+		var trusted = authenticated && User.Identity?.AuthenticationType == AuthDefaults.LoopbackScheme;
+
+		// On the trusted transport the principal is synthetic ("desktop"); report the real
+		// account name so the UI (e.g. security settings) shows something meaningful.
+		var username = trusted ? await _authService.GetUsername() : User.Identity?.Name;
+
+		return new AuthStatusResponse(setupComplete,
+			authenticated,
+			trusted,
+			authenticated ? User.FindFirst(AuthDefaults.ScopeClaim)?.Value : null,
+			authenticated ? username : null,
+			HostVersion.Current,
+			CompanionCompatibility.MinimumCompanionVersion);
+	}
+
+	[HttpPost("setup")]
+	[AllowAnonymous]
+	public async Task<IActionResult> Setup(SetupRequest body)
+	{
+		if (!LoopbackConnection.IsTrusted(HttpContext))
+		{
+			return Problem(statusCode: StatusCodes.Status403Forbidden,
+				title: "Setup is only allowed from the desktop app.");
+		}
+
+		var result = await _authService.Setup(body.Username, body.Password);
+		if (!result.Success)
+		{
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		return NoContent();
+	}
+
+	[HttpPost("login")]
+	[AllowAnonymous]
+	public async Task<IActionResult> Login(LoginRequest body)
+	{
+		if (!TryParseScope(body.Scope, out var scope))
+		{
+			return Problem(statusCode: StatusCodes.Status400BadRequest, title: "Invalid scope.");
+		}
+
+		var throttleKey = $"{BridgedConnectionStamp.ClientKey(HttpContext)}|{body.Username}";
+		if (_loginThrottle.IsThrottled(throttleKey, out var retryAfter))
+		{
+			Response.Headers.RetryAfter
+				= ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString(CultureInfo.InvariantCulture);
+			return Problem(statusCode: StatusCodes.Status429TooManyRequests,
+				title: "Too many failed login attempts. Try again later.");
+		}
+
+		var result = await _authService.Login(body.Username,
+			body.Password,
+			scope,
+			ToDeviceRegistration(body.Device));
+		if (!result.Success || result.Data is null)
+		{
+			_loginThrottle.RegisterFailure(throttleKey);
+
+			var attemptedUsername = Truncate(body.Username, MaxAttemptedUsernameLength);
+			var failureCount = _failedLoginTracker.RegisterFailure();
+			var culture = (await _preferences.GetLocalization()).Culture;
+			var remoteIp = BridgedConnectionStamp.DeviceKey(HttpContext) is { } deviceKey
+				? _localization.Resolve(
+					AppStrings.Notifications.FailedLoginOverUsb(BridgedConnectionStamp.MaskedDevice(deviceKey)),
+					culture)
+				: HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+			_userNotificationStore.Raise(new UserNotificationDraft
+			{
+				Severity = UserNotificationSeverity.Warning,
+				Kind = UserNotificationKind.Security,
+				Title = _localization.Resolve(AppStrings.Notifications.FailedLogin(), culture),
+				Message = _localization.Resolve(AppStrings.Notifications.FailedLoginMessage(failureCount,
+						attemptedUsername,
+						remoteIp),
+					culture),
+				Action = new UserNotificationAction(UserNotificationActionKind.OpenLogs, null),
+				DedupeKey = FailedLoginDedupeKey
+			});
+
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		_loginThrottle.RegisterSuccess(throttleKey);
+		_failedLoginTracker.Reset();
+		SetAuthCookies(result.Data);
+
+		return Ok(await ToTokenResponse(result.Data));
+	}
+
+	/// <summary>
+	/// Mints a one-time credential for a device that cannot be signed in by hand - a screen with no
+	/// keyboard. Loopback-only for the same reason setup is: whoever asks for one is handing a device
+	/// a session, and that has to be someone sitting at this machine, not a caller on the network.
+	/// </summary>
+	[HttpPost("device-enrollment")]
+	public async Task<IActionResult> CreateDeviceEnrollment()
+	{
+		if (!LoopbackConnection.IsTrusted(HttpContext))
+		{
+			return Problem(statusCode: StatusCodes.Status403Forbidden,
+				title: "Device enrollment is only allowed from the desktop app.");
+		}
+
+		var result = await _authService.CreateDeviceEnrollment(AuthDefaults.DeviceEnrollmentLifetime);
+		if (!result.Success || result.Data is null)
+		{
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		return Ok(new DeviceEnrollmentResponse(result.Data.Token, result.Data.ExpiresAt.ToString("O")));
+	}
+
+	[HttpGet("pairing-code")]
+	public IActionResult GetPairingCode()
+	{
+		return PairingCodeResult(false);
+	}
+
+	[HttpPost("pairing-code")]
+	public IActionResult RotatePairingCode()
+	{
+		return PairingCodeResult(true);
+	}
+
+	/// <summary>
+	/// Spends an enrollment credential for an ordinary client session. Anonymous by necessity - the
+	/// device has nothing else to present - but the credential is single-use, short-lived and only
+	/// ever buys client scope.
+	/// </summary>
+	[HttpPost("device-enrollment/redeem")]
+	[AllowAnonymous]
+	public async Task<IActionResult> RedeemDeviceEnrollment(RedeemDeviceEnrollmentRequest body)
+	{
+		var token = body.Token ?? string.Empty;
+		string[] throttleKeys = PairingCodeStore.IsPairingCodeShape(token)
+			? [$"{BridgedConnectionStamp.ClientKey(HttpContext)}|device-enrollment", PairingCodeThrottleKey]
+			: [$"{BridgedConnectionStamp.ClientKey(HttpContext)}|device-enrollment"];
+
+		var retryAfter = TimeSpan.Zero;
+		foreach (var key in throttleKeys)
+		{
+			if (_loginThrottle.IsThrottled(key, out var keyRetryAfter) && keyRetryAfter > retryAfter)
+			{
+				retryAfter = keyRetryAfter;
+			}
+		}
+
+		if (retryAfter > TimeSpan.Zero)
+		{
+			Response.Headers.RetryAfter
+				= ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString(CultureInfo.InvariantCulture);
+			return Problem(statusCode: StatusCodes.Status429TooManyRequests,
+				title: "Too many failed enrollment attempts. Try again later.");
+		}
+
+		var result = await _authService.RedeemDeviceEnrollment(token,
+			ToDeviceRegistration(body.Device) ?? UnknownDeviceRegistration());
+		if (!result.Success || result.Data is null)
+		{
+			foreach (var key in throttleKeys)
+			{
+				_loginThrottle.RegisterFailure(key);
+			}
+
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		foreach (var key in throttleKeys)
+		{
+			_loginThrottle.RegisterSuccess(key);
+		}
+
+		SetAuthCookies(result.Data);
+
+		return Ok(await ToTokenResponse(result.Data));
+	}
+
+	[HttpPost("refresh")]
+	[AllowAnonymous]
+	public async Task<IActionResult> Refresh()
+	{
+		var rawToken = AuthCookies.ReadRefreshToken(HttpContext);
+		if (string.IsNullOrEmpty(rawToken))
+		{
+			return Problem(statusCode: StatusCodes.Status401Unauthorized, title: "No refresh token.");
+		}
+
+		var result = await _authService.Refresh(rawToken);
+		if (!result.Success || result.Data is null)
+		{
+			DeleteAuthCookies();
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		SetAuthCookies(result.Data);
+
+		return Ok(await ToTokenResponse(result.Data));
+	}
+
+	[HttpPost("identity")]
+	[AllowAnonymous]
+	public async Task<IActionResult> ProveIdentity(HostIdentityChallenge body)
+	{
+		if (!HostIdentityMessage.TryParseNonce(body.Nonce, out _))
+		{
+			return Problem(statusCode: StatusCodes.Status400BadRequest, title: "Invalid nonce.");
+		}
+
+		// Taken from this host's own socket, never from the request, so a relay signs the real host's
+		// endpoint and not its own.
+		var localAddress = HttpContext.Connection.LocalIpAddress;
+		if (localAddress is null)
+		{
+			return Problem(statusCode: StatusCodes.Status503ServiceUnavailable, title: "No local endpoint.");
+		}
+
+		var endpoint = HostIdentityMessage.CanonicalAuthority(localAddress, HttpContext.Connection.LocalPort);
+		try
+		{
+			var publicKey = Convert.ToBase64String(await _hostIdentity.GetPublicKey(HttpContext.RequestAborted));
+			var signature = await _hostIdentity.Sign(HostIdentityMessage.Build(publicKey, endpoint, body.Nonce!),
+				HttpContext.RequestAborted);
+			return Ok(new HostIdentityProof(publicKey, endpoint, Convert.ToBase64String(signature)));
+		}
+		catch (HostIdentityUnavailableException)
+		{
+			return Problem(statusCode: StatusCodes.Status503ServiceUnavailable, title: "Host identity unavailable.");
+		}
+	}
+
+	[HttpPost("logout")]
+	[AllowAnonymous]
+	public async Task<IActionResult> Logout()
+	{
+		var rawToken = AuthCookies.ReadRefreshToken(HttpContext);
+		if (!string.IsNullOrEmpty(rawToken))
+		{
+			await _authService.Logout(rawToken);
+		}
+
+		DeleteAuthCookies();
+
+		return NoContent();
+	}
+
+	[HttpPost("change-password")]
+	[Authorize]
+	public async Task<IActionResult> ChangePassword(ChangePasswordRequest body)
+	{
+		var result = await _authService.ChangePassword(body.CurrentPassword, body.NewPassword);
+		if (!result.Success)
+		{
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		return NoContent();
+	}
+
+	[HttpPost("reset-password")]
+	[Authorize]
+	public async Task<IActionResult> ResetPassword(ResetPasswordRequest body)
+	{
+		// No current password is asked for, so only someone at this machine may do it: an admin token
+		// from the network is refused like setup is.
+		if (!LoopbackConnection.IsTrusted(HttpContext))
+		{
+			return Problem(statusCode: StatusCodes.Status403Forbidden,
+				title: "Password reset is only allowed from the desktop app.");
+		}
+
+		var result = await _authService.ResetPassword(body.NewPassword ?? string.Empty);
+		if (!result.Success)
+		{
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		if (await _authService.GetUsername() is { } username)
+		{
+			_loginThrottle.ClearUsername(username);
+		}
+
+		return NoContent();
+	}
+
+	[HttpPost("change-username")]
+	[Authorize]
+	public async Task<IActionResult> ChangeUsername(ChangeUsernameRequest body)
+	{
+		var result = await _authService.ChangeUsername(body.CurrentPassword, body.NewUsername);
+		if (!result.Success)
+		{
+			return AuthProblem(result.Error, result.ErrorMessage);
+		}
+
+		return NoContent();
+	}
+
+	private IActionResult PairingCodeResult(bool rotate)
+	{
+		if (!LoopbackConnection.IsTrusted(HttpContext))
+		{
+			return Problem(statusCode: StatusCodes.Status403Forbidden,
+				title: "Pairing codes are only available in the desktop app.");
+		}
+
+		var now = _timeProvider.GetUtcNow().UtcDateTime;
+		var code = rotate ? _pairingCodes.Rotate(now) : _pairingCodes.Current(now);
+		return Ok(new PairingCodeResponse(code.Code, code.ExpiresAt.ToString("O")));
+	}
+
+	private async Task<TokenResponse> ToTokenResponse(LoginResult login)
+	{
+		var expiresIn = (int)(login.AccessTokenExpiresAt - _timeProvider.GetUtcNow().UtcDateTime).TotalSeconds;
+
+		var device = login.DeviceId is { } deviceId
+			? new DeviceCredential(deviceId.ToString(), login.IssuedDeviceSecret, login.StartupProfileId)
+			: null;
+
+		return new TokenResponse(login.AccessToken,
+			Math.Max(expiresIn, 0),
+			AuthDefaults.ScopeClaimValue(login.Scope),
+			login.Username,
+			device,
+			await HostKeyOrNull());
+	}
+
+	// A host that cannot load its identity still signs people in; the app treats the exchange as legacy.
+	// No request token: the refresh token is already rotated here, and that must never become an error.
+	private async Task<string?> HostKeyOrNull()
+	{
+		try
+		{
+			return Convert.ToBase64String(await _hostIdentity.GetPublicKey());
+		}
+		catch (Exception e) when (e is HostIdentityUnavailableException
+			or ObjectDisposedException
+			or OperationCanceledException)
+		{
+			return null;
+		}
+	}
+
+	/// <summary>A device that told us nothing about itself still gets registered, as an unknown one.</summary>
+	private static DeviceRegistration UnknownDeviceRegistration()
+	{
+		return new DeviceRegistration(null,
+			null,
+			DeviceClientType.Unknown,
+			null,
+			null,
+			null,
+			DeviceFormFactor.Unknown,
+			null);
+	}
+
+	private static DeviceRegistration? ToDeviceRegistration(DeviceLoginInfo? device)
+	{
+		if (device is null)
+		{
+			return null;
+		}
+
+		return new DeviceRegistration(Guid.TryParse(device.DeviceId, out var id) ? id : null,
+			device.DeviceSecret,
+			ParseClientType(device.ClientType),
+			device.ProposedName,
+			device.Platform,
+			device.Browser,
+			ParseFormFactor(device.FormFactor),
+			device.AppVersion);
+	}
+
+	private static DeviceClientType ParseClientType(string? value)
+	{
+		return value switch
+		{
+			"web-client" => DeviceClientType.WebClient,
+			"admin-ui" => DeviceClientType.AdminUi,
+			"native" => DeviceClientType.Native,
+			_ => DeviceClientType.Unknown
+		};
+	}
+
+	private static DeviceFormFactor ParseFormFactor(string? value)
+	{
+		return value switch
+		{
+			"desktop" => DeviceFormFactor.Desktop,
+			"tablet" => DeviceFormFactor.Tablet,
+			"phone" => DeviceFormFactor.Phone,
+			_ => DeviceFormFactor.Unknown
+		};
+	}
+
+	private void SetAuthCookies(LoginResult login)
+	{
+		// Per request, not per configuration: a session established over HTTPS must never ship its
+		// cookie back in plaintext, and the same host also serves plain HTTP unless the user chose to
+		// replace that listener. The consequence is deliberate - a session started over HTTPS is not
+		// carried to the HTTP endpoint (the user signs in again there) - because the asymmetry only
+		// ever refuses to downgrade a secure session.
+		var secure = Request.IsHttps;
+
+		var now = _timeProvider.GetUtcNow().UtcDateTime;
+
+		// Named per listener: cookies ignore the port, so an installed host and a second one on the same
+		// machine would otherwise keep overwriting each other's cookie, and whichever wrote last would
+		// make the other's <img> requests fail with a token signed by the wrong key.
+		Response.Cookies.Append(AuthDefaults.AccessCookieFor(AuthCookies.ListenerPort(HttpContext)),
+			login.AccessToken,
+			new CookieOptions
+			{
+				HttpOnly = true,
+				Secure = secure,
+				SameSite = SameSiteMode.Strict,
+				Path = "/",
+				Expires = new DateTimeOffset(login.AccessTokenExpiresAt, TimeSpan.Zero),
+				// Expires is judged by the device clock: a device running ahead of this host would drop the
+				// cookie on arrival and every <img> request would go unauthenticated. Max-Age is relative.
+				MaxAge = Remaining(login.AccessTokenExpiresAt, now)
+			});
+		Response.Cookies.Append(AuthDefaults.RefreshCookieFor(AuthCookies.ListenerPort(HttpContext)),
+			login.RefreshToken,
+			new CookieOptions
+			{
+				HttpOnly = true,
+				Secure = secure,
+				SameSite = SameSiteMode.Strict,
+				Path = "/api/auth",
+				Expires = new DateTimeOffset(login.RefreshTokenExpiresAt, TimeSpan.Zero),
+				MaxAge = Remaining(login.RefreshTokenExpiresAt, now)
+			});
+	}
+
+	private static TimeSpan Remaining(DateTime expiresAt, DateTime now)
+	{
+		return expiresAt > now ? expiresAt - now : TimeSpan.Zero;
+	}
+
+	private void DeleteAuthCookies()
+	{
+		var secure = Request.IsHttps;
+
+		var port = AuthCookies.ListenerPort(HttpContext);
+
+		Response.Cookies.Delete(AuthDefaults.RefreshCookieFor(port),
+			new CookieOptions { Path = "/api/auth", Secure = secure });
+		Response.Cookies.Delete(AuthDefaults.AccessCookieFor(port), new CookieOptions { Path = "/", Secure = secure });
+
+		// The unsuffixed pair is what installations before the per-listener names used; signing out has to
+		// clear it too, or a stale one outlives the session it belonged to.
+		Response.Cookies.Delete(AuthDefaults.RefreshCookie,
+			new CookieOptions { Path = "/api/auth", Secure = secure });
+		Response.Cookies.Delete(AuthDefaults.AccessCookie, new CookieOptions { Path = "/", Secure = secure });
+	}
+
+	private ObjectResult AuthProblem(AuthError? error, string? message)
+	{
+		var statusCode = error switch
+		{
+			AuthError.ValidationError => StatusCodes.Status400BadRequest,
+			AuthError.SetupAlreadyComplete => StatusCodes.Status409Conflict,
+			AuthError.Throttled => StatusCodes.Status429TooManyRequests,
+			_ => StatusCodes.Status401Unauthorized
+		};
+
+		return Problem(statusCode: statusCode, title: message ?? "Authentication failed.");
+	}
+
+	private static string Truncate(string value, int maxLength)
+	{
+		return value.Length <= maxLength ? value : value[..maxLength];
+	}
+
+	private static bool TryParseScope(string value, out AuthScope scope)
+	{
+		switch (value)
+		{
+			case AuthDefaults.AdminScope:
+				scope = AuthScope.Admin;
+				return true;
+			case AuthDefaults.ClientScope:
+				scope = AuthScope.Client;
+				return true;
+			default:
+				scope = default;
+				return false;
+		}
+	}
+}

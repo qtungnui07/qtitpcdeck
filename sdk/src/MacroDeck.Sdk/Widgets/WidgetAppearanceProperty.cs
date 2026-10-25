@@ -1,0 +1,47 @@
+namespace MacroDeck.Sdk.Widgets;
+
+/// <summary>
+/// One property of a <see cref="WidgetAppearancePatch" /> that can be cleared independently of the
+/// rest of it - see <see cref="WidgetAppearanceRequest.ClearProperties" />. An action whose control
+/// offers "reset to default" alongside "set a value" reports the property here instead of writing a
+/// value the host would have to invent.
+///
+/// Values are persisted and exchanged through the SDK, so they are explicitly assigned and new
+/// entries must be appended. The original BackgroundColor value is retained for binary consumers.
+/// </summary>
+public enum WidgetAppearanceProperty
+{
+	BackgroundColor = 0,
+	Label = 1,
+	LabelColor = 2,
+	Icon = 3,
+	Font = 4,
+	Border = 5,
+	BorderColor = 6,
+
+	/// <summary>
+	/// How the icon is framed - fit mode, zoom, position and opacity. One property rather than five,
+	/// because a widget type either renders a framed icon or none of it, and clearing it means
+	/// "back to the defaults" for the whole framing.
+	/// </summary>
+	IconDisplay = 7,
+
+	/// <summary>
+	/// The highlight colour of a Slider or History Graph - see <see cref="WidgetAppearancePatch.AccentColor" />.
+	/// Clearing it returns the widget to the reader's theme accent. It has no visible effect while the
+	/// widget's colour thresholds are on.
+	/// </summary>
+	AccentColor = 8,
+
+	/// <summary>
+	/// The colour an action button draws its icon in - see <see cref="WidgetAppearancePatch.IconColor" />.
+	/// Clearing it returns the icon to its own colours.
+	/// </summary>
+	IconColor = 9,
+
+	/// <summary>
+	/// Which appearance of the icon is shown - see <see cref="WidgetAppearancePatch.IconAppearance" />.
+	/// Clearing it returns the icon to automatic selection.
+	/// </summary>
+	IconAppearance = 10
+}

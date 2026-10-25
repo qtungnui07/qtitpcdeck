@@ -1,0 +1,157 @@
+import { provideZonelessChangeDetection, signal } from '@angular/core';
+import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { Subject } from 'rxjs';
+import { IconAppearanceContext } from '@macro-deck/runtime';
+import { ApiService, IconAppearanceContextService } from '@shared';
+import { IconAppearanceModel, IconModel } from '../../services/icon-pack.service';
+import { IconTileComponent } from './icon-tile.component';
+
+describe('IconTileComponent', () => {
+  let fixture: ComponentFixture<IconTileComponent>;
+
+  const icon: IconModel = {
+    id: 'icon-1',
+    packId: 'pack',
+    name: 'wide icon',
+    isAnimated: false,
+    processingState: 'Ready',
+    availableSizes: [128],
+  };
+
+  beforeEach(() => {
+    const apiSpy = jasmine.createSpyObj<ApiService>('ApiService', ['getIconImageUrl', 'onNotification']);
+    apiSpy.getIconImageUrl.and.returnValue('http://host/icon.webp');
+    apiSpy.onNotification.and.callFake(() => new Subject());
+    Object.defineProperty(apiSpy, 'connectionStateSignal', { value: signal('disconnected') });
+
+    TestBed.configureTestingModule({
+      imports: [IconTileComponent],
+      providers: [provideZonelessChangeDetection(), { provide: ApiService, useValue: apiSpy }],
+    });
+    fixture = TestBed.createComponent(IconTileComponent);
+    fixture.componentRef.setInput('icon', icon);
+    fixture.componentRef.setInput('size', 96);
+    fixture.detectChanges();
+  });
+
+  it('requests the thumbnail under the icon content hash so replaced bytes are not served from cache', () => {
+    const api = TestBed.inject(ApiService) as jasmine.SpyObj<ApiService>;
+    api.getIconImageUrl.and.callFake((iconId: string, size?: number, version?: string | null) =>
+      `http://host/api/icons/${iconId}/image?size=${size}&v=${version}`);
+
+    fixture.componentRef.setInput('icon', { ...icon, contentHash: 'sha256:new' });
+    fixture.detectChanges();
+
+    const img = fixture.nativeElement.querySelector('.thumb img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toBe('http://host/api/icons/icon-1/image?size=128&v=sha256:new');
+  });
+
+  it('renders the thumbnail as a 1:1 square regardless of the image aspect ratio', () => {
+    const thumb = fixture.nativeElement.querySelector('.thumb') as HTMLElement;
+    const rect = thumb.getBoundingClientRect();
+    expect(rect.width).toBe(96);
+    expect(rect.height).toBe(96);
+  });
+
+  it('fills the square thumbnail like an action button (cover, no letterboxing)', () => {
+    const img = fixture.nativeElement.querySelector('.thumb img') as HTMLImageElement;
+    expect(getComputedStyle(img).objectFit).toBe('cover');
+  });
+
+  it('rounds the thumbnail with the action-button radius token', () => {
+    const thumb = fixture.nativeElement.querySelector('.thumb') as HTMLElement;
+    document.documentElement.style.setProperty('--radius-lg', '12px');
+    expect(getComputedStyle(thumb).borderRadius).toBe('12px');
+    document.documentElement.style.removeProperty('--radius-lg');
+  });
+
+  it('keeps the fixed tile width for long icon names so grid rows cannot overflow', () => {
+    document.documentElement.style.setProperty('--space-1', '4px');
+    fixture.componentRef.setInput('icon', {
+      ...icon,
+      name: 'a very long icon name that must not stretch the tile beyond its fixed width',
+    });
+    fixture.detectChanges();
+
+    const tile = fixture.nativeElement.querySelector('.tile') as HTMLElement;
+    expect(tile.getBoundingClientRect().width).toBe(104);
+    document.documentElement.style.removeProperty('--space-1');
+  });
+});
+
+describe('IconTileComponent appearances', () => {
+  let fixture: ComponentFixture<IconTileComponent>;
+  let api: jasmine.SpyObj<ApiService>;
+
+  const plain: IconModel = {
+    id: 'icon-1',
+    packId: 'pack',
+    name: 'logo',
+    isAnimated: false,
+    processingState: 'Ready',
+    availableSizes: [128],
+    contentHash: 'h',
+    appearances: [],
+  };
+
+  const dark: IconAppearanceModel = {
+    id: 'asset-1',
+    key: 'colorScheme=dark',
+    traits: { colorScheme: 'dark' },
+    contentHash: 'a',
+    isAnimated: false,
+    width: 256,
+    height: 256,
+    processingState: 'Ready',
+    processingError: null,
+  };
+
+  beforeEach(() => {
+    api = jasmine.createSpyObj<ApiService>('ApiService', ['getIconImageUrl', 'onNotification']);
+    api.getIconImageUrl.and.callFake((iconId: string, size?: number, version?: string | null, context?: IconAppearanceContext) =>
+      `http://host/api/icons/${iconId}/image?v=${version}${context ? `&colorScheme=${context.colorScheme}` : ''}`);
+    api.onNotification.and.callFake(() => new Subject());
+    Object.defineProperty(api, 'connectionStateSignal', { value: signal('disconnected') });
+
+    TestBed.configureTestingModule({
+      imports: [IconTileComponent],
+      providers: [
+        provideZonelessChangeDetection(),
+        { provide: ApiService, useValue: api },
+        { provide: IconAppearanceContextService, useValue: { current: () => ({ colorScheme: 'dark', motion: 'animated' }) } },
+      ],
+    });
+    fixture = TestBed.createComponent(IconTileComponent);
+  });
+
+  function render(icon: IconModel): HTMLElement {
+    fixture.componentRef.setInput('icon', icon);
+    fixture.detectChanges();
+    return fixture.nativeElement as HTMLElement;
+  }
+
+  it('marks an icon that has appearances, and only such an icon', () => {
+    expect(render(plain).querySelector('.appearances-badge')).toBeNull();
+
+    const badge = render({ ...plain, appearances: [dark] }).querySelector('.appearances-badge');
+    expect(badge).not.toBeNull();
+    expect(badge?.getAttribute('aria-label')).toBeTruthy();
+  });
+
+  it('shows the appearance that fits the current theme, and the plain URL for an icon without appearances', () => {
+    const plainSrc = render(plain).querySelector('.thumb img')?.getAttribute('src');
+    const appearanceSrc = render({ ...plain, appearances: [dark] }).querySelector('.thumb img')?.getAttribute('src');
+
+    expect(plainSrc).toBe('http://host/api/icons/icon-1/image?v=h');
+    expect(appearanceSrc).toBe('http://host/api/icons/icon-1/image?v=h&colorScheme=dark');
+  });
+
+  it('asks to open the icon on a double click', () => {
+    const opened = jasmine.createSpy('opened');
+    fixture.componentInstance.tileOpen.subscribe(opened);
+
+    render(plain).querySelector<HTMLButtonElement>('.tile')!.dispatchEvent(new MouseEvent('dblclick'));
+
+    expect(opened).toHaveBeenCalledWith(plain);
+  });
+});

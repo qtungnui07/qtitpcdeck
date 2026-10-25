@@ -1,0 +1,104 @@
+using MacroDeckHost.Application.Layouts;
+using MacroDeckHost.Application.Profiles;
+using MacroDeckHost.Application.Ui.Transport.Messages.Profiles;
+using MacroDeckHost.Application.Variables.Colors;
+using MacroDeckHost.Domain.Entities;
+
+namespace MacroDeckHost.Application.Ui.Handlers;
+
+public static class ProfileDtoMapper
+{
+	public static Profile MapJsonProfile(ProfileEntity entity, IColorReferenceResolver? colors = null)
+	{
+		return MapJsonProfile(entity, null, colors);
+	}
+
+	public static ProfilePlacement MapToPlacement(ProfileEntity entity)
+	{
+		return new ProfilePlacement { Id = entity.Id.ToString(), Order = entity.Order };
+	}
+
+	public static Profile MapJsonProfile(
+		ProfileEntity entity,
+		DeviceGridConstraint? constraint,
+		IColorReferenceResolver? colors = null)
+	{
+		var (background, backgroundSource) = ColorSource.Present(entity.DefaultBackgroundColor, colors);
+		return new Profile
+		{
+			Id = entity.Id.ToString(),
+			Name = entity.Name,
+			Order = entity.Order,
+			LayoutType = entity.LayoutType.ToString(),
+			IsVirtual = false,
+			SourceIntegrationId = null,
+			Layout = new ProfileLayout
+			{
+				Rows = entity.DefaultRows,
+				Columns = entity.DefaultColumns,
+				RowsLocked = false,
+				ColumnsLocked = false,
+				Constraint = MapConstraint(constraint),
+				Compatibility = MapCompatibility(constraint, entity.DefaultRows, entity.DefaultColumns)
+			},
+			DefaultRows = entity.DefaultRows,
+			DefaultColumns = entity.DefaultColumns,
+			DefaultBackgroundColor = background,
+			DefaultBackgroundColorSource = backgroundSource,
+			DefaultWidgetSpacing = entity.DefaultWidgetSpacing,
+			DefaultWidgetBorderRadius = entity.DefaultWidgetBorderRadius,
+			DefaultEmptyCellStyle = EmptyCellStyleText.Format(entity.DefaultEmptyCellStyle),
+			DefaultWidgetShadows = entity.DefaultWidgetShadows
+		};
+	}
+
+	private static ProfileLayoutConstraint? MapConstraint(DeviceGridConstraint? constraint)
+	{
+		return constraint is null
+			? null
+			: new ProfileLayoutConstraint
+			{
+				Rows = constraint.Rows,
+				Columns = constraint.Columns,
+				MinRows = constraint.MinRows,
+				MaxRows = constraint.MaxRows,
+				MinColumns = constraint.MinColumns,
+				MaxColumns = constraint.MaxColumns,
+				RowsLocked = constraint.RowsLocked,
+				ColumnsLocked = constraint.ColumnsLocked,
+				LayoutId = constraint.LayoutId,
+				LayoutName = constraint.LayoutName,
+				DeviceName = constraint.DeviceName,
+				WidgetSpacingHonoured = constraint.WidgetSpacingHonoured,
+				CornerRadiusHonoured = constraint.CornerRadiusHonoured,
+				CustomFolderViewsSupported = constraint.CustomFolderViewsSupported
+			};
+	}
+
+	private static ProfileLayoutCompatibility? MapCompatibility(
+		DeviceGridConstraint? constraint,
+		int currentRows,
+		int currentColumns)
+	{
+		if (constraint is null)
+		{
+			return null;
+		}
+
+		if (constraint.HasConflict)
+		{
+			return new ProfileLayoutCompatibility
+			{
+				Status = "conflictingDevices",
+				DeviceNames = constraint.ConflictingDeviceNames
+			};
+		}
+
+		if (constraint.ExceedsLockedLayout(currentRows, currentColumns))
+		{
+			return new ProfileLayoutCompatibility { Status = "exceedsLayout", DeviceNames = [] };
+		}
+
+		return new ProfileLayoutCompatibility { Status = "ok", DeviceNames = [] };
+	}
+}

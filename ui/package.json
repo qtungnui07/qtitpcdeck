@@ -1,0 +1,28 @@
+{
+  "name": "qtitpcdeck-ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "qtitpcdeck UI - framework-free runtime, Svelte clients and the Tauri bootstrapper",
+  "workspaces": [
+    "runtime",
+    "web-client",
+    "angular",
+    "svelte"
+  ],
+  "scripts": {
+    "dev": "node dev.js",
+    "build": "npm run build -w @macro-deck/runtime && npm run build:prod -w macro-deck-ui-angular",
+    "build:runtime": "npm run build -w @macro-deck/runtime",
+    "build:desktop": "npm run build -w @macro-deck/runtime && npm run build:desktop -w macro-deck-ui-angular -- --configuration=production",
+    "clean": "rm -rf angular/dist angular/.angular runtime/dist runtime/out-spec",
+    "start:angular": "npm start -w macro-deck-ui-angular",
+    "start:svelte": "npm run dev -w @qtitpcdeck/svelte",
+    "build:svelte": "npm run build -w @qtitpcdeck/svelte",
+    "test:svelte": "npm test -w @qtitpcdeck/svelte",
+    "test:runtime": "npm test -w @macro-deck/runtime",
+    "build:web-client": "npm run build -w @macro-deck/runtime && npm run build -w @macro-deck/web-client",
+    "test:web-client": "npm test -w @macro-deck/web-client",
+    "build:preview-renderer": "node scripts/build-preview-renderer.mjs",
+    "measure:conformance": "node scripts/measure-conformance.mjs"
+  }
+}

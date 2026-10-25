@@ -1,0 +1,918 @@
+import { Location } from '@angular/common';
+import { ChangeDetectionStrategy, Component, OnInit, computed, inject, signal } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { FormsModule } from '@angular/forms';
+import { ActivatedRoute, Router } from '@angular/router';
+import { catchError, EMPTY, exhaustMap, from, timer } from 'rxjs';
+import type { Variable } from '@macro-deck/runtime';
+import { AppStrings, ConfigEntryDto, GetIntegrationCapabilitiesResponse, IpcProvidedCapability, IntegrationIssuesChangedEvent, IntegrationsChangedEvent, IpcIntegrationActionCapability, IpcIntegrationVariableCapability, VariableCatalogNode, IpcIntegrationIssue, PLUGIN_PERMISSION_HOST_ADB, PLUGIN_PERMISSION_HOST_COMPANION_DEVICES, PluginCompatibilityReport, resolveLocalizedText } from '@macro-deck/runtime';
+import { ApiService, CheckboxComponent, ErrorBannerComponent, InputComponent, LocalizationService, LocalizedTextPipe, ModalComponent, ToastService, ToggleSwitchComponent, ButtonComponent, TranslatePipe, VariableService } from '@shared';
+import { ConfigFlowDialogComponent } from '../../config-flow/config-flow-dialog.component';
+import { DetailPageComponent } from '../../detail-page/detail-page.component';
+import { EmptyStateComponent } from '../../feedback/empty-state/empty-state.component';
+import { LoadingStateComponent } from '../../feedback/loading-state/loading-state.component';
+import { ConfirmationModalComponent } from '../../overlay/confirmation-modal/confirmation-modal.component';
+import { TabBarComponent } from '../../tab-bar/tab-bar.component';
+import { TabItem } from '../../tab-bar/tab-bar.model';
+import { COUNTED_CAPABILITY_KINDS } from '../../../domain/integration-capability.util';
+import { ConfigFlowService } from '../../../services/config-flow.service';
+import { IntegrationService, Integration } from '../../../services/integration.service';
+import { PluginCompatibilityService } from '../../../services/plugin-compatibility.service';
+import { PluginInstallationService } from '../../../services/plugin-installation.service';
+import { isStoreDetailUrl } from '../../../services/store-browse-state.service';
+import { VariableCatalogService } from '../../../services/variable-catalog.service';
+import { VariableBindDialogComponent } from '../../variables/variable-bind-dialog.component';
+import { VariableCatalogRow, createVariableCatalogRows } from '../../variables/variable-catalog-rows';
+import { VariableGroupHeaderComponent } from '../../variables/variable-group-header.component';
+import { VARIABLE_ROW_HEIGHT, VARIABLE_ROW_INDENT, VariableRowComponent } from '../../variables/variable-row.component';
+import { ActionCapabilityRowComponent } from './action-capability-row.component';
+import { IntegrationCompatibilityCardComponent } from './integration-compatibility-card.component';
+import { IntegrationIssuesCardComponent } from './integration-issues-card.component';
+import { IntegrationStatusBadge, IntegrationStatusStripComponent } from './integration-status-strip.component';
+
+type DetailTab = 'overview' | 'actions' | 'variables';
+
+type VariableTabRow =
+  | { kind: 'unbound-header'; key: string; count: number | null; expanded: boolean; collapsible: boolean }
+  | { kind: 'catalog-state'; key: string; state: 'loading' | 'offline' | 'empty' }
+  | { kind: 'declared'; key: string; variable: IpcIntegrationVariableCapability }
+  | { kind: 'bound'; key: string; variable: Variable }
+  | VariableCatalogRow;
+
+const TEMPLATE_PLACEHOLDER = /<([^<>]+)>/;
+
+const TAB_ID_PREFIX = 'integration-detail';
+
+@Component({
+  selector: 'app-integration-detail-page',
+  standalone: true,
+  imports: [
+    FormsModule,
+    CheckboxComponent,
+    ConfigFlowDialogComponent,
+    ConfirmationModalComponent,
+    DetailPageComponent,
+    EmptyStateComponent,
+    ErrorBannerComponent,
+    LoadingStateComponent,
+    ModalComponent,
+    ToggleSwitchComponent,
+    ButtonComponent,
+    InputComponent,
+    TabBarComponent,
+    ActionCapabilityRowComponent,
+    VariableGroupHeaderComponent,
+    VariableRowComponent,
+    VariableBindDialogComponent,
+    IntegrationIssuesCardComponent,
+    IntegrationCompatibilityCardComponent,
+    IntegrationStatusStripComponent,
+    LocalizedTextPipe,
+    TranslatePipe,
+  ],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  templateUrl: './integration-detail-page.component.html',
+  styleUrls: ['./integration-detail-page.component.scss'],
+})
+export class IntegrationDetailPageComponent implements OnInit {
+  private readonly localization = inject(LocalizationService);
+  private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
+  private readonly location = inject(Location);
+
+  protected readonly openedFromStore = signal(false);
+  protected readonly integrationService = inject(IntegrationService);
+  protected readonly configFlow = inject(ConfigFlowService);
+  private readonly api = inject(ApiService);
+  private readonly variableService = inject(VariableService);
+  private readonly variableCatalog = inject(VariableCatalogService);
+  private readonly toasts = inject(ToastService);
+  protected readonly compatibilityService = inject(PluginCompatibilityService);
+  private readonly installation = inject(PluginInstallationService);
+
+  protected readonly integrationId = signal<string>('');
+  protected readonly showStoreLink = signal(false);
+
+  protected readonly canUninstall = computed(() => {
+    const integration = this.integration();
+    return !!integration && !integration.isInternal && this.installation.installedIds().has(integration.id);
+  });
+
+  protected readonly uninstallOpen = signal(false);
+  protected readonly uninstallDeleteData = signal(false);
+  protected readonly uninstallBusy = signal(false);
+
+  protected readonly uninstallMessage = computed(() => {
+    const integration = this.integration();
+    if (!integration) {
+      return '';
+    }
+    const version = this.installation.find(integration.id)?.activeVersion;
+    const named = version ? `${integration.name} ${version}` : integration.name;
+    return this.localization.translateKey(AppStrings.Integrations.Page.UninstallMessage, { name: named });
+  });
+  protected readonly configEntries = signal<ConfigEntryDto[]>([]);
+  protected readonly configuring = signal(false);
+  protected readonly configuringEntryId = signal<string | null>(null);
+  protected readonly configurationName = signal('');
+  protected readonly configurationNameTarget = signal<ConfigEntryDto | null>(null);
+  protected readonly pendingRemove = signal<ConfigEntryDto | null>(null);
+  protected readonly configurationMutationPending = signal(false);
+  protected readonly showDisableConfirm = signal(false);
+  protected readonly issues = signal<IpcIntegrationIssue[]>([]);
+  protected readonly issuesLoading = signal(false);
+  protected readonly issuesError = signal<string | null>(null);
+  protected readonly resolvingIssueId = signal<string | null>(null);
+
+  protected readonly capabilities = signal<GetIntegrationCapabilitiesResponse | null>(null);
+  protected readonly capabilitiesLoading = signal(false);
+  protected readonly capabilitiesError = signal<string | null>(null);
+  private capabilitiesRequest = 0;
+
+  protected readonly activeTab = signal<DetailTab>('overview');
+  protected readonly actionSearch = signal('');
+  protected readonly variableSearch = signal('');
+
+  protected readonly tabIdPrefix = TAB_ID_PREFIX;
+
+  protected readonly disableMessage = computed(() => {
+    const name = this.integration()?.name ?? this.localization.translateKey(AppStrings.Integrations.Page.FallbackIntegrationName);
+    return this.localization.translateKey(AppStrings.Integrations.Page.DisableMessage, { name });
+  });
+
+  protected readonly removeConfigurationMessage = computed(() =>
+    this.localization.translateKey(AppStrings.Integrations.Detail.RemoveConfigEntryMessage, {
+      name: this.pendingRemove()?.title ?? '',
+    }));
+
+  protected readonly integration = computed<Integration | null>(() =>
+    this.integrationService.integrations().find(i => i.id === this.integrationId()) ?? null
+  );
+
+  protected readonly canSetUp = computed(() => this.integration()?.supportsConfigFlow === true);
+
+  protected readonly compatibilityReport = computed<PluginCompatibilityReport | null>(() => {
+    const integration = this.integration();
+    if (!integration || integration.isInternal) {
+      return null;
+    }
+    return this.compatibilityService.reports().find(report => report.pluginId === integration.id) ?? null;
+  });
+
+  private readonly issuesHealthy = computed(() =>
+    this.integration()?.enabled === true
+    && !this.issuesLoading()
+    && this.issuesError() === null
+    && this.issues().length === 0
+  );
+
+  private readonly compatibilityHealthy = computed(() => {
+    const report = this.compatibilityReport();
+    return !this.compatibilityService.isLoading()
+      && this.compatibilityService.loadError() === null
+      && report !== null
+      && report.state === 'compatible'
+      && !report.usageTruncated
+      && report.findings.length === 0;
+  });
+
+  private readonly compatibilityUnknown = computed(() =>
+    this.integration()?.isInternal === false
+    && !this.compatibilityService.isLoading()
+    && this.compatibilityService.loadError() === null
+    && this.compatibilityReport() === null
+  );
+
+  protected readonly showIssuesCard = computed(() =>
+    this.integration()?.enabled === true && !this.issuesHealthy()
+  );
+
+  protected readonly showCompatibilityCard = computed(() =>
+    this.integration()?.isInternal === false && !this.compatibilityHealthy() && !this.compatibilityUnknown()
+  );
+
+  protected readonly statusBadges = computed<IntegrationStatusBadge[]>(() => {
+    const badges: IntegrationStatusBadge[] = [];
+    if (this.issuesHealthy()) {
+      badges.push({ id: 'issues', tier: 'ok', icon: 'check', label: this.localization.translateKey(AppStrings.Integrations.Detail.RunningCleanly) });
+    }
+    if (this.integration()?.isInternal === false) {
+      if (this.compatibilityHealthy()) {
+        badges.push({ id: 'compatibility', tier: 'ok', icon: 'check', label: this.localization.translateKey(AppStrings.Integrations.Detail.FullyCompatible) });
+      } else if (this.compatibilityUnknown()) {
+        badges.push({ id: 'compatibility', tier: 'neutral', icon: 'info', label: this.localization.translateKey(AppStrings.Integrations.Detail.NoCompatibilityData) });
+      }
+    }
+    return badges;
+  });
+
+  protected readonly offersCatalog = computed(() => {
+    const id = this.integration()?.id;
+    return !!id && this.variableCatalog.providersFor()().some(p => p.integrationId === id);
+  });
+
+  protected readonly catalogBindNode = signal<VariableCatalogNode | null>(null);
+
+  private readonly catalogIds = computed<string[]>(() => {
+    const id = this.integration()?.id;
+    return id && this.offersCatalog() ? [id] : [];
+  });
+
+  private readonly unboundExpanded = signal(false);
+
+  private readonly catalog = createVariableCatalogRows({
+    integrationIds: this.catalogIds,
+    search: this.variableSearch,
+    isExpanded: () => this.unboundExpanded(),
+  });
+
+  protected readonly variableRowHeight = VARIABLE_ROW_HEIGHT;
+  protected readonly catalogIndent = VARIABLE_ROW_INDENT;
+
+  private readonly unboundRows = computed<VariableTabRow[]>(() => {
+    const id = this.catalogIds()[0];
+    const group = id ? this.catalog.group(id) : null;
+    if (!group) {
+      return [];
+    }
+
+    const rows: VariableTabRow[] = [{
+      kind: 'unbound-header',
+      key: 'unbound',
+      count: group.count,
+      expanded: group.expanded,
+      collapsible: group.collapsible,
+    }];
+    if (group.expanded && group.state !== 'ready') {
+      rows.push({ kind: 'catalog-state', key: 'unbound-state', state: group.state });
+    }
+    rows.push(...group.rows);
+    return rows;
+  });
+
+  protected readonly variableRows = computed<VariableTabRow[]>(() => {
+    const variables: VariableTabRow[] = [
+      ...this.filteredVariables().map(variable =>
+        ({ kind: 'declared' as const, key: `declared:${variable.name}`, variable })),
+      ...this.filteredBoundVariables().map(variable =>
+        ({ kind: 'bound' as const, key: `bound:${variable.id}`, variable })),
+    ];
+    return this.catalog.searching()
+      ? [...variables, ...this.unboundRows()]
+      : [...this.unboundRows(), ...variables];
+  });
+
+  protected readonly listedVariableCount = computed(() =>
+    this.filteredVariables().length + this.filteredBoundVariables().length);
+
+  protected readonly totalVariableCount = computed(() =>
+    this.declaredVariables().length + this.boundVariables().length);
+
+  protected toggleUnbound(): void {
+    this.unboundExpanded.update(expanded => !expanded);
+  }
+
+  protected toggleCatalogBranch(node: VariableCatalogNode): void {
+    const id = this.integration()?.id;
+    if (id) {
+      this.catalog.toggleBranch(id, node);
+    }
+  }
+
+  protected growCatalog(): void {
+    const id = this.integration()?.id;
+    if (id) {
+      this.catalog.grow(id);
+    }
+  }
+
+  protected retryCatalog(): void {
+    const id = this.integration()?.id;
+    if (id) {
+      this.catalog.retry(id);
+    }
+  }
+
+  protected isCatalogBindable(node: VariableCatalogNode): boolean {
+    return this.catalog.isBindable(node);
+  }
+
+  protected catalogPrimary(node: VariableCatalogNode): string {
+    return this.catalog.reference(node) ?? this.catalog.displayName(node);
+  }
+
+  protected catalogSecondary(node: VariableCatalogNode): string | null {
+    return this.catalog.reference(node) ? this.catalog.displayName(node) : null;
+  }
+
+  protected catalogStateLabel(state: 'loading' | 'offline' | 'empty'): string {
+    const S = AppStrings.Variables.Dynamic;
+    switch (state) {
+      case 'loading':
+        return this.localization.translateKey(S.Loading);
+      case 'offline':
+        return this.localization.translateKey(S.OfflineMessage, { integration: this.integration()?.name ?? '' });
+      case 'empty':
+        return this.localization.translateKey(S.EmptyMessage);
+    }
+  }
+
+  protected catalogNoteLabel(note: 'loading' | 'not-bindable'): string {
+    const S = AppStrings.Variables.Dynamic;
+    return this.localization.translateKey(note === 'loading' ? S.Loading : S.NotBindable);
+  }
+
+  protected unboundAriaLabel(count: number | null): string | null {
+    return count === null
+      ? null
+      : this.localization.translateKey(AppStrings.Variables.Dynamic.GroupHeadingCount, { count });
+  }
+
+  protected templateChipLabel(name: string): string {
+    const placeholder = TEMPLATE_PLACEHOLDER.exec(name)?.[1];
+    return placeholder
+      ? this.localization.translateKey(AppStrings.Integrations.Detail.OnePerConfiguredPlaceholder, { placeholder })
+      : this.localization.translateKey(AppStrings.Integrations.Detail.OnePerConfiguration);
+  }
+
+  protected boundValue(variable: Variable): string {
+    const value = variable.value ?? '';
+    return variable.unit
+      ? this.localization.translateKey(AppStrings.Variables.Format.ValueWithUnit, { value, unit: variable.unit })
+      : value;
+  }
+
+  protected boundDisplayName(variable: Variable): string | null {
+    return resolveLocalizedText(variable.displayName, this.localization) || null;
+  }
+
+  protected readonly resourceUnavailableLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Variables.Dynamic.ResourceUnavailable));
+
+  protected loadMoreCatalog(parentId: string | undefined): void {
+    const id = this.integration()?.id;
+    if (id) {
+      this.catalog.loadMore(id, parentId);
+    }
+  }
+
+  protected readonly bindActionLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Variables.Dynamic.BindAction));
+
+  protected readonly unboundHint = computed(() =>
+    this.localization.translateKey(AppStrings.Variables.Dynamic.GroupHint));
+
+  protected readonly unboundHeading = computed(() =>
+    this.localization.translateKey(AppStrings.Variables.Dynamic.GroupHeading));
+
+  protected readonly retryLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Variables.Dynamic.Retry));
+
+  protected readonly loadMoreLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Variables.Dynamic.LoadMore));
+
+  protected onCatalogBindRequested(node: VariableCatalogNode): void {
+    this.catalogBindNode.set(node);
+  }
+
+  protected closeCatalogBindDialog(): void {
+    this.catalogBindNode.set(null);
+  }
+
+  protected readonly usesAdb = computed(() => this.declaresPermission(PLUGIN_PERMISSION_HOST_ADB));
+
+  protected readonly usesCompanionDevices = computed(() =>
+    this.declaresPermission(PLUGIN_PERMISSION_HOST_COMPANION_DEVICES));
+
+  private declaresPermission(permission: string): boolean {
+    const integration = this.integration();
+    return integration?.isInternal === false
+      && !!this.installation.find(integration.id)?.permissions.includes(permission);
+  }
+
+  protected readonly additionalCapabilities = computed<IpcProvidedCapability[]>(() =>
+    (this.integration()?.providedCapabilities ?? []).filter(c => !COUNTED_CAPABILITY_KINDS.includes(c.kind)));
+
+  protected readonly requiresSetup = computed(() =>
+    this.canSetUp() && this.integration()?.requiresConfiguration !== false
+      && !this.configEntries().some(entry => entry.usable !== false)
+  );
+
+  protected readonly configurationOptional = computed(() =>
+    this.canSetUp() && this.integration()?.requiresConfiguration === false && this.configEntries().length === 0
+  );
+
+  private readonly statusKind = computed<'setup' | 'disabled' | 'starting' | 'ready' | ''>(() => {
+    const integration = this.integration();
+    if (!integration) return '';
+    if (this.requiresSetup()) return 'setup';
+    if (!integration.enabled) return 'disabled';
+    if (!integration.isInitialized) return 'starting';
+    return 'ready';
+  });
+
+  protected readonly statusLabel = computed(() => {
+    switch (this.statusKind()) {
+      case 'setup': return this.localization.translateKey(AppStrings.Integrations.Detail.StatusSetupRequired);
+      case 'disabled': return this.localization.translateKey(AppStrings.Integrations.Detail.StatusDisabled);
+      case 'starting': return this.localization.translateKey(AppStrings.Integrations.Detail.StatusStarting);
+      case 'ready': return this.localization.translateKey(AppStrings.Integrations.Detail.StatusReady);
+      default: return '';
+    }
+  });
+
+  protected readonly statusClass = computed(() => {
+    switch (this.statusKind()) {
+      case 'setup': return 'status-chip-setup';
+      case 'disabled': return 'status-chip-disabled';
+      case 'starting': return 'status-chip-starting';
+      default: return 'status-chip-ready';
+    }
+  });
+
+  protected readonly declaredActions = computed<IpcIntegrationActionCapability[]>(() =>
+    this.capabilities()?.actions ?? []);
+
+  protected readonly declaredVariables = computed<IpcIntegrationVariableCapability[]>(() => {
+    const declared = this.capabilities()?.variables ?? [];
+    const id = this.integrationId();
+    const live = new Map(
+      this.variableService.variables()
+        .filter(v => v.ownerIntegrationId === id)
+        .map(v => [v.name, v] as const));
+
+    if (live.size === 0) return declared;
+
+    return declared.map(capability => {
+      // Only rows the host resolved against the registry may be refined here. The earlier branches
+      // (setup required, integration disabled, template) are lifecycle states that a value cannot
+      // contradict, and the paths that change them refetch the catalog anyway.
+      if (capability.availability !== 'Ready' && capability.availability !== 'Unavailable') {
+        return capability;
+      }
+
+      const match = live.get(capability.name);
+      if (!match) return capability;
+
+      const available = match.available ?? true;
+      return {
+        ...capability,
+        value: available ? match.value : capability.value,
+        valueAvailable: available,
+        availability: available ? 'Ready' : 'Unavailable',
+        availabilityReason: available ? 'Ready' : 'Unavailable',
+      };
+    });
+  });
+
+  protected readonly actionsCount = computed(() =>
+    this.capabilities()?.actions.length ?? this.integration()?.actionCount ?? 0);
+
+  protected readonly variablesCount = computed(() =>
+    (this.capabilities()?.variables.length ?? this.integration()?.variableCount ?? 0) + this.boundVariables().length);
+
+  protected readonly tabs = computed<TabItem[]>(() => [
+    { id: 'overview', label: this.localization.translateKey(AppStrings.Integrations.Detail.OverviewTab) },
+    { id: 'actions', label: this.localization.translateKey(AppStrings.Integrations.Detail.ActionsTab), badge: this.actionsCount() },
+    { id: 'variables', label: this.localization.translateKey(AppStrings.Integrations.Detail.VariablesTab), badge: this.variablesCount() },
+  ]);
+
+  protected readonly filteredActions = computed<IpcIntegrationActionCapability[]>(() => {
+    const query = this.actionSearch().trim().toLowerCase();
+    const actions = this.declaredActions();
+    if (!query) return actions;
+    return actions.filter(a =>
+      resolveLocalizedText(a.name, this.localization).toLowerCase().includes(query)
+      || resolveLocalizedText(a.description, this.localization).toLowerCase().includes(query));
+  });
+
+  protected readonly filteredVariables = computed<IpcIntegrationVariableCapability[]>(() => {
+    const query = this.variableSearch().trim().toLowerCase();
+    const variables = this.declaredVariables();
+    if (!query) return variables;
+    return variables.filter(v => `vars.${v.name}`.toLowerCase().includes(query));
+  });
+
+  protected readonly boundVariables = computed<Variable[]>(() => {
+    const id = this.integrationId();
+    const declared = new Set(this.declaredVariables().map(v => v.name));
+    return this.variableService.variables().filter(v =>
+      v.ownerIntegrationId === id && !!v.dynamicResourceId && v.scope === 'global' && !declared.has(v.name));
+  });
+
+  protected readonly filteredBoundVariables = computed<Variable[]>(() => {
+    const query = this.variableSearch().trim().toLowerCase();
+    const variables = this.boundVariables();
+    if (!query) return variables;
+    return variables.filter(v => `vars.${v.name}`.toLowerCase().includes(query));
+  });
+
+  constructor() {
+    // The event carries the full issue list, so applying it directly here means the page never has
+    // to refetch to stay current with a provider's own unprompted state change (issue #229).
+    this.api.onNotification<IntegrationIssuesChangedEvent>('IntegrationIssuesChangedEvent')
+      .pipe(takeUntilDestroyed())
+      .subscribe(event => {
+        if (event.integrationId !== this.integrationId()) {
+          return;
+        }
+
+        this.issues.set(event.issues);
+        this.issuesError.set(null);
+      });
+
+    this.api.onNotification<IntegrationsChangedEvent>('IntegrationsChangedEvent')
+      .pipe(takeUntilDestroyed())
+      .subscribe(event => {
+        if (event.integrationId === this.integrationId()) {
+          void this.loadCapabilities();
+        }
+      });
+
+    // Connection states may change without a configuration mutation. Exhausting rather than
+    // overlapping requests keeps a slow/offline OBS endpoint from building up refresh work.
+    timer(2000, 2000)
+      .pipe(
+        exhaustMap(() => from(this.loadConfigEntries()).pipe(catchError(() => EMPTY))),
+        takeUntilDestroyed(),
+      )
+      .subscribe();
+  }
+
+  protected readonly setUpLabel = computed(() => {
+    const integration = this.integration();
+    if (integration?.allowsMultipleConfigurations) {
+      return this.localization.translateKey(AppStrings.Integrations.Detail.AddConfigurationAction);
+    }
+    const reconfiguring = !integration?.allowsMultipleConfigurations && this.configEntries().length > 0;
+    return this.localization.translateKey(
+      reconfiguring ? AppStrings.Integrations.Detail.ReconfigureAction : AppStrings.Integrations.Detail.SetUpAction
+    );
+  });
+
+  async ngOnInit(): Promise<void> {
+    this.integrationId.set(this.route.snapshot.paramMap.get('integrationId') ?? '');
+    const navigation = this.router.currentNavigation() ?? this.router.lastSuccessfulNavigation();
+    this.openedFromStore.set(isStoreDetailUrl(navigation?.previousNavigation?.finalUrl?.toString()));
+
+    const initialTab = this.route.snapshot.queryParamMap.get('tab');
+    if (initialTab === 'actions' || initialTab === 'variables') {
+      this.activeTab.set(initialTab);
+    }
+
+    if (this.integrationService.integrations().length === 0) {
+      await this.integrationService.loadIntegrations();
+    }
+
+    void this.loadStoreListing();
+    void this.installation.load();
+    await this.loadConfigEntries();
+    await this.loadIssues();
+    await this.loadCapabilities();
+    // Fire-and-forget: the card renders its own loading/empty states, and this cache is shared with
+    // the Developer tab's Compatibility tab, so a visit there already primes it.
+    void this.compatibilityService.load();
+  }
+
+  goBack(): void {
+    if (this.openedFromStore()) {
+      this.location.back();
+      return;
+    }
+    void this.router.navigate(['/integrations']);
+  }
+
+  protected requestUninstall(): void {
+    this.uninstallDeleteData.set(false);
+    this.uninstallOpen.set(true);
+  }
+
+  protected cancelUninstall(): void {
+    this.uninstallOpen.set(false);
+  }
+
+  protected async confirmUninstall(): Promise<void> {
+    const integration = this.integration();
+    if (!integration) {
+      return;
+    }
+
+    this.uninstallBusy.set(true);
+    const keepData = !this.uninstallDeleteData();
+    const result = await this.installation.uninstall(integration.id, keepData).catch(() => null);
+    this.uninstallBusy.set(false);
+
+    if (!result?.success) {
+      this.toasts.show(this.localization.translateKey(AppStrings.Integrations.Page.UninstallFailed), {
+        detail: result?.error?.message,
+        variant: 'error',
+      });
+      return;
+    }
+
+    this.uninstallOpen.set(false);
+    this.toasts.show(this.localization.translateKey(AppStrings.Integrations.Page.Uninstalled, { name: integration.name }), { variant: 'success' });
+    await this.integrationService.loadIntegrations();
+    void this.router.navigate(['/integrations']);
+  }
+
+  protected openInStore(): void {
+    void this.router.navigate(['/store', 'Plugin', this.integrationId()]);
+  }
+
+  private async loadStoreListing(): Promise<void> {
+    const id = this.integrationId();
+    if (!id || this.integration()?.isInternal) {
+      return;
+    }
+    try {
+      const response = await this.api.getStoreExtension('Plugin', id);
+      this.showStoreLink.set(!!response.extension && id === this.integrationId());
+    } catch {
+      this.showStoreLink.set(false);
+    }
+  }
+
+  iconUrl(): string | null {
+    const integration = this.integration();
+    return integration?.hasIcon ? this.api.getIntegrationIconUrl(integration.id, integration.iconVersion) : null;
+  }
+
+  onTabChange(id: string): void {
+    const tab = id as DetailTab;
+    this.activeTab.set(tab);
+    void this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { tab: tab === 'overview' ? null : tab },
+      queryParamsHandling: 'merge',
+      replaceUrl: true,
+    });
+  }
+
+  onToggle(toggle: ToggleSwitchComponent): void {
+    const integration = this.integration();
+    // The switch flips itself on click; revert it for the branches that don't change the
+    // enabled state directly, so the toggle never gets stuck out of sync with reality.
+    if (!integration) {
+      return;
+    }
+
+    if (integration.enabled) {
+      toggle.checked = true;
+      this.showDisableConfirm.set(true);
+      return;
+    }
+
+    if (this.requiresSetup()) {
+      toggle.checked = false;
+      const legacy = this.configEntries().find(entry => entry.usable === false);
+      if (legacy) {
+        this.openConfigurationFlow(legacy.id);
+      } else {
+        this.onConfigure();
+      }
+      return;
+    }
+
+    void this.toggleAndRefresh(integration.id);
+  }
+
+  async confirmDisable(): Promise<void> {
+    this.showDisableConfirm.set(false);
+    const integration = this.integration();
+    if (integration) {
+      await this.toggleAndRefresh(integration.id);
+    }
+  }
+
+  private async toggleAndRefresh(integrationId: string): Promise<void> {
+    await this.integrationService.toggleIntegration(integrationId);
+    await this.loadIssues();
+    await this.loadCapabilities();
+  }
+
+  cancelDisable(): void {
+    this.showDisableConfirm.set(false);
+  }
+
+  onConfigure(): void {
+    const integration = this.integration();
+    if (!integration) return;
+
+    this.openConfigurationFlow(
+      integration.allowsMultipleConfigurations ? null : this.configEntries()[0]?.id ?? null,
+    );
+  }
+
+  onEditEntry(entry: ConfigEntryDto): void {
+    this.openConfigurationFlow(entry.id);
+  }
+
+  onRenameEntry(entry: ConfigEntryDto): void {
+    this.configurationName.set(entry.title);
+    this.configurationNameTarget.set(entry);
+  }
+
+  cancelConfigurationName(): void {
+    this.configurationNameTarget.set(null);
+  }
+
+  async submitConfigurationName(): Promise<void> {
+    const title = this.configurationName().trim();
+    if (!title || this.configurationMutationPending()) return;
+
+    const integration = this.integration();
+    const entry = this.configurationNameTarget();
+    if (!integration || !entry) return;
+
+    this.configurationMutationPending.set(true);
+    try {
+      const response = await this.api.renameConfigEntry(integration.id, entry.id, title);
+      if (!response.success) {
+        this.toasts.show(response.error?.message ?? this.localization.translateKey(AppStrings.Integrations.Detail.ConfigurationMutationFailed), { variant: 'error' });
+        return;
+      }
+      this.cancelConfigurationName();
+      await this.refreshAfterConfigurationMutation();
+    } finally {
+      this.configurationMutationPending.set(false);
+    }
+  }
+
+  private openConfigurationFlow(entryId: string | null): void {
+    this.configuringEntryId.set(entryId);
+    this.configuring.set(true);
+  }
+
+  async onConfigFlowClosed(completed: boolean): Promise<void> {
+    this.configuring.set(false);
+    this.configuringEntryId.set(null);
+    if (completed) {
+      await this.integrationService.loadIntegrations();
+      await this.loadConfigEntries();
+      await this.loadIssues();
+      await this.loadCapabilities();
+    }
+  }
+
+  async onResolveIssue(issue: IpcIntegrationIssue): Promise<void> {
+    const integration = this.integration();
+    if (!integration || this.resolvingIssueId()) {
+      return;
+    }
+
+    this.resolvingIssueId.set(issue.id);
+    try {
+      const response = await this.api.resolveIntegrationIssue(integration.id, issue.id);
+      if (response.followUp === 'StartConfigFlow') {
+        this.onConfigure();
+        return;
+      }
+      // What the action actually achieved is only in the response - a permission may have been
+      // granted, a prompt raised, or System Settings opened - and dropping it left the button
+      // looking like it did nothing at all (issue #706).
+      const message = resolveLocalizedText(response.message, this.localization);
+      if (message) {
+        this.toasts.show(message, { variant: response.success ? 'success' : 'error' });
+      }
+      await this.integrationService.loadIntegrations();
+      await this.loadIssues();
+      await this.loadCapabilities();
+    } finally {
+      this.resolvingIssueId.set(null);
+    }
+  }
+
+  private async loadIssues(): Promise<void> {
+    const integration = this.integration();
+    if (!integration?.enabled) {
+      this.issues.set([]);
+      this.issuesLoading.set(false);
+      this.issuesError.set(null);
+      return;
+    }
+
+    this.issuesLoading.set(true);
+    this.issuesError.set(null);
+    try {
+      const response = await this.api.getIntegrationIssues(integration.id);
+      this.issues.set(response.issues);
+    } catch (error) {
+      // A failed load must not silently blank the list - that would read as "no issues" when the
+      // truth is "we don't know".
+      console.error('Failed to load integration issues:', error);
+      this.issuesError.set(this.localization.translateKey(AppStrings.Integrations.Detail.LoadIssuesFailed));
+    } finally {
+      this.issuesLoading.set(false);
+    }
+  }
+
+  private async loadCapabilities(): Promise<void> {
+    const id = this.integrationId();
+    if (!id) {
+      return;
+    }
+
+    const request = ++this.capabilitiesRequest;
+    const hasSnapshot = this.capabilities() !== null;
+    if (!hasSnapshot) {
+      this.capabilitiesLoading.set(true);
+    }
+    this.capabilitiesError.set(null);
+    try {
+      const response = await this.api.getIntegrationCapabilities(id);
+      if (request === this.capabilitiesRequest) {
+        this.capabilities.set(response);
+      }
+    } catch (error) {
+      // Same rule as the issue list: a failed load must not render as an empty catalog, which would
+      // read as "this integration declares nothing" when the truth is "we don't know".
+      console.error('Failed to load integration capabilities:', error);
+      if (request === this.capabilitiesRequest && !hasSnapshot) {
+        this.capabilitiesError.set(this.localization.translateKey(AppStrings.Integrations.Detail.LoadCapabilitiesFailed));
+      }
+    } finally {
+      if (request === this.capabilitiesRequest) {
+        this.capabilitiesLoading.set(false);
+      }
+    }
+  }
+
+  onRemoveEntry(entry: ConfigEntryDto): void {
+    this.pendingRemove.set(entry);
+  }
+
+  cancelRemoveEntry(): void {
+    this.pendingRemove.set(null);
+  }
+
+  async confirmRemoveEntry(): Promise<void> {
+    const integration = this.integration();
+    const entry = this.pendingRemove();
+    if (!integration || !entry || this.configurationMutationPending()) {
+      return;
+    }
+
+    this.pendingRemove.set(null);
+    this.configurationMutationPending.set(true);
+    try {
+      const response = await this.api.deleteConfigEntry(integration.id, entry.id, true);
+      if (!response.success) {
+        this.toasts.show(response.error?.message ?? this.localization.translateKey(AppStrings.Integrations.Detail.ConfigurationMutationFailed), { variant: 'error' });
+        return;
+      }
+      await this.refreshAfterConfigurationMutation();
+    } finally {
+      this.configurationMutationPending.set(false);
+    }
+  }
+
+  protected configurationStatusLabel(entry: ConfigEntryDto): string {
+    const key = {
+      Connected: AppStrings.Integrations.Detail.ConfigStatusConnected,
+      Connecting: AppStrings.Integrations.Detail.ConfigStatusConnecting,
+      Reconnecting: AppStrings.Integrations.Detail.ConfigStatusReconnecting,
+      Disconnected: AppStrings.Integrations.Detail.ConfigStatusDisconnected,
+      NeedsReconfiguration: AppStrings.Integrations.Detail.ConfigStatusNeedsReconfiguration,
+      Ready: AppStrings.Integrations.Detail.ConfigStatusReady,
+    }[entry.status ?? 'Ready'];
+    return this.localization.translateKey(key);
+  }
+
+  protected configurationStatusClass(entry: ConfigEntryDto): string {
+    if (!entry.status || entry.status === 'Connected' || entry.status === 'Ready') return 'config-status-ok';
+    if (entry.status === 'NeedsReconfiguration' || entry.status === 'Disconnected') return 'config-status-warning';
+    return 'config-status-pending';
+  }
+
+  private async refreshAfterConfigurationMutation(): Promise<void> {
+    await this.integrationService.loadIntegrations();
+    await this.loadConfigEntries();
+    await this.loadIssues();
+    await this.loadCapabilities();
+  }
+
+  tryInDeveloper(action: IpcIntegrationActionCapability): void {
+    if (action.availability !== 'Ready') {
+      return;
+    }
+    const integration = this.integration();
+    if (!integration) {
+      return;
+    }
+    void this.router.navigate(['/developer'], {
+      queryParams: { integrationId: integration.id, actionId: action.id },
+    });
+  }
+
+  private async loadConfigEntries(): Promise<void> {
+    const integration = this.integration();
+    if (!integration?.supportsConfigFlow) {
+      this.configEntries.set([]);
+      return;
+    }
+
+    const response = await this.api.getConfigEntries(integration.id);
+    this.configEntries.set(response.entries);
+  }
+}

@@ -1,0 +1,1533 @@
+asyncapi: 3.0.0
+
+info:
+  title: Macro Deck plugin protocol - WebSocket envelope
+  version: "1"
+  description: >-
+    The message envelope exchanged over the plugin WebSocket transport after the REST session
+    exchange documented in openapi.yaml. Delivery is at-most-once, with no sequence numbers and no
+    replay buffer - safety on retry comes from idempotencyKey, not from the transport.
+
+# Drift anchor: MacroDeck.Plugin.Protocol.Versioning.ProtocolVersions
+x-macrodeck-protocol-versions:
+  minimum: 1
+  current: 3
+  supported: [1, 2, 3]
+
+# Drift anchor: MacroDeck.Plugin.Protocol.Errors.ProtocolErrorCodes.All
+x-macrodeck-error-codes:
+  - PROTOCOL_VERSION_UNSUPPORTED
+  - UNKNOWN_MESSAGE_TYPE
+  - MALFORMED_ENVELOPE
+  - INVALID_PAYLOAD
+  - UNAUTHENTICATED
+  - PLUGIN_ALREADY_REGISTERED
+  - SESSION_EXPIRED
+  - SESSION_NOT_RESUMABLE
+  - SESSION_REPLACED
+  - SESSION_NOT_FOUND
+  - CAPABILITY_UNSUPPORTED
+  - CAPABILITY_UNAVAILABLE
+  - PAYLOAD_TOO_LARGE
+  - ASSET_TOO_LARGE
+  - QUEUE_OVERFLOW
+  - RATE_LIMITED
+  - TIMEOUT
+  - CANCELLED
+  - CORRELATION_UNKNOWN
+  - DUPLICATE_IDEMPOTENCY_KEY
+  - INTERNAL_ERROR
+  - ADB_NOT_ENABLED
+  - ADB_NOT_ALLOWED
+  - ADB_FAILED
+  - UI_RESOURCE_QUOTA_EXCEEDED
+  - PLUGIN_ICON_NOT_FOUND
+  - ICON_PACK_INVALID
+  - ICON_PACK_SYNC_NOT_ALLOWED
+  - ICON_NOT_FOUND
+  - COMPANION_DEVICES_NOT_ALLOWED
+  - DESKTOP_NOTIFICATIONS_NOT_ALLOWED
+
+# Drift anchor: MacroDeck.Plugin.Protocol.Errors.ProtocolCloseCodes
+x-macrodeck-close-codes:
+  queueOverflow: 1013
+  sessionReplaced: 4000
+  protocolVersionUnsupported: 4001
+  sessionExpired: 4002
+  authenticationFailed: 4003
+  supervisorShutdown: 4004
+  registrationRejected: 4005
+
+# Drift anchor: message types for which MacroDeck.Plugin.Protocol.Limits.ProtocolBackpressure.IsExemptWhilePaused
+# returns true - these keep flowing while a flow.pause is in effect because they drain the peer's
+# queue rather than growing it.
+x-macrodeck-backpressure-exempt-types:
+  - capability.result
+  - capability.declare.ack
+  - asset.ack
+  - host.asset.ack
+  - session.ping
+  - session.pong
+  - session.goodbye
+  - flow.pause
+  - flow.resume
+  - capability.cancel
+  - protocol.error
+  - host.invoke
+  - host.result
+  - host.cancel
+
+# Drift anchor: MacroDeck.Plugin.Protocol.Callbacks.HostApis.All and HostOperations.For - the api and
+# operation values a host.invoke may carry. A host that predates an api or operation answers
+# CAPABILITY_UNSUPPORTED.
+x-macrodeck-host-operations:
+  variables: [list, get, create, set, delete, refresh, history.open, history.read, history.close, bind]
+  user-variables: [apply, create]
+  config: [entries, get-string, get-secret, set-string, set-secret]
+  deck: [change-folder, change-profile, parent, back]
+  scripts: [run]
+  widgets: [apply, invalidate-icon, get-data]
+  notifications: [notify, dismiss, show, update, close]
+  action-interactions: [request-item-picker, request-device-picker, show-modal]
+  ui: [snapshot, patch, fault, reload, register-resource, remove-resource, register-music-player-artwork, origin.report-failure, origin.show-modal, origin.open-url,
+    report-parameter-values]
+  devices: [register, update, presence, unregister, interaction, icon, widget-icon, close]
+  variable-values: [value, invalidate]
+  layouts: [register, unregister]
+  folder-views: [register, unregister]
+  widget-types: [register, unregister]
+  event-bindings: []
+  screensavers: [register, unregister]
+  adb: [shell, battery, push, pull, install, uninstall, package-installed, connect, key, tap, swipe, input-text,
+    start-app, force-stop-app, open-uri, reboot, screenshot, status]
+  messaging: [publish, send, request, subscriptions]
+  icon-packs: [sync-bundled, get-icon-resource, get-icon]
+  video-streams: [providers-changed, streams-changed, session-update, session-close]
+  colors: [resolve, watches]
+  batteries: [publish, remove, sync, withdraw]
+  weather: [snapshots-changed]
+  locale: [time-of-day-format]
+  http: []
+  companion-devices: [wait, send, request, screenshot]
+  music-players: [album-color]
+  desktop-notifications: [show]
+
+# Drift anchor: MacroDeck.Plugin.Protocol.Assets.AssetKinds.All - the kind values an asset.begin may carry.
+x-macrodeck-asset-kinds:
+  - icon
+  - artwork
+  - action-icon
+  - ui-resource
+  - icon-pack
+  - android-screenshot
+  - companion-screenshot
+
+defaultContentType: application/json
+
+servers:
+  pluginHost:
+    host: "{host}:{port}"
+    pathname: /plugins/ws
+    protocol: ws
+    description: >-
+      Reachable on both the public listener and the private loopback listener, but only from a
+      loopback remote address - local processes only. The session token obtained from POST
+      /api/plugins/sessions is presented as an Authorization: Bearer header on the upgrade
+      request; the WebSocket subprotocol macrodeck.plugin.v1 is negotiated via
+      Sec-WebSocket-Protocol.
+    variables:
+      host:
+        default: localhost
+      port:
+        default: "8193"
+
+channels:
+  pluginWebSocket:
+    address: /plugins/ws
+    description: >-
+      A single full-duplex channel. Every message on it, in either direction, is one
+      ProtocolEnvelope carrying exactly one of the message types below in its type field.
+    bindings:
+      ws:
+        method: GET
+        headers:
+          type: object
+          properties:
+            Sec-WebSocket-Protocol:
+              type: string
+              const: macrodeck.plugin.v1
+              description: >-
+                Drift anchor: MacroDeck.Plugin.Protocol.ProtocolConstants.WebSocketSubProtocol.
+            Authorization:
+              type: string
+              description: "Bearer <sessionToken>, scope \"plugin\"."
+    messages:
+      sessionHello:
+        $ref: "#/components/messages/sessionHello"
+      sessionWelcome:
+        $ref: "#/components/messages/sessionWelcome"
+      sessionGoodbye:
+        $ref: "#/components/messages/sessionGoodbye"
+      sessionPing:
+        $ref: "#/components/messages/sessionPing"
+      sessionPong:
+        $ref: "#/components/messages/sessionPong"
+      capabilityDeclare:
+        $ref: "#/components/messages/capabilityDeclare"
+      capabilityDeclareAck:
+        $ref: "#/components/messages/capabilityDeclareAck"
+      capabilityInvoke:
+        $ref: "#/components/messages/capabilityInvoke"
+      capabilityResult:
+        $ref: "#/components/messages/capabilityResult"
+      capabilityCancel:
+        $ref: "#/components/messages/capabilityCancel"
+      hostInvoke:
+        $ref: "#/components/messages/hostInvoke"
+      hostResult:
+        $ref: "#/components/messages/hostResult"
+      hostCancel:
+        $ref: "#/components/messages/hostCancel"
+      hostState:
+        $ref: "#/components/messages/hostState"
+      eventPublish:
+        $ref: "#/components/messages/eventPublish"
+      logPublish:
+        $ref: "#/components/messages/logPublish"
+      stateUpdate:
+        $ref: "#/components/messages/stateUpdate"
+      assetBegin:
+        $ref: "#/components/messages/assetBegin"
+      assetChunk:
+        $ref: "#/components/messages/assetChunk"
+      assetCommit:
+        $ref: "#/components/messages/assetCommit"
+      assetAck:
+        $ref: "#/components/messages/assetAck"
+      hostAssetBegin:
+        $ref: "#/components/messages/hostAssetBegin"
+      hostAssetChunk:
+        $ref: "#/components/messages/hostAssetChunk"
+      hostAssetCommit:
+        $ref: "#/components/messages/hostAssetCommit"
+      hostAssetAck:
+        $ref: "#/components/messages/hostAssetAck"
+      flowPause:
+        $ref: "#/components/messages/flowPause"
+      flowResume:
+        $ref: "#/components/messages/flowResume"
+      protocolError:
+        $ref: "#/components/messages/protocolError"
+
+operations:
+  sendToHost:
+    action: send
+    channel:
+      $ref: "#/channels/pluginWebSocket"
+    summary: Messages a plugin sends. Includes bidirectional types when the plugin is the sender.
+    messages:
+      - $ref: "#/channels/pluginWebSocket/messages/sessionHello"
+      - $ref: "#/channels/pluginWebSocket/messages/sessionGoodbye"
+      - $ref: "#/channels/pluginWebSocket/messages/sessionPing"
+      - $ref: "#/channels/pluginWebSocket/messages/sessionPong"
+      - $ref: "#/channels/pluginWebSocket/messages/capabilityDeclare"
+      - $ref: "#/channels/pluginWebSocket/messages/capabilityResult"
+      - $ref: "#/channels/pluginWebSocket/messages/hostInvoke"
+      - $ref: "#/channels/pluginWebSocket/messages/hostCancel"
+      - $ref: "#/channels/pluginWebSocket/messages/eventPublish"
+      - $ref: "#/channels/pluginWebSocket/messages/logPublish"
+      - $ref: "#/channels/pluginWebSocket/messages/stateUpdate"
+      - $ref: "#/channels/pluginWebSocket/messages/assetBegin"
+      - $ref: "#/channels/pluginWebSocket/messages/assetChunk"
+      - $ref: "#/channels/pluginWebSocket/messages/assetCommit"
+      - $ref: "#/channels/pluginWebSocket/messages/hostAssetAck"
+      - $ref: "#/channels/pluginWebSocket/messages/flowPause"
+      - $ref: "#/channels/pluginWebSocket/messages/flowResume"
+      - $ref: "#/channels/pluginWebSocket/messages/protocolError"
+  sendToPlugin:
+    action: send
+    channel:
+      $ref: "#/channels/pluginWebSocket"
+    summary: Messages the host sends. Includes bidirectional types when the host is the sender.
+    messages:
+      - $ref: "#/channels/pluginWebSocket/messages/sessionWelcome"
+      - $ref: "#/channels/pluginWebSocket/messages/sessionGoodbye"
+      - $ref: "#/channels/pluginWebSocket/messages/sessionPing"
+      - $ref: "#/channels/pluginWebSocket/messages/sessionPong"
+      - $ref: "#/channels/pluginWebSocket/messages/capabilityDeclareAck"
+      - $ref: "#/channels/pluginWebSocket/messages/capabilityInvoke"
+      - $ref: "#/channels/pluginWebSocket/messages/capabilityCancel"
+      - $ref: "#/channels/pluginWebSocket/messages/hostResult"
+      - $ref: "#/channels/pluginWebSocket/messages/hostState"
+      - $ref: "#/channels/pluginWebSocket/messages/assetAck"
+      - $ref: "#/channels/pluginWebSocket/messages/hostAssetBegin"
+      - $ref: "#/channels/pluginWebSocket/messages/hostAssetChunk"
+      - $ref: "#/channels/pluginWebSocket/messages/hostAssetCommit"
+      - $ref: "#/channels/pluginWebSocket/messages/flowPause"
+      - $ref: "#/channels/pluginWebSocket/messages/flowResume"
+      - $ref: "#/channels/pluginWebSocket/messages/protocolError"
+
+components:
+  messages:
+    sessionHello:
+      x-macrodeck-message-type: session.hello
+      x-macrodeck-direction: pluginToHost
+      summary: >-
+        Asserts the already-negotiated version and session id. Never re-negotiates - a mismatch is
+        PROTOCOL_VERSION_UNSUPPORTED and closes the socket.
+      payload:
+        $ref: "#/components/schemas/SessionHelloPayload"
+
+    sessionWelcome:
+      x-macrodeck-message-type: session.welcome
+      x-macrodeck-direction: hostToPlugin
+      summary: The host's reply to session.hello.
+      payload:
+        $ref: "#/components/schemas/SessionWelcomePayload"
+
+    sessionGoodbye:
+      x-macrodeck-message-type: session.goodbye
+      x-macrodeck-direction: bidirectional
+      summary: Voluntary teardown. Makes the session non-resumable at once.
+      payload:
+        $ref: "#/components/schemas/SessionGoodbyePayload"
+
+    sessionPing:
+      x-macrodeck-message-type: session.ping
+      x-macrodeck-direction: bidirectional
+      summary: Keep-alive probe.
+      payload:
+        type: object
+
+    sessionPong:
+      x-macrodeck-message-type: session.pong
+      x-macrodeck-direction: bidirectional
+      summary: Keep-alive reply.
+      payload:
+        type: object
+
+    capabilityDeclare:
+      x-macrodeck-message-type: capability.declare
+      x-macrodeck-direction: pluginToHost
+      summary: Declares the plugin's capability catalogue.
+      payload:
+        $ref: "#/components/schemas/CapabilityDeclarePayload"
+
+    capabilityDeclareAck:
+      x-macrodeck-message-type: capability.declare.ack
+      x-macrodeck-direction: hostToPlugin
+      summary: Acknowledges a capability declaration with the per-capability negotiation result.
+      payload:
+        $ref: "#/components/schemas/CapabilityDeclareAckPayload"
+
+    capabilityInvoke:
+      x-macrodeck-message-type: capability.invoke
+      x-macrodeck-direction: hostToPlugin
+      summary: Invokes one declared capability.
+      payload:
+        $ref: "#/components/schemas/CapabilityInvokePayload"
+
+    capabilityResult:
+      x-macrodeck-message-type: capability.result
+      x-macrodeck-direction: pluginToHost
+      summary: The result of a capability.invoke. Exempt from backpressure - it drains the invoker's queue.
+      payload:
+        $ref: "#/components/schemas/CapabilityResultPayload"
+
+    capabilityCancel:
+      x-macrodeck-message-type: capability.cancel
+      x-macrodeck-direction: hostToPlugin
+      summary: Best-effort cancellation. A no-op against an unknown correlation, never an error.
+      payload:
+        $ref: "#/components/schemas/CapabilityCancelPayload"
+
+    hostInvoke:
+      x-macrodeck-message-type: host.invoke
+      x-macrodeck-direction: pluginToHost
+      summary: >-
+        A plugin calling a host API - the reverse direction of capability.invoke. Exempt from
+        backpressure alongside host.result and host.cancel: a plugin handler blocked on host.result
+        while its host.invoke sits behind a flow.pause would live-lock.
+      payload:
+        $ref: "#/components/schemas/HostInvokePayload"
+
+    hostResult:
+      x-macrodeck-message-type: host.result
+      x-macrodeck-direction: hostToPlugin
+      summary: The result of a host.invoke. Exempt from backpressure - it drains the invoker's queue.
+      payload:
+        $ref: "#/components/schemas/HostResultPayload"
+
+    hostCancel:
+      x-macrodeck-message-type: host.cancel
+      x-macrodeck-direction: pluginToHost
+      summary: Best-effort cancellation of a host.invoke. A no-op against an unknown correlation, never an error.
+      payload:
+        $ref: "#/components/schemas/HostCancelPayload"
+
+    hostState:
+      x-macrodeck-message-type: host.state
+      x-macrodeck-direction: hostToPlugin
+      summary: The host pushing the list a plugin's synchronous API members serve from.
+      payload:
+        $ref: "#/components/schemas/HostStatePayload"
+
+    eventPublish:
+      x-macrodeck-message-type: event.publish
+      x-macrodeck-direction: pluginToHost
+      summary: Publishes a domain event.
+      payload:
+        $ref: "#/components/schemas/EventPublishPayload"
+
+    logPublish:
+      x-macrodeck-message-type: log.publish
+      x-macrodeck-direction: pluginToHost
+      summary: Forwards a batch of structured log events from the plugin's own sink.
+      payload:
+        $ref: "#/components/schemas/LogPublishPayload"
+
+    stateUpdate:
+      x-macrodeck-message-type: state.update
+      x-macrodeck-direction: pluginToHost
+      summary: >-
+        Pushes a state change. Means "this kind's snapshot is stale, re-describe it" - deliberately
+        not data-carrying.
+      payload:
+        $ref: "#/components/schemas/StateUpdatePayload"
+
+    assetBegin:
+      x-macrodeck-message-type: asset.begin
+      x-macrodeck-direction: pluginToHost
+      summary: Starts a chunked asset upload.
+      payload:
+        $ref: "#/components/schemas/AssetBeginPayload"
+
+    assetChunk:
+      x-macrodeck-message-type: asset.chunk
+      x-macrodeck-direction: pluginToHost
+      summary: >-
+        One chunk of an asset upload, carrying an explicit index - ordering cannot be inherited
+        from an at-most-once transport with no cross-resume ordering.
+      payload:
+        $ref: "#/components/schemas/AssetChunkPayload"
+
+    assetCommit:
+      x-macrodeck-message-type: asset.commit
+      x-macrodeck-direction: pluginToHost
+      summary: Finalises a chunked asset upload.
+      payload:
+        $ref: "#/components/schemas/AssetCommitPayload"
+
+    assetAck:
+      x-macrodeck-message-type: asset.ack
+      x-macrodeck-direction: hostToPlugin
+      summary: Acknowledges an asset.begin, asset.chunk or asset.commit. Exempt from backpressure.
+      payload:
+        $ref: "#/components/schemas/AssetAckPayload"
+
+    hostAssetBegin:
+      x-macrodeck-message-type: host.asset.begin
+      x-macrodeck-direction: hostToPlugin
+      summary: >-
+        Starts a chunked host-to-plugin asset upload - a separate pipeline from asset.begin kept apart
+        so that type's plugin-to-host direction never changes.
+      payload:
+        $ref: "#/components/schemas/HostAssetBeginPayload"
+
+    hostAssetChunk:
+      x-macrodeck-message-type: host.asset.chunk
+      x-macrodeck-direction: hostToPlugin
+      summary: One chunk of a host-to-plugin asset upload started by host.asset.begin.
+      payload:
+        $ref: "#/components/schemas/HostAssetChunkPayload"
+
+    hostAssetCommit:
+      x-macrodeck-message-type: host.asset.commit
+      x-macrodeck-direction: hostToPlugin
+      summary: Finalises a host-to-plugin chunked asset upload.
+      payload:
+        $ref: "#/components/schemas/HostAssetCommitPayload"
+
+    hostAssetAck:
+      x-macrodeck-message-type: host.asset.ack
+      x-macrodeck-direction: pluginToHost
+      summary: >-
+        Acknowledges a host.asset.begin, host.asset.chunk or host.asset.commit. Exempt from
+        backpressure.
+      payload:
+        $ref: "#/components/schemas/HostAssetAckPayload"
+
+    flowPause:
+      x-macrodeck-message-type: flow.pause
+      x-macrodeck-direction: bidirectional
+      summary: Requests the peer stop sending non-exempt message types.
+      payload:
+        $ref: "#/components/schemas/BackpressurePayload"
+
+    flowResume:
+      x-macrodeck-message-type: flow.resume
+      x-macrodeck-direction: bidirectional
+      summary: Lifts a prior flow.pause.
+      payload:
+        $ref: "#/components/schemas/BackpressurePayload"
+
+    protocolError:
+      x-macrodeck-message-type: protocol.error
+      x-macrodeck-direction: bidirectional
+      summary: >-
+        Carries a ProtocolError. Correlation is conditional on whether it answers a specific
+        message, so it is deliberately excluded from the static per-type correlation predicate.
+      payload:
+        type: object
+
+  schemas:
+    ProtocolEnvelope:
+      type: object
+      description: >-
+        The one shape every message on the wire takes. payload and error are mutually exclusive.
+        Unknown optional fields are ignored on read, never echoed back.
+      required:
+        - type
+        - id
+      properties:
+        type:
+          type: string
+          description: "<domain>.<verb>, e.g. capability.invoke."
+        id:
+          type: string
+          description: UUIDv7, minted by the sender.
+        correlationId:
+          type: string
+        sentAt:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC. Informational only - clocks differ between host and plugin process.
+        protocolVersion:
+          type: integer
+        deadlineMs:
+          type: integer
+        idempotencyKey:
+          type: string
+          maxLength: 128
+        payload:
+          type: object
+        error:
+          $ref: "#/components/schemas/ProtocolError"
+
+    ProtocolError:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Errors.ProtocolError.
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties:
+            type: string
+        retryable:
+          type: boolean
+
+    SessionHelloPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Handshake.SessionHelloPayload.
+      required: [protocolVersion, sessionId]
+      properties:
+        protocolVersion:
+          type: integer
+        sessionId:
+          type: string
+        resumeSessionId:
+          type: string
+        instanceId:
+          type: string
+
+    SessionWelcomePayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Handshake.SessionWelcomePayload.
+      required: [sessionId, resumed]
+      properties:
+        sessionId:
+          type: string
+        resumed:
+          type: boolean
+
+    SessionGoodbyePayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Handshake.SessionGoodbyePayload.
+      properties:
+        reason:
+          type: string
+
+    BackpressurePayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Limits.BackpressurePayload.
+      required: [reason]
+      properties:
+        reason:
+          type: string
+        resumeAfterMs:
+          type: integer
+
+    CapabilityVersionRange:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Versioning.CapabilityVersionRange.
+      required: [minimum, maximum]
+      properties:
+        minimum:
+          type: integer
+        maximum:
+          type: integer
+
+    DeclaredCapability:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Handshake.DeclaredCapability.
+      required: [kind, localId, versionRange]
+      properties:
+        kind:
+          type: string
+        localId:
+          type: string
+        versionRange:
+          $ref: "#/components/schemas/CapabilityVersionRange"
+        displayName:
+          type: string
+
+    CapabilityNegotiationResult:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Versioning.CapabilityNegotiationResult.
+      required: [kind, accepted]
+      properties:
+        kind:
+          type: string
+        accepted:
+          type: boolean
+        negotiatedVersion:
+          type: integer
+        rejectionReason:
+          type: string
+
+    CapabilityDeclarePayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Capabilities.CapabilityDeclarePayload. The catalogue is
+        complete, not a delta - a re-declaration replaces what the session already knows.
+      required: [capabilities]
+      properties:
+        capabilities:
+          type: array
+          maxItems: 512
+          items:
+            $ref: "#/components/schemas/DeclaredCapability"
+
+    CapabilityDeclareAckPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Capabilities.CapabilityDeclareAckPayload.
+      required: [capabilities]
+      properties:
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/CapabilityNegotiationResult"
+
+    CapabilityInvokePayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Capabilities.CapabilityInvokePayload. Deliberately carries
+        neither a deadline nor an idempotency key - both live on the envelope, and a second copy would
+        be a second source of truth.
+      required: [kind, localId, operation]
+      properties:
+        kind:
+          type: string
+        localId:
+          type: string
+        operation:
+          type: string
+        arguments:
+          description: Operation arguments, shaped by the kind and operation.
+
+    CapabilityResultPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Capabilities.CapabilityResultPayload. Carries only the
+        success value; a failed invocation sets the envelope's error instead.
+      properties:
+        data:
+          description: The operation's return value, shaped by the kind and operation.
+
+    CapabilityCancelPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Capabilities.CapabilityCancelPayload.
+      properties:
+        reason:
+          type: string
+
+    EventPublishPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Events.EventPublishPayload. Fire-and-forget: there is no
+        reply message, matching IEventPublisher.Publish's in-process contract.
+      required: [eventId]
+      properties:
+        eventId:
+          type: string
+          description: >-
+            The event's unqualified id, e.g. as declared by IEventProvider. The host qualifies it
+            with the authenticated plugin id.
+        parameters:
+          description: Parameter values, keyed the same way IEventPublisher.Publish's dictionary is. Absent when the event carries none.
+
+    LogPublishPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Logging.LogPublishPayload. Fire-and-forget: there is no
+        reply message.
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEventDto"
+        dropped:
+          type: integer
+          description: How many events the plugin's own sink dropped since the previous batch.
+
+    LogEventDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Logging.LogEventDto. Carries nothing identifying - no
+        plugin id, integration id, plugin version or process id - the host already has all four
+        from the authenticated session and the supervisor.
+      required: [timestamp, level, messageTemplate, renderedMessage]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        level:
+          type: string
+          description: A LogLevels value.
+        messageTemplate:
+          type: string
+        renderedMessage:
+          type: string
+        sourceContext:
+          type: string
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+          description: >-
+            A flat string-to-string map, pre-rendered by the plugin - not a nested JSON tree. The
+            host's on-disk line format never persists structured properties.
+        exception:
+          $ref: "#/components/schemas/LogExceptionDto"
+
+    LogExceptionDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Logging.LogExceptionDto. Structured rather than a
+        pre-composed ToString() blob, so the host composes the on-disk text itself and can cap
+        each part independently.
+      required: [type, message]
+      properties:
+        type:
+          type: string
+        message:
+          type: string
+        stackTrace:
+          type: string
+        inner:
+          $ref: "#/components/schemas/LogExceptionDto"
+
+    StateUpdatePayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Capabilities.StateUpdatePayload. Means "this kind's
+        snapshot is stale, re-describe it" - deliberately not data-carrying.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+        localId:
+          type: string
+          description: >-
+            The declared local id whose snapshot is stale; absent when the whole kind is affected. For
+            email-inbox it is an inbox id: that inbox's content or status changed, without a re-describe.
+        reason:
+          type: string
+
+    HostInvokePayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.HostInvokePayload. The reverse of
+        CapabilityInvokePayload - a plugin calling a host API.
+      required: [api, operation]
+      properties:
+        api:
+          type: string
+          description: A key of x-macrodeck-host-operations.
+        operation:
+          type: string
+          description: One of the operations x-macrodeck-host-operations lists for the api.
+        arguments:
+          description: Operation arguments, shaped by the api and operation.
+
+    HostResultPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.HostResultPayload. Carries only the success
+        value; a failed invocation sets the envelope's error instead.
+      properties:
+        data:
+          description: The operation's return value, shaped by the api and operation.
+
+    HostCancelPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Callbacks.HostCancelPayload.
+      properties:
+        reason:
+          type: string
+
+    HostStatePayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Callbacks.HostStatePayload.
+      required: [api]
+      properties:
+        api:
+          type: string
+        data:
+          description: >-
+            The pushed state, shaped by the api. Absent when the api has nothing to push. For the
+            colors api it is a ColorWatchStateDto, for the batteries api a BatteryStateDto, for the adb
+            api an AdbStateDto, for the http api an HttpStateDto, for the companion-devices api a
+            CompanionDevicesStateDto, for the music-players api a MusicPlayersStateDto, for the
+            desktop-notifications api a DesktopNotificationsStateDto.
+
+    ColorsResolveArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.ColorsResolveArguments, the arguments of
+        colors/resolve. Answered with a ColorsResolveResult. Only Color variables resolve; any
+        other variable type, a missing or unavailable variable or an unknown widget gives no colour.
+      required: [value]
+      properties:
+        value:
+          type: string
+          description: >-
+            A colour, or a Color variable reference such as
+            "{{ vars.primary | color | color_darken: 20 }}" of at most maxColorReferenceLength
+            characters and maxColorReferenceSteps modifier steps.
+        widgetId:
+          type: string
+          description: The widget whose own variables shadow global ones. Absent for global variables only.
+
+    ColorsResolveResult:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Callbacks.ColorsResolveResult.
+      properties:
+        color:
+          type: string
+          description: Lowercase #rrggbb or #rrggbbaa. Absent when the value resolves to no colour.
+
+    ColorsWatchesArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.ColorsWatchesArguments, the arguments of
+        colors/watches. The plugin's whole table of watched colours, replacing the previous one;
+        idempotent. A table above maxColorWatches entries is refused with INVALID_PAYLOAD. The host answers with no data and
+        pushes the resolved table as a colors host.state.
+      properties:
+        watches:
+          type: array
+          items:
+            $ref: "#/components/schemas/ColorWatchDto"
+
+    ColorWatchDto:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Callbacks.ColorWatchDto.
+      required: [watchId, value]
+      properties:
+        watchId:
+          type: string
+          description: The plugin's own id for the watch, unique within its table.
+        value:
+          type: string
+        widgetId:
+          type: string
+
+    ColorWatchStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.ColorWatchStateDto, the data of a colors
+        host.state: every watch of the plugin's current table, resolved. A push whose revision is at
+        or below the last one applied in the same session is stale and ignored.
+      required: [revision, values]
+      properties:
+        revision:
+          type: integer
+          format: int64
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/ColorWatchValueDto"
+
+    ColorWatchValueDto:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Callbacks.ColorWatchValueDto.
+      required: [watchId]
+      properties:
+        watchId:
+          type: string
+        color:
+          type: string
+          description: The colour. Absent when the watched value resolves to no colour.
+
+    AdbStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.AdbStateDto, the data of an adb host.state push,
+        per plugin: whether this plugin may use ADB, and the devices when it may.
+      properties:
+        access:
+          type: string
+          enum: [available, adb-not-enabled, adb-not-allowed]
+        devices:
+          type: array
+          description: Empty unless access is available.
+          items:
+            $ref: "#/components/schemas/AdbDeviceStateDto"
+        defaultDeviceSerial:
+          type: string
+          description: >-
+            Optional. The serial of the device to use when none is chosen: the default device picked in
+            the ADB settings, or the only attached device when none is picked. It can name a device absent
+            from devices. Absent from older hosts, when there is none, and unless access is available.
+        adbUnavailable:
+          type: boolean
+          description: >-
+            Optional. True while access is available but the host cannot find the adb program, so every
+            operation fails with adb_executable_not_found. Absent from older hosts and otherwise.
+        revision:
+          type: integer
+          format: int64
+
+    AdbDeviceStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.AdbDeviceStateDto, one device of an AdbStateDto.
+        A device that left is simply absent.
+      properties:
+        serial:
+          type: string
+        state:
+          type: string
+          enum: [online, connecting, offline, unauthorized]
+        model:
+          type: string
+        manufacturer:
+          type: string
+        product:
+          type: string
+        stableId:
+          type: string
+          description: >-
+            Optional. A per-installation keyed hash of the device's hardware serial, the same over USB
+            and Wi-Fi, and the local id the built-in ADB battery provider publishes the device under,
+            so a host:adb plugin can match an adb device with its battery entry. Absent from older
+            hosts and until the host has read it. The hardware serial itself is never sent.
+        lacksUsbPermission:
+          type: boolean
+          description: >-
+            Optional. True when the device is unauthorized because the host's computer lacks the USB
+            permissions to talk to it, rather than because the device has not authorized the computer.
+            Absent from older hosts and otherwise.
+        mode:
+          type: string
+          description: >-
+            Optional. For an offline device: bootloader, recovery, sideload, or unknown for a state adb
+            reported that the host does not recognise. Absent from older hosts and for a device running
+            Android normally. A reader treats a value it does not know as unknown.
+
+    BatteryDeviceDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.BatteryDeviceDto, one device as its provider
+        publishes it. kind, chargeState and health are open strings; a reader treats a value it does
+        not know as other or unknown.
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          description: The provider-local id, at most maxBatteryDeviceIdLength characters.
+        name:
+          type: string
+          description: At most maxBatteryDeviceNameLength characters.
+        kind:
+          type: string
+          description: phone, tablet, laptop, headphones, watch, controller, mouse, keyboard, speaker or other.
+        levelPercent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Absent when unknown.
+        chargeState:
+          type: string
+          description: unknown, discharging, charging, full or not-charging.
+        isConnected:
+          type: boolean
+        timeRemainingSeconds:
+          type: integer
+          format: int64
+        timeToFullSeconds:
+          type: integer
+          format: int64
+        health:
+          type: string
+          description: unknown, good, overheat, dead, over-voltage, cold or failure.
+
+    VariablesRefreshArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.VariablesRefreshArguments, the optional arguments of
+        variables/refresh. Without arguments, or with no definitionIds, every declared variable of the
+        calling plugin is read again; with definitionIds only those are. At most
+        maxVariableRefreshDefinitionIds ids. A host that predates definitionIds ignores them and reads
+        every declared variable.
+      properties:
+        definitionIds:
+          type: array
+          items:
+            type: string
+
+    VariablesBindArguments:
+      type: object
+      required: [bindings]
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.VariablesBindArguments, the arguments of
+        variables/bind. Records bindings from the calling plugin's own variable catalog resources to
+        variables; the owner is always the calling plugin. All or nothing: an invalid name, resource id or
+        type, or more than maxVariableBindingsPerCall bindings, is refused with INVALID_PAYLOAD and
+        nothing is recorded. Answered with a VariablesBindResult.
+      properties:
+        bindings:
+          type: array
+          items:
+            $ref: "#/components/schemas/VariableBindingRequestDto"
+
+    VariableBindingRequestDto:
+      type: object
+      required: [localResourceId, name, type]
+      properties:
+        localResourceId:
+          type: string
+        name:
+          type: string
+          description: A canonical variable name, ^[a-z][a-z0-9_]*$.
+        type:
+          type: string
+          description: Text, Numeric, Boolean or Color.
+        decimalPlaces:
+          type: integer
+        migratedFrom:
+          type: string
+
+    VariablesBindResult:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.VariablesBindResult. One outcome per binding, in
+        request order: bound, or already-bound when the plugin already had a binding for that resource.
+      properties:
+        outcomes:
+          type: array
+          items:
+            type: string
+            enum: [bound, already-bound]
+
+    BatteriesPublishArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.BatteriesPublishArguments, the arguments of
+        batteries/publish. Adds or replaces devices of the calling plugin. All or nothing: one invalid
+        device, or a set above maxBatteryDevicesPerProvider, is refused with INVALID_PAYLOAD and nothing
+        is applied.
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatteryDeviceDto"
+
+    BatteriesRemoveArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.BatteriesRemoveArguments, the arguments of
+        batteries/remove. Removes devices for good; unknown ids are ignored.
+      properties:
+        deviceIds:
+          type: array
+          items:
+            type: string
+
+    BatteriesSyncArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.BatteriesSyncArguments, the arguments of
+        batteries/sync. Replaces the calling plugin's whole set of devices; all or nothing like publish.
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatteryDeviceDto"
+
+    BatteriesWithdrawArguments:
+      description: >-
+        batteries/withdraw takes no arguments. It withdraws every device the calling plugin session
+        published: readers see them disappear, but their ids are not in removedIds, so values derived
+        from them stay empty instead of being deleted. A provider sends it before it is initialized
+        again within the same session; the SDK ignores a refused withdraw.
+      type: "null"
+
+    LocaleTimeOfDayFormatResult:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.LocaleTimeOfDayFormatResult, the result of
+        locale/time-of-day-format, which takes no arguments: the culture of the Macro Deck interface and
+        the hour cycle the user chose, or the operating system's when the setting follows the system. A
+        culture the plugin cannot load, or an hour cycle it does not know, falls back to the plugin's
+        current culture and h23. A host that predates the api answers CAPABILITY_UNSUPPORTED.
+      required: [culture, hourCycle]
+      properties:
+        culture:
+          type: string
+        hourCycle:
+          type: string
+          enum: [h12, h23]
+
+    HttpStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.HttpStateDto, the data of an http host.state, sent on
+        registration and whenever the user changes it: the User-Agent the plugin's outgoing HTTP and
+        WebSocket requests should carry. A host that predates it pushes nothing, and an SDK that predates
+        it ignores the push.
+      required: [userAgent]
+      properties:
+        userAgent:
+          type: string
+
+    DesktopNotificationsStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.DesktopNotificationsStateDto, the data of a
+        desktop-notifications host.state, per plugin, sent on registration: whether this plugin may show
+        notifications from the operating system of the computer Macro Deck runs on, meaning its manifest
+        declares host:desktop-notifications (or the session is self-registered) and the computer offers
+        them. A host that predates it pushes nothing, and an SDK that predates it ignores the push.
+      required: [supported]
+      properties:
+        supported:
+          type: boolean
+
+    DesktopNotificationShowArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.DesktopNotificationShowArguments, the arguments of
+        desktop-notifications/show, which answers no data once the host handed the notification to the
+        operating system. Refused with DESKTOP_NOTIFICATIONS_NOT_ALLOWED unless the plugin may show
+        desktop notifications.
+      required: [title, message]
+      properties:
+        title:
+          type: string
+        message:
+          type: string
+
+    MusicPlayersStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.MusicPlayersStateDto, the data of a music-players
+        host.state, the same for every plugin: the players of all enabled providers. Sent on registration and
+        whenever the list changes. A push whose revision is at or below the last one applied in the same
+        session is stale and ignored. A host that predates the api pushes nothing, and an SDK that predates it
+        ignores the push.
+      required: [instances, revision]
+      properties:
+        instances:
+          type: array
+          items:
+            $ref: "#/components/schemas/MusicPlayerInstanceStateDto"
+        revision:
+          type: integer
+          format: int64
+
+    MusicPlayerInstanceStateDto:
+      type: object
+      description: One player in a MusicPlayersStateDto.
+      required: [id, providerId, displayName]
+      properties:
+        id:
+          type: string
+          description: The qualified providerId::instanceId.
+        providerId:
+          type: string
+        providerName:
+          description: A localized text, a plain string or a $localized reference.
+        displayName:
+          type: string
+
+    MusicPlayerAlbumColorArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.MusicPlayerAlbumColorArguments, the arguments of
+        music-players/album-color. Answered with a MusicPlayerAlbumColorResult. Not gated; runs off the
+        session's dispatch loop and shares the limit of 4 in-flight artwork lookups per plugin. A host that
+        predates the api answers CAPABILITY_UNSUPPORTED.
+      required: [instanceId]
+      properties:
+        instanceId:
+          type: string
+          minLength: 1
+          maxLength: 512
+
+    MusicPlayerAlbumColorResult:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.MusicPlayerAlbumColorResult: the average colour of the
+        player's cover as lowercase #rrggbb, or the last one derived while it shows none. Absent when the host
+        knows no colour for the player.
+      properties:
+        color:
+          type: string
+
+    CompanionDevicesStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.CompanionDevicesStateDto, the data of a
+        companion-devices host.state, per plugin: whether it may use the devices connected through the
+        Companion app, and those devices when it may. Sent on registration and whenever access or a device
+        changes. A push whose revision is at or below the last one applied in the same session is stale and
+        ignored. A host that predates the api pushes nothing.
+      required: [access, devices, revision]
+      properties:
+        access:
+          type: string
+          enum: [available, not-allowed]
+        devices:
+          type: array
+          description: Empty unless access is available. A device that left is absent.
+          items:
+            $ref: "#/components/schemas/CompanionDeviceStateDto"
+        revision:
+          type: integer
+          format: int64
+
+    CompanionDeviceStateDto:
+      type: object
+      description: >-
+        One device in a CompanionDevicesStateDto. A value the device does not report is absent;
+        percentages are 0 to 100 and texts at most 64 characters. A reader ignores capability names it does
+        not know.
+      required: [deviceId, readySequence]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+        readySequence:
+          type: integer
+          format: int64
+          description: Changes exactly when the device becomes ready again after it was gone.
+        batteryLevelPercent:
+          type: integer
+        charging:
+          type: boolean
+        orientation:
+          type: string
+          enum: [portrait, landscape]
+        screenBrightnessPercent:
+          type: integer
+        model:
+          type: string
+        platform:
+          type: string
+        appVersion:
+          type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        requestableCapabilities:
+          type: array
+          items:
+            type: string
+        confirmsCommands:
+          type: boolean
+        inFocus:
+          type: boolean
+        networkType:
+          type: string
+          enum: [wifi, cellular, ethernet, vpn, none]
+        networkMetered:
+          type: boolean
+        networkValidated:
+          type: boolean
+        networkName:
+          type: string
+        cpuUsagePercent:
+          type: integer
+        memoryUsedPercent:
+          type: integer
+
+    CompanionDeviceCommandArguments:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.CompanionDeviceCommandArguments, the arguments of
+        companion-devices/send and companion-devices/request. Every companion-devices operation is refused
+        with COMPANION_DEVICES_NOT_ALLOWED while the plugin's access is not available. send answers
+        CompanionDeviceSendResultDto, request a CompanionDeviceRequestResultDto.
+      required: [deviceId, command]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+        command:
+          type: string
+          enum: [setBrightness, setOrientation, vibrate, screenOn, screenOff, focus]
+        brightnessPercent:
+          type: integer
+          description: 0 to 100, for setBrightness.
+        orientation:
+          type: string
+          enum: [automatic, portrait, landscape]
+          description: For setOrientation.
+
+    CompanionDeviceSendResultDto:
+      type: object
+      properties:
+        sent:
+          type: boolean
+          description: False when the device is not connected.
+
+    CompanionDeviceRequestResultDto:
+      type: object
+      required: [outcome]
+      properties:
+        outcome:
+          type: string
+          enum: [done, unconfirmed, failed]
+        failure:
+          type: string
+          description: >-
+            When outcome is failed: not-connected, removed, timed-out, consent-denied, unavailable or
+            failed. A reader treats a value it does not know as failed.
+
+    CompanionDeviceArguments:
+      type: object
+      description: >-
+        The arguments of companion-devices/wait, which waits a few seconds for a device that has just
+        connected to report its state and answers a CompanionDeviceWaitResultDto.
+      required: [deviceId]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+
+    CompanionDeviceWaitResultDto:
+      type: object
+      properties:
+        ready:
+          type: boolean
+
+    CompanionScreenshotArguments:
+      type: object
+      required: [deviceId, mode]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+        mode:
+          type: string
+          enum: [deck, full]
+
+    CompanionScreenshotResultDto:
+      type: object
+      description: >-
+        The result of companion-devices/screenshot: a failure, or the PNG's description, whose bytes follow
+        over host.asset.* with the companion-screenshot asset kind and this transferId.
+      properties:
+        failure:
+          type: string
+        contentType:
+          type: string
+        byteLength:
+          type: integer
+        contentHash:
+          type: string
+        transferId:
+          type: string
+
+    BatteryStateDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.BatteryStateDto, the data of a batteries
+        host.state, the same for every plugin. A push whose revision is at or below the last one applied
+        in the same session is stale and ignored. removedIds lists devices removed for good since the
+        previous revision; a device absent from devices without being listed was withdrawn and may return.
+      required: [revision, devices]
+      properties:
+        revision:
+          type: integer
+          format: int64
+        devices:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatteryDeviceSnapshotDto"
+        removedIds:
+          type: array
+          items:
+            type: string
+
+    BatteryDeviceSnapshotDto:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Callbacks.BatteryDeviceSnapshotDto, one device of a
+        BatteryStateDto qualified with its provider. id is providerId:localId.
+      required: [id, localId, providerId, name]
+      properties:
+        id:
+          type: string
+        localId:
+          type: string
+        providerId:
+          type: string
+        providerName:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+        levelPercent:
+          type: integer
+        chargeState:
+          type: string
+        isConnected:
+          type: boolean
+        timeRemainingSeconds:
+          type: integer
+          format: int64
+        timeToFullSeconds:
+          type: integer
+          format: int64
+        health:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+
+    AssetBeginPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Assets.AssetBeginPayload. totalBytes is checked against
+        maxAssetBytes up front, so an oversize upload is rejected before the first chunk.
+      required: [assetId, kind, mimeType, totalBytes, contentHash]
+      properties:
+        assetId:
+          type: string
+        kind:
+          type: string
+          description: One of x-macrodeck-asset-kinds.
+        mimeType:
+          type: string
+        totalBytes:
+          type: integer
+        contentHash:
+          type: string
+
+    AssetChunkPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Assets.AssetChunkPayload. data is base64 and bounded by
+        maxAssetChunkBytes pre-encoding.
+      required: [assetId, index, data]
+      properties:
+        assetId:
+          type: string
+        index:
+          type: integer
+        data:
+          type: string
+          format: byte
+
+    AssetCommitPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Assets.AssetCommitPayload.
+      required: [assetId]
+      properties:
+        assetId:
+          type: string
+
+    AssetAckPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Assets.AssetAckPayload.
+      required: [assetId, accepted]
+      properties:
+        assetId:
+          type: string
+        index:
+          type: integer
+        accepted:
+          type: boolean
+
+    HostAssetBeginPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Assets.HostAssetBeginPayload - the host-to-plugin mirror of
+        AssetBeginPayload. totalBytes is checked against maxAssetBytes up front.
+      required: [assetId, kind, mimeType, totalBytes, contentHash]
+      properties:
+        assetId:
+          type: string
+        kind:
+          type: string
+        mimeType:
+          type: string
+        totalBytes:
+          type: integer
+        contentHash:
+          type: string
+
+    HostAssetChunkPayload:
+      type: object
+      description: >-
+        Mirrors MacroDeck.Plugin.Protocol.Assets.HostAssetChunkPayload. data is base64 and bounded by
+        maxAssetChunkBytes pre-encoding.
+      required: [assetId, index, data]
+      properties:
+        assetId:
+          type: string
+        index:
+          type: integer
+        data:
+          type: string
+          format: byte
+
+    HostAssetCommitPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Assets.HostAssetCommitPayload.
+      required: [assetId]
+      properties:
+        assetId:
+          type: string
+
+    HostAssetAckPayload:
+      type: object
+      description: Mirrors MacroDeck.Plugin.Protocol.Assets.HostAssetAckPayload.
+      required: [assetId, accepted]
+      properties:
+        assetId:
+          type: string
+        index:
+          type: integer
+        accepted:
+          type: boolean

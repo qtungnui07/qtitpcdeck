@@ -1,0 +1,815 @@
+import {
+  ClientAppStrings,
+  Strings,
+  type ThemeMode,
+  type WebClientTargetCapabilities,
+} from '@macro-deck/runtime';
+import {
+  createButton,
+  createSegmentedControl,
+  createSettingsRow,
+  createSettingsSection,
+  createToggle,
+  type SegmentedOption,
+  type ToggleHandle,
+} from '../ui';
+import {
+  installHintKey,
+  installStatusKey,
+  updateActionKey,
+  updateStatusKey,
+  type AppUpdatePhase,
+  type PwaAvailability,
+  type PwaInstallOutcome,
+} from '../pwa';
+import { type RenderingMode } from '../rendering-mode';
+import { ICON_RESOLUTIONS, type IconResolution, type IconSizeRange } from '../icon-resolution';
+import { type WakeLockStatus } from '../wake-lock';
+
+const INSTALL_DISMISSED_HINT_MS = 4000;
+
+const GEAR_RING = 'M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033'
+  + ' 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0'
+  + ' 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051'
+  + 'a2.34 2.34 0 0 0 3.319-1.915';
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+export interface SettingsTranslator {
+  translate(qualifiedKey: string, args?: Record<string, unknown>): string;
+  signOut(): Promise<void>;
+}
+
+export interface AppearanceSurface {
+  themeMode(): ThemeMode;
+  setThemeMode(mode: ThemeMode): void;
+  onChange(listener: () => void): () => void;
+}
+
+export interface RenderingModeSurface {
+  get(): RenderingMode;
+  set(mode: RenderingMode): void;
+  onChange(listener: () => void): () => void;
+}
+
+export interface IconResolutionSurface {
+  get(): IconResolution;
+  set(resolution: IconResolution): void;
+  onChange(listener: () => void): () => void;
+  inUse(): IconSizeRange | null;
+}
+
+export interface WakeLockSurface {
+  currentStatus(): WakeLockStatus;
+  enabled(): boolean;
+  setEnabled(on: boolean): void;
+  onChange(listener: () => void): () => void;
+}
+
+export interface SettingsButtonSurface {
+  offered(): boolean;
+  connected(): boolean;
+  get(): boolean;
+  set(hidden: boolean): Promise<boolean>;
+  onChange(listener: () => void): () => void;
+}
+
+export interface AppUpdateSurface {
+  phase(): AppUpdatePhase;
+  onPhaseChange(listener: (phase: AppUpdatePhase) => void): void;
+  activateNow(): Promise<void>;
+  check(): Promise<void>;
+}
+
+export interface PwaInstallSurface {
+  availability(): PwaAvailability;
+  onChange(listener: (availability: PwaAvailability) => void): void;
+  promptInstall(): Promise<PwaInstallOutcome>;
+}
+
+export interface HintTimer {
+  set(callback: () => void, delayMs: number): unknown;
+  clear(handle: unknown): void;
+}
+
+const REAL_TIMER: HintTimer = {
+  set: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
+  clear: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+export interface ClientSettingsOptions {
+  client: SettingsTranslator;
+  appearance: AppearanceSurface;
+  renderingMode: RenderingModeSurface;
+  iconResolution?: IconResolutionSurface;
+  wakeLock: WakeLockSurface;
+  settingsButton?: SettingsButtonSurface;
+  update: AppUpdateSurface;
+  install: PwaInstallSurface;
+  capabilities: WebClientTargetCapabilities;
+  openDeviceSetup?(): void;
+  loadNotices(): Promise<string>;
+  legacyEntry?: boolean;
+  timer?: HintTimer;
+}
+
+export interface ClientSettingsHandle {
+  readonly element: HTMLElement;
+  open(): void;
+  close(): void;
+  isOpen(): boolean;
+  setButtonHidden(hidden: boolean): void;
+  destroy(): void;
+}
+
+function element<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  className?: string,
+): HTMLElementTagNameMap[K] {
+  const created = document.createElement(tag);
+  if (className !== undefined) created.className = className;
+  return created;
+}
+
+function paragraph(className: string, text: string): HTMLElement {
+  const node = element('p', className);
+  node.textContent = text;
+  return node;
+}
+
+function clear(node: HTMLElement): void {
+  while (node.firstChild !== null) node.removeChild(node.firstChild);
+}
+
+function show(node: HTMLElement, visible: boolean): void {
+  if (visible) node.removeAttribute('hidden');
+  else node.setAttribute('hidden', '');
+}
+
+export function gearIcon(): SVGElement {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'wc-client-settings-icon');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  // An intrinsic size as well as the viewBox: an inline <svg> sized only by CSS falls back to the
+  // replaced-element default of 300x150 on the compatibility floor, which is how a 44px button
+  // ended up with an icon spilling out of it (issue #829). CSS still wins where CSS is honoured.
+  svg.setAttribute('width', '24');
+  svg.setAttribute('height', '24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+
+  const circle = document.createElementNS(SVG_NS, 'circle');
+  circle.setAttribute('cx', '12');
+  circle.setAttribute('cy', '12');
+  circle.setAttribute('r', '3');
+  svg.appendChild(circle);
+
+  const ring = document.createElementNS(SVG_NS, 'path');
+  ring.setAttribute('d', GEAR_RING);
+  svg.appendChild(ring);
+
+  return svg;
+}
+
+function wakeLockStatusKey(status: WakeLockStatus): string | null {
+  switch (status) {
+    case 'active': return ClientAppStrings.WebClient.KeepAwake.Active;
+    case 'suspended': return ClientAppStrings.WebClient.KeepAwake.Suspended;
+    case 'denied': return ClientAppStrings.WebClient.KeepAwake.Denied;
+    case 'unsupported': return ClientAppStrings.WebClient.KeepAwake.Unsupported;
+    case 'insecureOrigin': return ClientAppStrings.WebClient.KeepAwake.InsecureOrigin;
+    case 'pending': return ClientAppStrings.WebClient.KeepAwake.Pending;
+    default: return null;
+  }
+}
+
+interface LicensesViewer {
+  element: HTMLElement;
+  back: HTMLButtonElement;
+  loading: HTMLElement;
+  notices: HTMLElement;
+  failure: HTMLElement;
+  loaded: boolean;
+  request: number;
+}
+
+interface OpenModal {
+  backdrop: HTMLElement;
+  heading: HTMLElement;
+  body: HTMLElement;
+  licensesButton: HTMLButtonElement;
+  licenses: LicensesViewer;
+  themeMode: { setValue(value: string | null): void };
+  renderMode: { setValue(value: string | null): void };
+  iconResolution: { setValue(value: string | null): void } | null;
+  iconResolutionDescription: HTMLElement | null;
+  wakeLockControl: HTMLElement;
+  wakeLockStatus: HTMLElement;
+  settingsButtonToggle: ToggleHandle | null;
+  settingsButtonStatus: HTMLElement;
+  installDescription: HTMLElement | null;
+  installControl: HTMLElement;
+  installNote: HTMLElement;
+  updateRow: HTMLElement;
+  updateSlot: HTMLElement;
+  updateDescription: HTMLElement | null;
+  updateControl: HTMLElement;
+}
+
+export function createClientSettings(options: ClientSettingsOptions): ClientSettingsHandle | null {
+  if (!options.capabilities.clientSettings) return null;
+
+  const timer = options.timer === undefined ? REAL_TIMER : options.timer;
+  const text = (key: string, args?: Record<string, unknown>): string =>
+    options.client.translate(key, args);
+
+  const trigger = element('button', 'wc-client-settings-trigger');
+  trigger.type = 'button';
+  trigger.setAttribute('aria-label', text(ClientAppStrings.WebClient.Settings.OpenSettings));
+  trigger.appendChild(gearIcon());
+
+  let open: OpenModal | null = null;
+  let dismissedHintVisible = false;
+  let dismissedHintTimer: unknown = null;
+  let destroyed = false;
+  let settingsButtonPending: boolean | null = null;
+  let settingsButtonFailed = false;
+  let settingsButtonRequest = 0;
+
+  function themeOptions(): SegmentedOption[] {
+    // The deck runs on tablets whose OS may have no colour-scheme preference to follow at all - iOS
+    // only gained one in 13 - so "system" cannot be the only way to get a dark deck.
+    return [
+      { value: 'light', label: text(ClientAppStrings.Settings.Appearance.Light), icon: 'sun' },
+      { value: 'dark', label: text(ClientAppStrings.Settings.Appearance.Dark), icon: 'moon' },
+      { value: 'system', label: text(ClientAppStrings.Settings.Appearance.System) },
+    ];
+  }
+
+  function renderModeOptions(): SegmentedOption[] {
+    return [
+      { value: 'standard', label: text(ClientAppStrings.WebClient.Rendering.Standard) },
+      { value: 'simple', label: text(ClientAppStrings.WebClient.Rendering.Simple) },
+    ];
+  }
+
+  function iconResolutionOptions(): SegmentedOption[] {
+    return ICON_RESOLUTIONS.map(resolution => ({
+      value: String(resolution),
+      label: resolution === 'auto'
+        ? text(ClientAppStrings.WebClient.IconResolution.Automatic)
+        : text(ClientAppStrings.WebClient.IconResolution.SizeOption, { size: resolution }),
+    }));
+  }
+
+  function iconResolutionText(surface: IconResolutionSurface): string {
+    const inUse = surface.get() === 'auto' ? surface.inUse() : null;
+    if (inUse === null) return text(ClientAppStrings.WebClient.IconResolution.Description);
+    return inUse.min === inUse.max
+      ? text(ClientAppStrings.WebClient.IconResolution.InUse, { size: inUse.min })
+      : text(ClientAppStrings.WebClient.IconResolution.InUseRange, { min: inUse.min, max: inUse.max });
+  }
+
+  function description(row: HTMLElement): HTMLElement | null {
+    return row.querySelector<HTMLElement>('.wc-settings-row-desc');
+  }
+
+  function legacySection(): HTMLElement {
+    const section = createSettingsSection({
+      heading: text(ClientAppStrings.WebClient.Legacy.SectionTitle),
+    });
+    section.body.appendChild(
+      paragraph('wc-client-settings-status', text(ClientAppStrings.WebClient.Legacy.Notice)));
+    section.body.appendChild(
+      paragraph('wc-client-settings-status', text(ClientAppStrings.WebClient.Legacy.InstallHint)));
+    return section.element;
+  }
+
+  function deviceSetupSection(openWizard: () => void): HTMLElement {
+    const action = createButton({
+      label: text(ClientAppStrings.WebClient.DeviceSetup.OpenAction),
+      variant: 'secondary',
+      onClick: () => {
+        // The wizard is a dialog of its own, so this one gets out of its way first.
+        close();
+        openWizard();
+      },
+    });
+    const section = createSettingsSection({
+      heading: text(ClientAppStrings.WebClient.DeviceSetup.SectionTitle),
+      description: text(ClientAppStrings.WebClient.DeviceSetup.Description),
+    });
+    section.body.appendChild(action.element);
+    return section.element;
+  }
+
+  function licensesViewer(onBack: () => void): LicensesViewer {
+    const viewer = element('div', 'wc-client-settings-licenses');
+    viewer.setAttribute('hidden', '');
+
+    const back = createButton({
+      label: text(Strings.Common.Back),
+      variant: 'ghost',
+      onClick: onBack,
+    });
+    const toolbar = element('div', 'wc-client-settings-licenses-toolbar');
+    toolbar.appendChild(back.element);
+    viewer.appendChild(toolbar);
+
+    const loading = paragraph('wc-client-settings-status', text(Strings.Common.Loading));
+    loading.setAttribute('role', 'status');
+    viewer.appendChild(loading);
+
+    const failure = element('div', 'wc-client-settings-licenses-failure');
+    failure.setAttribute('role', 'alert');
+    show(failure, false);
+    viewer.appendChild(failure);
+
+    const notices = element('pre', 'wc-client-settings-licenses-text');
+    notices.setAttribute('tabindex', '0');
+    notices.setAttribute('aria-label', text(ClientAppStrings.WebClient.Settings.Licenses.Title));
+    show(notices, false);
+    viewer.appendChild(notices);
+
+    return {
+      element: viewer,
+      back: back.element,
+      loading: loading,
+      notices: notices,
+      failure: failure,
+      loaded: false,
+      request: 0,
+    };
+  }
+
+  function build(): OpenModal {
+    const backdrop = element('div', 'wc-client-settings-backdrop');
+    const dialog = element('div', 'wc-client-settings-dialog');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    backdrop.appendChild(dialog);
+
+    const header = element('div', 'wc-client-settings-header');
+    const heading = element('h2', 'wc-client-settings-title');
+    heading.textContent = text(Strings.Settings.Title);
+    header.appendChild(heading);
+
+    const closeButton = element('button', 'wc-client-settings-close');
+    closeButton.type = 'button';
+    closeButton.setAttribute('aria-label', text(Strings.Common.Close));
+    closeButton.textContent = '×';
+    closeButton.addEventListener('click', () => close());
+    header.appendChild(closeButton);
+    dialog.appendChild(header);
+
+    const body = element('div', 'wc-client-settings-body');
+    dialog.appendChild(body);
+
+    // A sibling of the settings body rather than a replacement for it: render() keeps updating the
+    // controls in the body while the viewer is showing, so they must stay attached.
+    const licenses = licensesViewer(() => closeLicenses());
+    dialog.appendChild(licenses.element);
+
+    if (options.legacyEntry === true) body.appendChild(legacySection());
+
+    const openWizard = options.openDeviceSetup;
+    if (openWizard !== undefined && options.capabilities.deviceSetupPrompts) {
+      body.appendChild(deviceSetupSection(openWizard));
+    }
+
+    const renderMode = createSegmentedControl({
+      ariaLabel: text(ClientAppStrings.WebClient.Rendering.Label),
+      options: renderModeOptions(),
+      value: options.renderingMode.get(),
+      onChange: value => options.renderingMode.set(value as RenderingMode),
+    });
+
+    const iconSurface = options.iconResolution;
+    const iconResolution = iconSurface === undefined ? null : createSegmentedControl({
+      ariaLabel: text(ClientAppStrings.WebClient.IconResolution.Label),
+      options: iconResolutionOptions(),
+      value: String(iconSurface.get()),
+      onChange: value => iconSurface.set(value === 'auto' ? 'auto' : Number(value) as IconResolution),
+    });
+
+    const themeMode = createSegmentedControl({
+      ariaLabel: text(ClientAppStrings.Settings.Appearance.ThemeModeLabel),
+      options: themeOptions(),
+      value: options.appearance.themeMode(),
+      onChange: value => options.appearance.setThemeMode(value as ThemeMode),
+    });
+
+    const wakeLockControl = element('div', 'wc-client-settings-control');
+    const wakeLockStatus = paragraph('wc-client-settings-status', '');
+
+    // A target whose firmware already keeps its screen lit declares `wakeLock: false`, and offering
+    // a switch that does nothing is precisely the dead control the capability list exists to remove.
+    const displayRows = [];
+    displayRows.push(
+        createSettingsRow({
+          label: text(ClientAppStrings.WebClient.Rendering.Label),
+          description: text(ClientAppStrings.WebClient.Rendering.Description),
+          control: renderMode.element,
+        }),
+        createSettingsRow({
+          label: text(ClientAppStrings.Settings.Appearance.ThemeModeLabel),
+          description: text(ClientAppStrings.Settings.Appearance.ThemeModeDescription),
+          control: themeMode.element,
+        }),
+    );
+
+    let iconResolutionRow: HTMLElement | null = null;
+    if (iconSurface !== undefined && iconResolution !== null) {
+      iconResolutionRow = createSettingsRow({
+        label: text(ClientAppStrings.WebClient.IconResolution.Label),
+        description: iconResolutionText(iconSurface),
+        control: iconResolution.element,
+      });
+      displayRows.push(iconResolutionRow);
+    }
+
+    const keepAwakeOffered = options.capabilities.wakeLock;
+    if (keepAwakeOffered) {
+      displayRows.push(createSettingsRow({
+        label: text(ClientAppStrings.WebClient.KeepAwake.Label),
+        description: text(ClientAppStrings.WebClient.KeepAwake.Description),
+        control: wakeLockControl,
+      }));
+    }
+
+    const settingsButton = options.settingsButton;
+    const settingsButtonStatus = paragraph('wc-client-settings-status', '');
+    let settingsButtonToggle: ToggleHandle | null = null;
+    if (settingsButton !== undefined && settingsButton.offered()) {
+      settingsButtonToggle = createToggle({
+        ariaLabel: text(ClientAppStrings.WebClient.Settings.HideSettingsButton.Label),
+        checked: settingsButton.get(),
+        onChange: hidden => {
+          void saveSettingsButton(settingsButton, hidden);
+        },
+      });
+      displayRows.push(createSettingsRow({
+        label: text(ClientAppStrings.WebClient.Settings.HideSettingsButton.Label),
+        description: text(ClientAppStrings.WebClient.Settings.HideSettingsButton.Description),
+        control: settingsButtonToggle.element,
+      }));
+    }
+
+    const display = createSettingsSection({
+      heading: text(ClientAppStrings.WebClient.Settings.DisplaySection),
+      rows: displayRows,
+    });
+    if (keepAwakeOffered) display.body.appendChild(wakeLockStatus);
+    if (settingsButtonToggle !== null) display.body.appendChild(settingsButtonStatus);
+    body.appendChild(display.element);
+
+    const installControl = element('div', 'wc-client-settings-control');
+    const installRow = createSettingsRow({
+      label: text(ClientAppStrings.WebClient.Install.Label),
+      description: text(installStatusKey(options.install.availability())),
+      control: installControl,
+    });
+    const installNote = paragraph('wc-client-settings-status', '');
+
+    const updateControl = element('div', 'wc-client-settings-control');
+    const updateRow = createSettingsRow({
+      label: text(ClientAppStrings.WebClient.Install.UpdateLabel),
+      description: text(updateStatusKey(options.update.phase())),
+      control: updateControl,
+    });
+
+    const install = createSettingsSection({
+      heading: text(ClientAppStrings.WebClient.Install.SectionTitle),
+      rows: [installRow],
+    });
+    install.body.appendChild(installNote);
+    body.appendChild(install.element);
+
+    const signOut = createButton({
+      label: text(ClientAppStrings.WebClient.Account.SignOut),
+      variant: 'secondary',
+      onClick: () => {
+        void options.client.signOut();
+      },
+    });
+    body.appendChild(createSettingsSection({
+      heading: text(ClientAppStrings.WebClient.Account.SectionTitle),
+      rows: [createSettingsRow({
+        label: text(ClientAppStrings.WebClient.Account.SignedInLabel),
+        control: signOut.element,
+      })],
+    }).element);
+
+    const licensesButton = createButton({
+      label: text(ClientAppStrings.WebClient.Settings.Licenses.Button),
+      variant: 'ghost',
+      onClick: () => openLicenses(),
+    });
+    const licensesEntry = element('div', 'wc-client-settings-licenses-entry');
+    licensesEntry.appendChild(licensesButton.element);
+    body.appendChild(licensesEntry);
+
+    backdrop.addEventListener('click', event => {
+      if (event.target === backdrop) close();
+    });
+
+    return {
+      backdrop: backdrop,
+      heading: heading,
+      body: body,
+      licensesButton: licensesButton.element,
+      licenses: licenses,
+      themeMode: themeMode,
+      renderMode: renderMode,
+      iconResolution: iconResolution,
+      iconResolutionDescription: iconResolutionRow === null ? null : description(iconResolutionRow),
+      wakeLockControl: wakeLockControl,
+      wakeLockStatus: wakeLockStatus,
+      settingsButtonToggle: settingsButtonToggle,
+      settingsButtonStatus: settingsButtonStatus,
+      installDescription: description(installRow),
+      installControl: installControl,
+      installNote: installNote,
+      updateRow: updateRow,
+      updateSlot: install.body,
+      updateDescription: description(updateRow),
+      updateControl: updateControl,
+    };
+  }
+
+  function renderWakeLock(modal: OpenModal): void {
+    const status = options.wakeLock.currentStatus();
+    clear(modal.wakeLockControl);
+
+    // A switch that can never be flipped is worse than no switch: it invites a tap and answers with
+    // nothing. Both of these states are properties of the browser or the address, not something the
+    // user can change from here, so the row keeps only its explanation.
+    if (status !== 'unsupported' && status !== 'insecureOrigin') {
+      const toggle = createToggle({
+        ariaLabel: text(ClientAppStrings.WebClient.KeepAwake.Label),
+        checked: options.wakeLock.enabled(),
+        busy: status === 'pending',
+        // Runs straight from the click, not from a later microtask: the acquire has to carry the
+        // user gesture the platform requires of it.
+        onChange: on => options.wakeLock.setEnabled(on),
+      });
+      modal.wakeLockControl.appendChild(toggle.element);
+    }
+
+    const key = wakeLockStatusKey(status);
+    modal.wakeLockStatus.textContent = key === null ? '' : text(key);
+    show(modal.wakeLockStatus, key !== null);
+  }
+
+  function renderSettingsButton(modal: OpenModal): void {
+    const surface = options.settingsButton;
+    const toggle = modal.settingsButtonToggle;
+    if (surface === undefined || toggle === null) return;
+
+    toggle.setChecked(settingsButtonPending === null ? surface.get() : settingsButtonPending);
+    toggle.setBusy(settingsButtonPending !== null);
+    toggle.setDisabled(!surface.connected());
+    modal.settingsButtonStatus.textContent = settingsButtonFailed
+      ? text(ClientAppStrings.WebClient.Settings.HideSettingsButton.SaveFailed)
+      : '';
+    show(modal.settingsButtonStatus, settingsButtonFailed);
+  }
+
+  async function saveSettingsButton(surface: SettingsButtonSurface, hidden: boolean): Promise<void> {
+    const modal = open;
+    const request = ++settingsButtonRequest;
+    settingsButtonPending = hidden;
+    settingsButtonFailed = false;
+    render();
+
+    let saved = false;
+    try {
+      saved = await surface.set(hidden);
+    } catch {
+      saved = false;
+    }
+    if (open !== modal || request !== settingsButtonRequest) return;
+
+    settingsButtonPending = null;
+    settingsButtonFailed = !saved;
+    render();
+  }
+
+  function renderInstall(modal: OpenModal): void {
+    const availability = options.install.availability();
+    if (modal.installDescription !== null) {
+      modal.installDescription.textContent = text(installStatusKey(availability));
+    }
+
+    clear(modal.installControl);
+    if (availability === 'promptable' && !dismissedHintVisible) {
+      const action = createButton({
+        label: text(ClientAppStrings.WebClient.Install.InstallAction),
+        variant: 'secondary',
+        onClick: () => {
+          void promptInstall();
+        },
+      });
+      modal.installControl.appendChild(action.element);
+    }
+
+    // Explanatory text belongs under the row, not in its control slot: the slot is laid out beside
+    // the label, so a sentence there takes most of the row's width and reads as if it were the
+    // control.
+    const hint = dismissedHintVisible
+      ? ClientAppStrings.WebClient.Install.InstallDismissed
+      : installHintKey(availability);
+    modal.installNote.textContent = hint === null ? '' : text(hint);
+    show(modal.installNote, hint !== null);
+  }
+
+  function renderUpdate(modal: OpenModal): void {
+    const phase = options.update.phase();
+    // Taken off the page rather than hidden: a client that cannot update itself should not read out
+    // an update row to a screen reader, and `hidden` loses to the row's own display rule anyway.
+    // A browser tab is taken off too, whatever the phase: reloading the tab is how a tab updates,
+    // and the out-of-date guard already forces that - the row is for the installed app, which has
+    // no reload button of its own.
+    const attached = modal.updateRow.parentNode !== null;
+    if (phase === 'unsupported' || options.install.availability() !== 'runningAsApp') {
+      if (attached) modal.updateSlot.removeChild(modal.updateRow);
+      return;
+    }
+    if (!attached) modal.updateSlot.appendChild(modal.updateRow);
+
+    if (modal.updateDescription !== null) {
+      modal.updateDescription.textContent = text(updateStatusKey(phase));
+    }
+
+    clear(modal.updateControl);
+    const actionKey = updateActionKey(phase);
+    if (actionKey === null) return;
+
+    const action = createButton({
+      label: text(actionKey),
+      variant: 'secondary',
+      onClick: () => runUpdateAction(),
+    });
+    modal.updateControl.appendChild(action.element);
+  }
+
+  function render(): void {
+    const modal = open;
+    if (modal === null) return;
+
+    modal.renderMode.setValue(options.renderingMode.get());
+    const iconSurface = options.iconResolution;
+    if (iconSurface !== undefined) {
+      if (modal.iconResolution !== null) modal.iconResolution.setValue(String(iconSurface.get()));
+      if (modal.iconResolutionDescription !== null) {
+        modal.iconResolutionDescription.textContent = iconResolutionText(iconSurface);
+      }
+    }
+    modal.themeMode.setValue(options.appearance.themeMode());
+    renderWakeLock(modal);
+    renderSettingsButton(modal);
+    renderInstall(modal);
+    renderUpdate(modal);
+  }
+
+  function openLicenses(): void {
+    const modal = open;
+    if (modal === null) return;
+    show(modal.body, false);
+    show(modal.licenses.element, true);
+    modal.heading.textContent = text(ClientAppStrings.WebClient.Settings.Licenses.Title);
+    modal.licenses.back.focus();
+    if (!modal.licenses.loaded) void loadLicenses(modal);
+  }
+
+  function closeLicenses(): void {
+    const modal = open;
+    if (modal === null) return;
+    show(modal.licenses.element, false);
+    show(modal.body, true);
+    modal.heading.textContent = text(Strings.Settings.Title);
+    modal.licensesButton.focus();
+  }
+
+  async function loadLicenses(modal: OpenModal): Promise<void> {
+    const viewer = modal.licenses;
+    const request = ++viewer.request;
+    show(viewer.loading, true);
+    clear(viewer.failure);
+    show(viewer.failure, false);
+    show(viewer.notices, false);
+
+    let notices: string | null = null;
+    try {
+      notices = await options.loadNotices();
+    } catch {
+      notices = null;
+    }
+    if (open !== modal || request !== viewer.request) return;
+
+    show(viewer.loading, false);
+    if (notices === null) {
+      viewer.failure.appendChild(
+        paragraph('wc-client-settings-status', text(ClientAppStrings.WebClient.Settings.Licenses.LoadFailed)));
+      viewer.failure.appendChild(createButton({
+        label: text(Strings.Common.Retry),
+        variant: 'secondary',
+        onClick: () => {
+          // The retry button is removed by the reload it starts, so focus moves somewhere that stays.
+          viewer.back.focus();
+          void loadLicenses(modal);
+        },
+      }).element);
+      show(viewer.failure, true);
+      return;
+    }
+    viewer.notices.textContent = notices;
+    viewer.loaded = true;
+    show(viewer.notices, true);
+  }
+
+  function runUpdateAction(): void {
+    const phase = options.update.phase();
+    if (phase === 'available') {
+      void options.update.activateNow();
+      return;
+    }
+    if (phase === 'idle' || phase === 'upToDate' || phase === 'checkFailed' || phase === 'applyFailed') {
+      void options.update.check();
+    }
+  }
+
+  async function promptInstall(): Promise<void> {
+    if (options.install.availability() !== 'promptable') return;
+
+    const outcome = await options.install.promptInstall();
+    if (outcome !== 'dismissed' || destroyed) return;
+
+    dismissedHintVisible = true;
+    render();
+    timer.clear(dismissedHintTimer);
+    dismissedHintTimer = timer.set(() => {
+      dismissedHintVisible = false;
+      render();
+    }, INSTALL_DISMISSED_HINT_MS);
+  }
+
+  function onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape') close();
+  }
+
+  function openModal(): void {
+    if (open !== null || destroyed) return;
+    settingsButtonPending = null;
+    settingsButtonFailed = false;
+    open = build();
+    document.body.appendChild(open.backdrop);
+    document.addEventListener('keydown', onKeydown);
+    render();
+  }
+
+  function close(): void {
+    const modal = open;
+    if (modal === null) return;
+    open = null;
+    document.removeEventListener('keydown', onKeydown);
+    if (modal.backdrop.parentNode !== null) modal.backdrop.parentNode.removeChild(modal.backdrop);
+  }
+
+  trigger.addEventListener('click', () => openModal());
+
+  const unsubscribeAppearance = options.appearance.onChange(() => render());
+  const unsubscribeRendering = options.renderingMode.onChange(() => render());
+  const unsubscribeWakeLock = options.wakeLock.onChange(() => render());
+  const unsubscribeIconResolution = options.iconResolution?.onChange(() => render());
+  const unsubscribeSettingsButton = options.settingsButton === undefined
+    ? () => undefined
+    : options.settingsButton.onChange(() => render());
+  // Neither of these hands back an unsubscribe, so they are taken once here rather than per open,
+  // and answered with nothing once the modal is closed.
+  options.update.onPhaseChange(() => render());
+  options.install.onChange(() => render());
+
+  return {
+    element: trigger,
+    open: () => openModal(),
+    close: () => close(),
+    isOpen: () => open !== null,
+    setButtonHidden: (hidden: boolean) => show(trigger, !hidden),
+    destroy: () => {
+      destroyed = true;
+      close();
+      timer.clear(dismissedHintTimer);
+      unsubscribeAppearance();
+      unsubscribeRendering();
+      unsubscribeWakeLock();
+      if (unsubscribeIconResolution !== undefined) unsubscribeIconResolution();
+      unsubscribeSettingsButton();
+      if (trigger.parentNode !== null) trigger.parentNode.removeChild(trigger);
+    },
+  };
+}

@@ -1,0 +1,84 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "qtitpcdeck",
+  "mainBinaryName": "qtitpcdeck",
+  "identifier": "app.qtitpcdeck",
+  "bundle": {
+    "fileAssociations": [
+      {
+        "ext": ["qtitpcdeckProfile", "macroDeckProfile"],
+        "name": "qtitpcdeck.Profile",
+        "description": "qtitpcdeck Profile",
+        "role": "Editor",
+        "rank": "Owner",
+        "mimeType": "application/vnd.qtitpcdeck.profile",
+        "exportedType": {
+          "identifier": "app.qtitpcdeck.profile",
+          "conformsTo": ["public.data", "public.zip-archive"]
+        }
+      },
+      {
+        "ext": ["qtitpcdeckFolder", "macroDeckFolder"],
+        "name": "qtitpcdeck.Folder",
+        "description": "qtitpcdeck Folder",
+        "role": "Editor",
+        "rank": "Owner",
+        "mimeType": "application/vnd.qtitpcdeck.folder",
+        "exportedType": {
+          "identifier": "app.qtitpcdeck.folder",
+          "conformsTo": ["public.data", "public.zip-archive"]
+        }
+      },
+      {
+        "ext": ["qtitpcdeckWidget", "macroDeckWidget"],
+        "name": "qtitpcdeck.Widget",
+        "description": "qtitpcdeck Widget",
+        "role": "Editor",
+        "rank": "Owner",
+        "mimeType": "application/vnd.qtitpcdeck.widget",
+        "exportedType": {
+          "identifier": "app.qtitpcdeck.widget",
+          "conformsTo": ["public.data", "public.zip-archive"]
+        }
+      },
+      {
+        "ext": ["qtitpcdeckIconPack", "macroDeckIconPack"],
+        "name": "qtitpcdeck.IconPack",
+        "description": "qtitpcdeck Icon Pack",
+        "role": "Editor",
+        "rank": "Owner",
+        "mimeType": "application/vnd.qtitpcdeck.icon-pack",
+        "exportedType": {
+          "identifier": "app.qtitpcdeck.icon-pack",
+          "conformsTo": ["public.data", "public.zip-archive"]
+        }
+      },
+      {
+        "ext": ["qtitpcdeckPlugin", "macroDeckPlugin"],
+        "name": "qtitpcdeck.Plugin",
+        "description": "qtitpcdeck Plugin",
+        "role": "Editor",
+        "rank": "Owner",
+        "mimeType": "application/vnd.qtitpcdeck.plugin",
+        "exportedType": {
+          "identifier": "app.qtitpcdeck.plugin",
+          "conformsTo": ["public.data", "public.zip-archive"]
+        }
+      }
+    ],
+    "windows": {
+      "nsis": {
+        "startMenuFolder": "qtitpcdeck"
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["qtitpcdeck", "macrodeck"],
+        "name": "qtitpcdeck",
+        "role": "Viewer"
+      }
+    }
+  }
+}

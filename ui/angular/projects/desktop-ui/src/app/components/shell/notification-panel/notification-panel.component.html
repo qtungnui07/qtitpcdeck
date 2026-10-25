@@ -1,0 +1,38 @@
+<shared-side-panel
+  [isOpen]="isOpen()"
+  [heading]="appStrings.Nav.Notifications | translate"
+  [closeLabel]="appStrings.Shell.Notifications.Close | translate"
+  (closed)="closed.emit()">
+  @if (notificationCenter.hasUnread()) {
+    <shared-button sidePanelActions class="np-header-btn" variant="ghost" size="compact" (click)="onMarkAllRead()">
+      <span>{{ appStrings.Shell.Notifications.MarkAllRead | translate }}</span>
+    </shared-button>
+  }
+
+  @if (notificationCenter.hasDismissable()) {
+    <shared-button sidePanelActions class="np-header-btn" variant="ghost" size="compact" (click)="onClearAll()">
+      <span>{{ appStrings.Shell.Notifications.ClearAll | translate }}</span>
+    </shared-button>
+  }
+
+  <div class="np-body">
+    @if (notifications().length === 0) {
+      <shared-empty-state
+        compact
+        icon="bell"
+        [heading]="appStrings.Shell.Notifications.EmptyHeading | translate"
+        [message]="appStrings.Shell.Notifications.EmptyMessage | translate" />
+    } @else {
+      <div class="np-list">
+        @for (notification of notifications(); track notification.id) {
+          <app-notification-item
+            [notification]="notification"
+            (action)="onAction($event)"
+            (dismissed)="onDismiss($event)"
+            (markRead)="onMarkRead($event)"
+            (cancel)="onCancel($event)" />
+        }
+      </div>
+    }
+  </div>
+</shared-side-panel>

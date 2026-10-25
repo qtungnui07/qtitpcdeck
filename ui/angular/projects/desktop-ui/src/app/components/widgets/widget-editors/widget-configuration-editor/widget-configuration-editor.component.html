@@ -1,0 +1,63 @@
+<ng-template #previewBlock>
+  <div class="editor-preview">
+    <div
+      class="preview-frame preview-frame-scaled"
+      [style.width.px]="previewReference.width * previewScale"
+      [style.height.px]="previewReference.height * previewScale"
+      [style.border-radius.px]="22 * previewScale">
+      <shared-ui-tree-widget
+        class="preview-widget preview-widget-scaled"
+        [widgetType]="widget.type"
+        [data]="previewData()"
+        [variableScopeWidgetId]="widget.id"
+        [width]="previewReference.width"
+        [height]="previewReference.height"
+        [style.width.px]="previewReference.width"
+        [style.height.px]="previewReference.height"
+        [style.--wq.px]="previewReference.width < previewReference.height ? previewReference.width : previewReference.height"
+        [style.transform]="'scale(' + previewScale + ')'"
+        [tileDrawsBorder]="true">
+      </shared-ui-tree-widget>
+      <shared-widget-border-overlay [border]="previewBorder()" />
+    </div>
+  </div>
+</ng-template>
+
+<ng-template #propertiesBlock>
+  @if (propertiesRegion(); as propertiesNode) {
+    <div class="widget-config-properties">
+      <shared-ui-node [node]="propertiesNode" />
+    </div>
+  }
+</ng-template>
+
+@if (sessionEnd()) {
+  <div class="widget-config-rejected" role="alert">
+    @if (!tooLarge()) {
+      <p>{{ 'macrodeck.app:Widgets.Editor.ConfigUnavailableMessage' | translate }}</p>
+    } @else if (canRestore()) {
+      <p>{{ 'macrodeck.app:Widgets.Editor.ConfigTooLargeMessage' | translate }}</p>
+      <shared-button variant="primary" (click)="restoreLastShownDraft()">
+        {{ 'macrodeck.app:Widgets.Editor.RestoreLastWorkingAction' | translate }}
+      </shared-button>
+    } @else {
+      <p>{{ 'macrodeck.app:Widgets.Editor.ConfigTooLargeNoRestoreMessage' | translate }}</p>
+    }
+  </div>
+} @else if (editorRegion(); as editorNode) {
+  <app-widget-editor-shell>
+    <ng-container editorSidebar>
+      <ng-container [ngTemplateOutlet]="previewBlock" />
+      <ng-container [ngTemplateOutlet]="propertiesBlock" />
+    </ng-container>
+
+    <div class="widget-config-editor">
+      <shared-ui-node [node]="editorNode" />
+    </div>
+  </app-widget-editor-shell>
+} @else {
+  <div class="widget-config-single-pane">
+    <ng-container [ngTemplateOutlet]="previewBlock" />
+    <ng-container [ngTemplateOutlet]="propertiesBlock" />
+  </div>
+}

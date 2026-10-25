@@ -1,0 +1,95 @@
+---
+title: Compatibility
+description: The three packages as versioned contracts, why the model major moved to 3, and why 4 did not move the floor with it.
+---
+
+`MacroDeck.Ui`, `MacroDeck.Ui.Model`, and `MacroDeck.Ui.Testing` are public NuGet contracts. Existing
+keys, component meanings, patch semantics, and public API members must follow the normal
+[compatibility policy](/policies/compatibility/).
+
+## Why the floor is 3 and the ceiling is 4
+
+The UI model's `Minimum` is 3 and its `Current` is 4, and the gap between them is the difference between
+a rename and a widening.
+
+The floor moved to 3 because the component vocabulary was renamed outright rather than extended: every
+`widget.*` node type became either `ui.*` or `macrodeck.*`, with no alias kept for the old spelling. A
+tree built against the old vocabulary is not representable under the new one, so a package that no longer
+understands a single `widget.*` type must not advertise the majors in which those were the only spelling.
+
+The ceiling moved to 4 because an `icon` property may now carry a typed `{"type":…,"reference":…}`
+provider reference where it previously always carried a bare icon-pack reference string - the same shape
+as the move to 2, where a text property gained the option of carrying a localization reference. A producer
+built against 3 emits only the string form and one built against 4 may emit either, so the two are not
+interchangeable and the version has to say which a session speaks. The floor stayed where it was because
+nothing was renamed: a reader at 4 accepts both readings, so it still reads every tree a producer at 3
+emits, and `UiIconInput` is unchanged.
+
+Either way a client and a provider negotiate the model version as they always have - before a session is
+opened - and a mismatch produces the same graceful decline, never a tree the reader cannot parse.
+
+## Additions that moved no version
+
+New component types and new properties are additive and leave the model version alone; the component
+profile's rule decides which of the two a new feature is. [Modifiers](/ui/components/modifier/) add both:
+
+| Addition | Shape | An older reader |
+|---|---|---|
+| `modifiers` (background, radius, border, accessibility text, `disabled`) | A property on any node | Ignores it and draws the node plainer. A disabled subtree still offers none of its own events, because the DSL stopped it declaring them, but the reader does not know the region absorbs the tile's press, so a deck tile's own flows still run there. |
+| `drag`, `drag-end`, `swipe`, `pinch`, `pinch-end` | Event names | Never sends a name it does not implement. |
+| `pointer-down`, `pointer-move`, `pointer-up`, `tap` | Event names | Never sends them, and does not claim the pointer for a node that declares only these: a deck tile's own press flow still runs when the node is pressed there. |
+| `italic`, `underline`, `strikethrough`, `monospace`, `background` on a `ui.text` span | Properties of a `spans` entry | Draws the span's text plain, in the run's own face and without a background. |
+| `spans` and `variant` on a config `prose` | Properties of the node | Draws the paragraph's plain `text` as an ordinary paragraph. |
+| `accent` on a config `stack` | A property of the node | Ignores it and draws a plain stack. |
+| `UiSessionParameterValuesReportedEvent`, `UiSessionFlushedEvent` and the `FlushUiSession` request, for an action configuration session | Client events and a client request | An older client ignores both events and never flushes, so a value an action's configuration only reported is not saved from it; the tree still shows and edits. An older host refuses `FlushUiSession` as an unknown type, which a client treats as flushed. See [Reporting values the tree edits](/ui/views/configuration/#reporting-values-the-tree-edits). |
+| `offersStateProvider`, `offersIconProvider`, `stateProviderBlockId`, `iconProviderBlockId` on `actions-list-editor`, and the `provide` config event | Properties and an event name | Ignores the properties, never sends `provide`, and shows the action list without provider controls. |
+| `status` (`UiStatus`), `menu` (`UiConfigMenu`) and `dialog` (`UiConfigDialog`) | Configuration types | Declines them and draws the node's `fallback`. |
+| `confirmTitle`, `confirmMessage`, `confirmLabel`, `confirmDanger`, `promptValue` on `button` | Properties | Raises `activate` at once, without asking and without a payload. |
+| `interaction` on `ui.slider` (`relative`) | A property | Ignores it and keeps the absolute drag: a press jumps the level to the pointer, and a tap sends `change`. |
+| `ui.modifier` (padding, opacity, clip, mask, frame), component version 1 | A type | Draws the node's explicit `fallback`; without one, none of the wrapped content (Macro Deck's renderer shows a faint placeholder box). No fallback is invented for you. |
+| `trackColor` on `ui.gauge` | A property | Ignores it and draws the theme's track colour, so the ring still reads. |
+| `shadow`, `strokeColor` and `strokeWidth` on `ui.text` | Properties | Ignores them: keeps its own legibility shadow and draws no outline, so the text still reads. |
+| `spans` on `ui.text` | A property | Ignores it and draws `text`, which the producer keeps the plain equivalent of the spans: the same words, each image as its alt text, on one font and colour. |
+| `overflow` on `ui.stack` (`clip-start`), component version 2 | A property, gated by a component version | Draws the node's `fallback`, because a producer using `clip-start` asks for version 2. Without that ask a version 1 reader ignores the key and shrinks every child into the box. |
+| `anchor` on `ui.list` (`end`), component version 3 | A property, gated by a component version | Draws the node's `fallback`, because a producer using `end` asks for version 3. Without that ask a version 2 reader ignores the key and leaves the view where the user put it, so new rows at the end stay below the fold. |
+| `ui.responsive` and its `variants` property, component version 1 | A type | Draws the node's `fallback`. Unlike `ui.modifier`, one is invented when you set none: a copy of the default layout. When it decides whether the tile's own press belongs to a control, it walks every layout, not only the one it would have drawn - see [Responsive](/ui/components/responsive/#older-readers). |
+| `ui.first-fit`, component version 1 | A type | Draws the node's `fallback`. One is invented when you set none: a copy of the last layout, the one that is always acceptable. When it decides whether the tile's own press belongs to a control, it walks every layout - see [First fit](/ui/components/first-fit/#older-readers-and-readers-that-cannot-measure). |
+| `macrodeck.video-stream` and its `stream` property, component version 1 | A type | Draws the node's `fallback`, and opens no session. See [Video stream](/ui/components/video-stream/#older-readers). |
+| `transparent` as the `background` of `ui.stack` and `ui.button` | A value | Treats it as no background: a stack draws the tile face behind it, a button its accent colour. The tile face stays, so the folder background does not show through. |
+| `searchable` on `choice` and `dynamic-choice` | A property | Ignores it and draws the plain select; the value and its label are unchanged. |
+| `allowTransparent` on `color` | A property | Ignores it and offers no Transparent swatch; a stored `transparent` still shows as the input's value. |
+| `thresholds` (`UiThresholdsInput`) and its `unit`, `fixedCount`, `fixedColors` and `maxCount` properties | A configuration type | Declines it and draws the node's `fallback`, or shows the field as unsupported. |
+| `allowVariables` on `color` and `thresholds` | A property | Ignores it and offers fixed colours only. |
+| `ofParent` on a length (`UiLength.OfParent`) | A member of an existing value | Ignores it and resolves `basis` against the widget, which is why `basis` is always sent. Pass the fallback you want as the second argument. See [Sizing](/ui/concepts/sizing/#relative-to-the-containing-box). |
+| `minCellSize` on `ui.grid` | A property | Ignores it and draws `columns` by `rows`, hiding the children that do not fit those rows. Set both to the arrangement an older reader should draw. See [Grid](/ui/components/grid/#choosing-the-columns). |
+| `#rrggbbaa` wherever a `#rrggbb` colour is accepted | A value | Rejects it like any other unknown spelling: the property counts as omitted and the theme colour is drawn. |
+| `device-laptop`, `device-watch`, `device-headphones`, `device-gamepad`, `device-mouse`, `device-keyboard`, `device-speaker`, `battery` and `battery-charging` as the `icon` of `ui.icon`, component version 2 | Values, gated by a component version | Draws the node's `fallback`, because a producer using one of these names asks for version 2. Without that ask a version 1 reader draws nothing for the name. See [Icon](/ui/components/icon/#names-and-versions). |
+
+See [ADR 0064](https://github.com/Macro-Deck-App/Macro-Deck/blob/main/engineering/decisions/0064-components-are-a-registry-over-two-namespaces.md)
+for why the vocabulary is organized as a registry over the `ui.*`/`macrodeck.*` namespaces rather than one
+flat list, and [The UI model](/ui/concepts/ui-model/#model-version-negotiation) for where negotiation
+sits in a session's lifecycle.
+
+## Behaviour changes that moved no version
+
+These change what an existing plugin observes without a new model version. Each is a deliberate
+exception to the [compatibility policy](/policies/compatibility/), listed here so you can check your plugin
+against it.
+
+| Change | Hosts | What an existing plugin sees |
+|---|---|---|
+| A plugin built on the SDK with the message channel declares the `messaging` capability kind, at local id `provider`, whenever the host lists it in `capabilityKinds` - also when the plugin never uses the channel | Released after 3.0.0-beta.11 | A test that asserts a plugin's exact declared capabilities, against `MacroDeckTestHost`, `PluginTestHarness` or a real host, sees one more entry. Nothing changes on a host without the kind. See [Messaging between plugins](/features/messaging/#older-versions-of-macro-deck). |
+| `UiView` implements `IDisposable`, and `UiPreviewInstance.DisposeAsync` disposes its view - including a `UiView` a preview scenario returned itself | Released after 3.0.0-beta.7 | A plugin that never disposes a view behaves as before. A preview scenario that returns a cached `UiView` gets a disposed view that ignores every event from the second open on; build a new one per call. A plugin that builds with CA1001 as an error may see it on a type that creates a `UiView` in a field without being disposable. See [Disposing](/ui/concepts/reactive-updates/#disposing). |
+| A `link` with an external `http` or `https` URL is opened by the host in the default browser on every surface, whether or not it declares `activate` | Released after 3.0.0-beta.6 | A link that declares `activate` still receives it exactly once, and is now opened by the host outside the integration setup dialog too. A handler that opened the URL itself opens a second tab; remove that code. See [Links](/ui/concepts/events/#links). |
+| `IUiConfigFlow.CreateUiSessionAsync` can be called again for the same flow instance, after its previous session ended with a retryable error or was reloaded for .NET Hot Reload | Released after 3.0.0-beta.13 | A flow that assumed one session per flow instance gets a second call. Build each session from state the flow holds; the user's unsaved edits arrive as `change` events. See [From a config flow](/ui/views/configuration/#from-a-config-flow). |
+| A device provider receives a null `DeviceSurfaceAppearance.BackgroundColor` for a widget whose stored background is `transparent`, instead of the literal | Released after 3.0.0-beta.14 | A provider that drew the stored string sees no colour for that key, like a widget without a background; one that parsed the literal as a colour no longer fails on it. See [Devices](/features/devices/). |
+| Under .NET Hot Reload, a plugin built on this SDK ends every open session except dialogs with `ui/reload`, and Macro Deck opens each one again | SDK released after 3.0.0-beta.13; on an older host the SDK sends `ui/fault` instead | A provider is asked for new sessions for views that are already open, each time Hot Reload applies a change. A plugin that is not being hot reloaded sees nothing new. See [Real views](/ui/views/developer-preview/#real-views). |
+| `PackageSigner` and `PackageVerifier` refuse an icon pack with more than 30,000 archive entries, counting the signature files, with `too-many-entries`; an icon pack's `pack.json` may be up to 32 MiB instead of 8 MiB | SDK released after 3.0.0-beta.13 | Signing a pack that would exceed 30,000 entries now fails. No host ever imported more than 10,000 entries, so no signed pack that installs is affected. Plugin, profile and template manifests keep the 8 MiB bound. See [Publish an icon pack](/creator-portal/publish-icon-pack/#size-limits). |
+| An exported icon pack, profile or widget carries one master image per icon and no smaller sizes; Macro Deck creates the sizes it serves from the master when an icon is first shown, and ignores size files in packs it imports | Released after 3.0.0-beta.13 | An icon pack bundled from a newer export has half to a quarter of the files. Macro Deck 3.0.0-beta.13 and older import it but show its full-size masters at every size. A bundled pack exported by an older version still imports; its size files are not used. See [Publish an icon pack](/creator-portal/publish-icon-pack/#size-limits). |
+| Icons can have [appearances](/guide/concepts/#icon-appearances). An exported icon pack's `pack.json` and a profile or widget archive nest them under their icon and list their masters as extra files. For such an icon, a plugin icon handle's `resourceId` carries a marker, and a device surface's `IconId` is the GUID of the appearance chosen for that device | Released after 3.0.0-beta.15 | A pack bundled from a newer export has one more file per appearance; Macro Deck versions without appearances import it and show the default images, and an `icon-pack add` from an older CLI accepts it. A plugin that treats `resourceId` as opaque sees no difference. A device provider gets a GUID it may not find in icon listings; `GetIconAsync` serves it. Icons without appearances behave as before. See [Publish an icon pack](/creator-portal/publish-icon-pack/) and [Devices](/features/devices/). |
+| An icon can have appearances with the trait `variant` (key `variant=outlined`), named by the user and picked manually. The **Set Icon Appearance** action's `iconAppearance` parameter is now a dynamic choice listing them, instead of a fixed list | Released after 3.0.0-beta.15 | Stored values and key syntax are unchanged; a client that cannot load options still shows the stored value. A pack with `variant` appearances imports in any version that has appearances, and older versions show the default image. A `variant` appearance never matches a viewer context, so it is never selected automatically. See [Button icons](/features/button-icons/). |
+| Turning an integration off withdraws everything its providers registered - widget types, layouts, folder views, screensavers - and takes its devices offline. While it is off, registering one of those is validated and answered as usual but not kept, and its devices stay offline whatever presence is reported | Released after 3.0.0-beta.14 | A plugin the user turned off no longer has its widget types, layouts, folder views or screensavers offered, including after it reconnects, and its devices show offline. Nothing changes while it is on, or for a plugin that was never configured. When the user turns it back on, the plugin is asked to initialize again, as after a configuration change, and registers what it offers. |
+| A `ui.list` reader starts its `reveal` count over when the list's content is replaced: it holds fewer children than at its previous paint, or the child at the furthest index sent is gone or has another id | Released after 3.0.0-beta.11 | A `reveal` can now carry an index at or below one the plugin already received, after its list shrank or its rows were replaced, including a row inserted or removed above the furthest index. A handler that only grows its window, as [List](/ui/components/list/#loading-more-items) shows, is unaffected; one that sets its window from the index unconditionally can shrink it and should keep the larger value. A reader that has not adopted this rule, such as an older Companion app, may not ask again after a replacement. |
+| A colour with alpha, stored as `rgba(...)` or `#rrggbbaa`, is drawn translucent on the deck and in the widget editor | Released after 3.0.0-beta.15 | A widget appearance patch or stored widget data with such a colour, which used to be drawn opaque, now lets the tile face show through. Send `#rrggbb` to keep a colour opaque. Device surfaces still receive opaque `#rrggbb`. |
+| The Slider and History Graph widgets have colour thresholds: while a widget's `thresholdsEnabled` is on, the band its value falls in picks its colour | Released after 3.0.0-beta.15 | A `WidgetAppearanceProperty.AccentColor` patch on such a widget is still stored and acknowledged, but has no visible effect until the user turns the thresholds off. |
+| A Weather widget's default press runs the details action its station's provider declares through `IWeatherProvider.DetailsAction`, instead of always running the built-in Weather integration's **Weather details** action | Released after 3.0.0-beta.16 | A weather plugin built against an older SDK declares no details action, so pressing a widget that shows one of its stations runs nothing until the user adds a flow; a flow the user added still runs. See [Pressing the widget](/features/weather/#pressing-the-widget). |

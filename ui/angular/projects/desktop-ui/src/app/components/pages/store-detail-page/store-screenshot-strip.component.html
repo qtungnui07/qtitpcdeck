@@ -1,0 +1,43 @@
+@if (selected(); as current) {
+  <div class="gallery">
+    <button
+      type="button"
+      class="gallery-main"
+      [attr.aria-label]="thumbnailAriaLabel(current, selectedIndex())"
+      (click)="open(selectedIndex(), $event)">
+      <img [src]="thumbnailUrl(current)" [alt]="current.caption || ''">
+      <span class="gallery-expand" aria-hidden="true">
+        <span class="icon icon-search icon-sm"></span>
+      </span>
+    </button>
+    @if (current.caption) {
+      <p class="gallery-caption">{{ current.caption }}</p>
+    }
+
+    @if (screenshots().length > 1) {
+      <div class="gallery-thumbs" role="list">
+        @for (screenshot of screenshots(); track screenshot.index; let i = $index) {
+          <button
+            type="button"
+            role="listitem"
+            class="thumb"
+            [class.active]="i === selectedIndex()"
+            [attr.aria-current]="i === selectedIndex() ? 'true' : null"
+            [attr.aria-label]="thumbnailAriaLabel(screenshot, i)"
+            (click)="select(i)">
+            <img [src]="thumbnailUrl(screenshot)" alt="" loading="lazy">
+          </button>
+        }
+      </div>
+    }
+  </div>
+}
+
+@if (openIndex() !== null) {
+  <app-store-screenshot-viewer
+    [kind]="kind()"
+    [extensionId]="extensionId()"
+    [screenshots]="screenshots()"
+    [initialIndex]="openIndex()!"
+    (closed)="onViewerClosed()" />
+}

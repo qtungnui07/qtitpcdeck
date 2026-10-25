@@ -1,0 +1,105 @@
+using MacroDeckHost.Application.Notifications;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Application.Store;
+using MacroDeckHost.Application.Store.Operations;
+using MacroDeck.Localization;
+using MacroDeckHost.Localization;
+using Mediator;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace MacroDeckHost.Application.Events.Handlers;
+
+/// <summary>Raises a per-operation notification only once an install or update reaches a terminal state -
+/// intermediate progress belongs on the store page, not the notification list. The dedupe key carries the
+/// package id so two packages failing around the same time do not overwrite each other's notification.
+/// </summary>
+public sealed class StoreOperationUserNotificationHandler : INotificationHandler<StoreOperationProgressNotification>
+{
+	private readonly IUserNotificationStore _store;
+	private readonly IServiceScopeFactory _scopeFactory;
+	private readonly ILocalizationResolver _localization;
+
+	public StoreOperationUserNotificationHandler(
+		IUserNotificationStore store,
+		IServiceScopeFactory scopeFactory,
+		ILocalizationResolver localization)
+	{
+		_store = store;
+		_scopeFactory = scopeFactory;
+		_localization = localization;
+	}
+
+	public async ValueTask Handle(StoreOperationProgressNotification notification, CancellationToken cancellationToken)
+	{
+		var operation = notification.Operation;
+		if (!operation.IsTerminal)
+		{
+			return;
+		}
+
+		var dedupeKey = DedupeKey(operation);
+		if (operation.State is StoreOperationState.Cancelled)
+		{
+			_store.DismissByKey(dedupeKey);
+			return;
+		}
+
+		var culture = await ActiveLocalization.Culture(_scopeFactory);
+		var isUpdate = operation.Kind is StoreOperationKind.Update;
+		var isDowngrade = isUpdate && StoreVersions.IsOlder(operation.Version, operation.PreviousVersion);
+		var draft = operation.State is StoreOperationState.Completed
+			? new UserNotificationDraft
+			{
+				Severity = UserNotificationSeverity.Info,
+				Kind = UserNotificationKind.Update,
+				Title = _localization.Resolve(isDowngrade
+							? AppStrings.Notifications.StoreExtensionDowngraded(operation.DisplayName)
+							: isUpdate
+								? AppStrings.Notifications.StoreExtensionUpdated(operation.DisplayName)
+								: AppStrings.Notifications.StoreExtensionInstalled(operation.DisplayName),
+						culture)
+					?? operation.DisplayName,
+				Message = _localization.Resolve(AppStrings.Notifications.StoreVersionReady(operation.Version),
+					culture),
+				Action = new UserNotificationAction(UserNotificationActionKind.OpenExtensionStore, operation.PackageId),
+				DedupeKey = dedupeKey
+			}
+			: new UserNotificationDraft
+			{
+				Severity = UserNotificationSeverity.Error,
+				Kind = UserNotificationKind.Error,
+				Title = _localization.Resolve(isDowngrade
+							? AppStrings.Notifications.StoreExtensionDowngradeFailed(operation.DisplayName)
+							: isUpdate
+								? AppStrings.Notifications.StoreExtensionUpdateFailed(operation.DisplayName)
+								: AppStrings.Notifications.StoreExtensionInstallFailed(operation.DisplayName),
+						culture)
+					?? operation.DisplayName,
+				Message = FailureHeadline(operation.Error) is { } headline
+					? _localization.Resolve(headline, culture)
+					: operation.ErrorMessage,
+				Action = operation.Error is StoreOperationError.RequiresNewerMacroDeck
+					? new UserNotificationAction(UserNotificationActionKind.OpenUpdateSettings, null)
+					: new UserNotificationAction(UserNotificationActionKind.OpenExtensionStore, operation.PackageId),
+				DedupeKey = dedupeKey
+			};
+
+		_store.Raise(draft);
+	}
+
+	private static LocalizedString? FailureHeadline(StoreOperationError? error)
+	{
+		return error switch
+		{
+			StoreOperationError.RequiresNewerMacroDeck => AppStrings.Store.Error.RequiresNewerMacroDeck(),
+			StoreOperationError.Incompatible => AppStrings.Store.Error.Incompatible(),
+			StoreOperationError.VersionNotFound => AppStrings.Store.Error.VersionNotFound(),
+			_ => null
+		};
+	}
+
+	private static string DedupeKey(StoreOperation operation)
+	{
+		return $"store-operation:{operation.ExtensionKind}:{operation.PackageId.ToLowerInvariant()}";
+	}
+}

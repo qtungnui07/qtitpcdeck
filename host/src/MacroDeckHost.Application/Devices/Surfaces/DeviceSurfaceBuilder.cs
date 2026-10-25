@@ -1,0 +1,402 @@
+using System.Text.Json.Nodes;
+using MacroDeck.Localization;
+using MacroDeck.Sdk.Devices;
+using MacroDeckHost.Application.Actions;
+using MacroDeckHost.Application.Caching;
+using MacroDeckHost.Application.Icons;
+using MacroDeckHost.Application.Layouts;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Application.Profiles;
+using MacroDeckHost.Application.Rendering;
+using MacroDeckHost.Application.Timers;
+using MacroDeckHost.Application.Ui.Transport.Messages.Widgets;
+using MacroDeckHost.Application.Variables.Colors;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Domain.Common;
+using MacroDeckHost.Domain.Entities;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Domain.Widgets;
+
+namespace MacroDeckHost.Application.Devices.Surfaces;
+
+/// <summary>
+/// What a device should render right now, plus what the session has to subscribe to keep it current.
+/// <see cref="Revision" /> is not part of it: the session owns the counter and only advances it once
+/// the projection is known to differ from the last one pushed.
+/// </summary>
+public sealed record DeviceSurfaceProjection
+{
+	public static readonly DeviceSurfaceProjection Empty = new()
+	{
+		Surface = DeviceSurface.Empty,
+		ProfileId = null,
+		FolderId = null,
+		Subscriptions = [],
+		WidgetFolderIds = new Dictionary<string, string>(StringComparer.Ordinal)
+	};
+
+	public required DeviceSurface Surface { get; init; }
+
+	public required string? ProfileId { get; init; }
+
+	public required string? FolderId { get; init; }
+
+	/// <summary>The widgets the session subscribes state and label pushes for.</summary>
+	public required IReadOnlyList<DeviceSurfaceSubscription> Subscriptions { get; init; }
+
+	/// <summary>
+	/// The folder that owns each widget on the surface, keyed by widget id. Not the folder being
+	/// rendered: a pinned widget is shown here but belongs to another folder, and its trigger has to be
+	/// addressed to the folder it belongs to.
+	/// </summary>
+	public required IReadOnlyDictionary<string, string> WidgetFolderIds { get; init; }
+
+	public string? FolderName { get; init; }
+}
+
+/// <summary>One widget the session watches, keyed the way each publisher keys its subscribers.</summary>
+public sealed record DeviceSurfaceSubscription(Guid WidgetId, string StateId);
+
+/// <summary>
+/// Projects a device's assigned profile and current folder into the surface it should render. Reads
+/// folders as DTOs through <see cref="IProfileRegistry" /> rather than as entities, so a virtual
+/// profile projects through exactly the same path a stored one does.
+/// </summary>
+public sealed class DeviceSurfaceBuilder
+{
+	private readonly IProfileRegistry _profiles;
+	private readonly IWidgetStateService _widgetStates;
+	private readonly IWidgetIconService _widgetIcons;
+	private readonly ILabelTextService _labelText;
+	private readonly ILocalizationResolver _localization;
+	private readonly IAppPreferenceService _preferences;
+	private readonly IIconPackCache _icons;
+	private readonly IWidgetDefaultShortPress _defaultShortPress;
+	private readonly IColorReferenceResolver _colors;
+
+	public DeviceSurfaceBuilder(
+		IProfileRegistry profiles,
+		IWidgetStateService widgetStates,
+		IWidgetIconService widgetIcons,
+		ILabelTextService labelText,
+		ILocalizationResolver localization,
+		IAppPreferenceService preferences,
+		IIconPackCache icons,
+		IWidgetDefaultShortPress defaultShortPress,
+		IColorReferenceResolver colors)
+	{
+		_colors = colors;
+		_icons = icons;
+		_defaultShortPress = defaultShortPress;
+		_profiles = profiles;
+		_widgetStates = widgetStates;
+		_widgetIcons = widgetIcons;
+		_labelText = labelText;
+		_localization = localization;
+		_preferences = preferences;
+	}
+
+	public async Task<DeviceSurfaceProjection> BuildAsync(
+		DeviceEntity device,
+		string? currentProfileId,
+		string? currentFolderId,
+		CancellationToken cancellationToken)
+	{
+		if (ResolveProfileId(currentProfileId, device.StartupProfileId) is not { } profileId
+			|| ResolveProfile(profileId) is not { } profile
+			|| _profiles.GetFoldersForProfile(profileId) is not { Count: > 0 } folders)
+		{
+			return DeviceSurfaceProjection.Empty;
+		}
+
+		var folder = folders.FirstOrDefault(candidate =>
+				string.Equals(candidate.Id, currentFolderId, StringComparison.Ordinal))
+			?? StartFolderResolver.SelectStartFolder(folders);
+		if (folder is null)
+		{
+			return DeviceSurfaceProjection.Empty;
+		}
+
+		var culture = (await _preferences.GetLocalization()).Culture;
+		var iconContext = IconContextOf(device);
+		var widgets = new List<DeviceSurfaceWidget>();
+		var subscriptions = new List<DeviceSurfaceSubscription>();
+		var widgetFolderIds = new Dictionary<string, string>(StringComparer.Ordinal);
+		foreach (var (widget, ownerFolderId) in SurfaceFolderChain.DisplayedWidgets(folder, folders))
+		{
+			widgets.Add(await BuildWidget(widget, culture, iconContext, subscriptions, cancellationToken));
+			widgetFolderIds[widget.Id] = ownerFolderId;
+		}
+
+		var surface = new DeviceSurface
+		{
+			Revision = 1,
+			Profile = new DeviceSurfaceProfile(profile.Id, profile.Name),
+			Folder = new DeviceSurfaceFolder(folder.Id, folder.Name, folder.ParentId, folder.ParentId is null),
+			Layout = new DeviceSurfaceLayout
+			{
+				Rows = SurfaceFolderChain.ResolveRows(folder, folders, profile.DefaultRows),
+				Columns = SurfaceFolderChain.ResolveColumns(folder, folders, profile.DefaultColumns),
+				WidgetSpacing = SurfaceFolderChain.ResolveWidgetSpacing(folder, folders, profile.DefaultWidgetSpacing),
+				WidgetBorderRadius = SurfaceFolderChain.ResolveWidgetBorderRadius(folder,
+					folders,
+					profile.DefaultWidgetBorderRadius),
+				BackgroundColor = DeviceColor(SurfaceFolderChain.ResolveBackgroundColor(folder,
+						profile.DefaultBackgroundColor),
+					null),
+				// Echoed verbatim: the host never parses it and never fits the grid or the widget
+				// positions to the device's physical capabilities.
+				LayoutReference = device.LayoutReference
+			},
+			Widgets = widgets
+		};
+
+		return new DeviceSurfaceProjection
+		{
+			Surface = surface,
+			ProfileId = profile.Id,
+			FolderId = folder.Id,
+			FolderName = folder.Name,
+			Subscriptions = subscriptions,
+			WidgetFolderIds = widgetFolderIds
+		};
+	}
+
+	private IReadOnlyList<DeviceInteractionKind> SupportedInteractions(Widget widget)
+	{
+		var triggerTypes = WidgetFlowsJson.TriggerTypes(widget.Data);
+		var hasPressFlow = TimerWidgetConfig.IsTimerType(widget.Type)
+			|| _defaultShortPress.RunsOnDevices(widget.Type)
+			|| triggerTypes.Any(type =>
+				string.Equals(type, WidgetTriggerTypes.ShortPress, StringComparison.OrdinalIgnoreCase)
+				|| string.Equals(type, WidgetTriggerTypes.LongPress, StringComparison.OrdinalIgnoreCase)
+				|| string.Equals(type, WidgetTriggerTypes.TouchStart, StringComparison.OrdinalIgnoreCase)
+				|| string.Equals(type, WidgetTriggerTypes.TouchEnd, StringComparison.OrdinalIgnoreCase));
+
+		if (hasPressFlow)
+		{
+			return
+			[
+				DeviceInteractionKind.Press, DeviceInteractionKind.Release, DeviceInteractionKind.ShortPress,
+				DeviceInteractionKind.LongPress
+			];
+		}
+
+		return !string.Equals(widget.Type, WidgetTypeIds.Slider, StringComparison.Ordinal)
+			&& WidgetTypeIds.BuiltIn.Contains(widget.Type, StringComparer.Ordinal)
+			&& WidgetFlowsJson.HasRunnableFlow(widget.Data, WidgetTriggerTypes.DoublePress)
+				? [DeviceInteractionKind.Press, DeviceInteractionKind.Release]
+				: [];
+	}
+
+	private static string? ReadString(JsonObject? data, string key)
+	{
+		return data?[key] is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+	}
+
+	private static int? ReadInt(JsonObject? data, string key)
+	{
+		return data?[key] is JsonValue value && value.TryGetValue<int>(out var number) ? number : null;
+	}
+
+	private static double? ReadDouble(JsonObject? data, string key)
+	{
+		return data?[key] is JsonValue value && value.TryGetValue<double>(out var number) ? number : null;
+	}
+
+	// Providers predate transparent widget backgrounds and may parse this as a colour, so it arrives as no colour.
+	private static string? DeviceBackground(string? value)
+	{
+		return string.Equals(value?.Trim(), "transparent", StringComparison.OrdinalIgnoreCase) ? null : value;
+	}
+
+	// Providers predate colour references and alpha: a reference arrives resolved and a translucent colour
+	// as opaque #rrggbb, while every other value is passed exactly as stored, as it always was.
+	private string? DeviceColor(string? value, Guid? widgetId)
+	{
+		if (value is null)
+		{
+			return null;
+		}
+
+		var resolved = value;
+		if (ColorReference.TryParse(value, out _))
+		{
+			resolved = _colors.Resolve(value,
+				widgetId is null ? VariableScope.Global : VariableScope.Widget,
+				widgetId?.ToString());
+			if (resolved.Length == 0)
+			{
+				return null;
+			}
+		}
+
+		return RgbaColor.Parse(resolved) is { IsOpaque: false } translucent ? translucent.ToOpaqueString() : resolved;
+	}
+
+	private static string? Pick(JsonObject? state, JsonObject root, string key)
+	{
+		return ReadString(state, key) is { Length: > 0 } value ? value : ReadString(root, key);
+	}
+
+	/// <summary>
+	/// The same state-wins-else-root cascade <see cref="Pick" /> applies to a plain field, but reading the
+	/// typed <c>icon</c> shape (falling back to a legacy bare <c>iconId</c>) and returning only an
+	/// icon-pack reference - <see cref="MacroDeck.Sdk.Devices.DeviceSurfaceAppearance.IconId" />
+	/// stays GUID-only forever, so a reference naming any other provider resolves to no icon here exactly
+	/// as an unparseable legacy id always has.
+	/// </summary>
+	private static WidgetIconReference? PickIconPackReference(JsonObject? state, JsonObject root)
+	{
+		var reference = ReadIconReference(state) ?? ReadIconReference(root);
+		return reference is { Type: WidgetIconReference.IconPackType } value ? value : null;
+	}
+
+	private static WidgetIconReference? ReadIconReference(JsonObject? appearance)
+	{
+		return WidgetIconReference.Read(appearance?["icon"], ReadString(appearance, "iconId"));
+	}
+
+	private async Task<DeviceSurfaceWidget> BuildWidget(
+		Widget widget,
+		string culture,
+		IconAppearanceContext iconContext,
+		List<DeviceSurfaceSubscription> subscriptions,
+		CancellationToken cancellationToken)
+	{
+		var isPersisted = Guid.TryParse(widget.Id, out var widgetId);
+		var state = isPersisted ? await _widgetStates.Resolve(widgetId, cancellationToken) : null;
+		var stateId = state?.StateId;
+
+		var appearance = await BuildAppearance(widget, widgetId, isPersisted, stateId, iconContext, cancellationToken);
+		if (isPersisted)
+		{
+			subscriptions.Add(new DeviceSurfaceSubscription(widgetId, stateId ?? LabelGroups.Normalize(string.Empty)));
+		}
+
+		return new DeviceSurfaceWidget
+		{
+			Id = widget.Id,
+			Type = widget.Type.ToString(),
+			PositionX = widget.PositionX,
+			PositionY = widget.PositionY,
+			Width = widget.Width,
+			Height = widget.Height,
+			IsPinned = widget.IsPinned,
+			StateId = stateId,
+			StateLabel = state is null ? null : _localization.Resolve(state.StateLabel, culture),
+			Appearance = appearance,
+			SupportedInteractions = SupportedInteractions(widget)
+		};
+	}
+
+	/// <summary>
+	/// Builds the curated appearance a device renders from. The widget's stored <c>Data</c> never
+	/// travels: it carries the flow definitions, the state mapping and the provider configuration, none
+	/// of which a rendering provider is entitled to see.
+	/// </summary>
+	private async Task<DeviceSurfaceAppearance> BuildAppearance(
+		Widget widget,
+		Guid widgetId,
+		bool isPersisted,
+		string? stateId,
+		IconAppearanceContext iconContext,
+		CancellationToken cancellationToken)
+	{
+		var model = ActionButtonStateModel.Read(widget.Data);
+		var root = model.Data;
+		var state = model.StateMode ? model.FindState(stateId)?.Appearance : null;
+		var iconDisplay = state?["iconDisplay"] as JsonObject ?? root["iconDisplay"] as JsonObject;
+
+		var label = isPersisted
+			? await _labelText.ResolveText(widgetId, stateId ?? string.Empty, cancellationToken)
+			: null;
+
+		// An active icon provider is authoritative for the whole button (issue #425 decision 1) and is
+		// checked first: it decides IconId/IconVersion/HasProviderIcon together, so the three can never
+		// disagree about who currently owns the icon.
+		var providerIcon = isPersisted
+			? await _widgetIcons.Resolve(widgetId, WidgetIconLimit.Protocol, cancellationToken)
+			: WidgetIconResolution.Inactive;
+
+		// IconId never carries anything but an icon-pack GUID, so an active provider forces it null here
+		// rather than widening it to a provider reference - see DeviceSurfaceAppearance.IconId's remarks.
+		var iconPackReference = providerIcon.IsActive ? null : PickIconPackReference(state, root);
+		var (iconId, iconVersion) = ResolveDeviceIcon(iconPackReference, iconContext);
+		var providerResource = providerIcon is { IsActive: true, Resource: { } resource } ? resource : null;
+
+		return new DeviceSurfaceAppearance
+		{
+			Label = label ?? Pick(state, root, "label"),
+			LabelColor = DeviceColor(Pick(state, root, "labelColor"), isPersisted ? widgetId : null),
+			BackgroundColor = DeviceColor(DeviceBackground(Pick(state, root, "backgroundColor")),
+				isPersisted ? widgetId : null),
+			IconId = iconId,
+			// Carried so that re-rendering an icon under the same id (or the same provider) still changes
+			// the projected surface: without it the push rule sees an identical surface and the device
+			// keeps its stale bytes.
+			IconVersion = providerResource?.ContentHash ?? iconVersion,
+			HasProviderIcon = providerResource is not null,
+			IconFit = ReadString(iconDisplay, "fit"),
+			IconZoom = ReadDouble(iconDisplay, "zoom"),
+			IconOffsetX = ReadDouble(iconDisplay, "offsetX"),
+			IconOffsetY = ReadDouble(iconDisplay, "offsetY"),
+			FontSize = ReadInt(state, "fontSize") ?? ReadInt(root, "fontSize"),
+			TextAlign = Pick(state, root, "textAlign"),
+			LabelPosition = Pick(state, root, "labelPosition")
+		};
+	}
+
+	private (string? IconId, string? Version) ResolveDeviceIcon(
+		WidgetIconReference? reference,
+		IconAppearanceContext context)
+	{
+		if (reference is not { } value)
+		{
+			return (null, null);
+		}
+
+		if (!Guid.TryParse(value.Reference, out var id) || _icons.GetIconById(id) is not { } icon)
+		{
+			return (value.Reference, null);
+		}
+
+		var appearances = icon.AppearanceOfId is null ? _icons.GetAppearances(icon.Id) : [];
+		var selected = value.Appearance switch
+		{
+			_ when appearances.Count == 0 => icon,
+			WidgetIconReference.DefaultAppearance => icon,
+			{ } pin when IconAppearanceSelector.FindPinned(appearances, pin) is { } pinned => pinned,
+			_ => IconAppearanceSelector.Select(icon, appearances, context)
+		};
+
+		return selected == icon
+			? (value.Reference, IconImageVersion.Of(icon))
+			: (selected.Id.ToString(), IconImageVersion.Of(selected));
+	}
+
+	private static IconAppearanceContext IconContextOf(DeviceEntity device)
+	{
+		var visuals = LayoutSnapshotSerializer.TryDeserialize(device.LayoutSnapshot, out var layout)
+			? layout.PrimaryGrid?.Visuals ?? layout.Capabilities?.Visuals
+			: null;
+
+		return new IconAppearanceContext(null,
+			visuals is { AnimatedIcons: false } ? IconAppearanceTraits.Static : IconAppearanceTraits.Animated);
+	}
+
+	// A cross-profile navigation moves the session off the device's assigned profile, so the session's
+	// own profile wins while it still resolves; the assignment is only the starting point.
+	private string? ResolveProfileId(string? currentProfileId, string? startupProfileId)
+	{
+		return currentProfileId is not null && ResolveProfile(currentProfileId) is not null
+			? currentProfileId
+			: startupProfileId;
+	}
+
+	private Ui.Transport.Messages.Profiles.Profile? ResolveProfile(string profileId)
+	{
+		return _profiles.GetProfiles()
+			.FirstOrDefault(profile => string.Equals(profile.Id, profileId, StringComparison.Ordinal));
+	}
+}

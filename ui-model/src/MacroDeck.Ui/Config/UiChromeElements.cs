@@ -1,0 +1,637 @@
+using MacroDeck.Ui.Components;
+using MacroDeck.Ui.Dsl;
+
+namespace MacroDeck.Ui.Config;
+
+/// <summary>
+/// The root of a configuration surface: a multi-step setup flow. Counterpart of the existing config flow
+/// dialog, whose Continue and Cancel buttons and whose submit-enabled gate this element carries.
+///
+/// <para>
+/// Only the <b>active</b> step is a child. A completed step is removed from the tree and going back rebuilds
+/// it, because a step that is not being shown has no rendering and keeping it would make the tree a history
+/// rather than a view.
+/// </para>
+/// </summary>
+public sealed record UiFlow : UiContainer
+{
+	/// <summary>The dialog's heading.</summary>
+	public UiText Title { get; init; }
+
+	/// <summary>The step being shown, which is the id the next submit belongs to.</summary>
+	public UiValue<string> StepId { get; init; }
+
+	/// <summary>Where the flow is: showing a step, waiting on an external authorization, finished, failed. An
+	/// open vocabulary, like every type string in this profile.</summary>
+	public UiValue<string> State { get; init; }
+
+	/// <summary>Whether the submit affordance is enabled. Counterpart of the dialog's own gate, which is what
+	/// validation feeds: a flow with an invalid visible field cannot continue.</summary>
+	public UiValue<bool> CanSubmit { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Flow;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Title, Title.Value);
+		properties.Set(UiConfigProperties.StepId, StepId);
+		properties.Set(UiConfigProperties.State, State);
+		properties.Set(UiConfigProperties.CanSubmit, CanSubmit);
+	}
+}
+
+/// <summary>One screen of a flow. Counterpart of the existing config flow step, down to the description being
+/// the sentence that introduces the instructions rather than the instructions themselves.</summary>
+public sealed record UiStep : UiContainer
+{
+	/// <summary>The id this step submits under.</summary>
+	public UiValue<string> StepId { get; init; }
+
+	/// <summary>The step's heading.</summary>
+	public UiText Title { get; init; }
+
+	/// <summary>The sentence introducing the step, or the whole guide when there are no instructions.</summary>
+	public UiText Description { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Step;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.StepId, StepId);
+		properties.Set(UiConfigProperties.Title, Title.Value);
+		properties.Set(UiConfigProperties.Description, Description.Value);
+	}
+}
+
+/// <summary>A run of children laid out in one direction. The layout primitive the existing dialog and parameter
+/// list express implicitly through their own markup; making it an element is what lets a plugin group fields
+/// without one.</summary>
+// CA1711 reserves the Stack suffix for a LIFO collection. This is the layout element whose type string is
+// "stack", derived from what the existing dialog renders; renaming the type would make it disagree with the wire
+// name a renderer switches on.
+#pragma warning disable CA1711
+public sealed record UiConfigStack : UiContainer
+#pragma warning restore CA1711
+{
+	/// <summary>Which way the children run. An open vocabulary; a renderer that does not know a value lays them
+	/// out the way it does by default.</summary>
+	public UiValue<string> Direction { get; init; }
+
+	/// <summary>Whether the row keeps its children on one line instead of wrapping them onto more than one
+	/// when they do not fit. Absent means today's wrapping behaviour, so an existing stack renders unchanged.
+	/// Set <c>false</c> together with a <see cref="UiElement.RowWeight" /> on the children that should share
+	/// the row's width in proportion rather than size to their own content.</summary>
+	public UiValue<bool> Wrap { get; init; }
+
+	/// <summary>A literal colour, as <c>#rrggbb</c>, that sets the stack apart as a card: a renderer draws a
+	/// leading bar in this colour along a fixed dark surface with light text, the same in every theme, so
+	/// content styled for that surface keeps its contrast. Absent means a plain stack. A reader that does not
+	/// know the key, or does not recognise the spelling, ignores it.</summary>
+	public UiValue<string> Accent { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Stack;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Direction, Direction);
+		properties.Set(UiConfigProperties.Wrap, Wrap);
+		properties.Set(UiConfigProperties.Accent, Accent);
+	}
+}
+
+/// <summary>
+/// A segmented set of panels, each a <see cref="UiTab" />; only the active one's children render.
+/// Counterpart of the original Action Button appearance form's Label/Background/Border switch, drawn as a
+/// segmented control over the tab labels.
+///
+/// <para>
+/// Which tab is active is deliberately <b>never in the tree</b>, for the same reason
+/// <see cref="UiAdvancedSection.DefaultExpanded" />'s remarks give for expansion: it is per-client state,
+/// and a shared session would broadcast one user's tab switch to everyone else. A renderer keeps it as its
+/// own local state and shows only that tab's children.
+/// </para>
+/// </summary>
+public sealed record UiTabs : UiContainer
+{
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Tabs;
+}
+
+/// <summary>One panel of a <see cref="UiTabs" />, named by its label.</summary>
+public sealed record UiTab : UiContainer
+{
+	/// <summary>The strip's caption for this panel.</summary>
+	public UiText Label { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Tab;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Label, Label.Value);
+	}
+}
+
+/// <summary>A section caption. Counterpart of the existing dialog's "Configuration" label, which separates the
+/// setup guide from the fields.</summary>
+public sealed record UiHeading : UiLeaf
+{
+	/// <summary>The caption.</summary>
+	public UiText Text { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Heading;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Text, Text.Value);
+	}
+}
+
+/// <summary>A paragraph of explanatory text. Counterpart of the existing step description, as a standalone
+/// element for prose that belongs somewhere other than at the top of a step.</summary>
+public sealed record UiProse : UiLeaf
+{
+	/// <summary>The paragraph.</summary>
+	public UiText Text { get; init; }
+
+	/// <summary>Marks the paragraph as a status line rather than an explanatory one, with a small leading
+	/// accent dot coloured the same way <see cref="UiBanner" />'s own <see cref="Severity" /> is - the
+	/// Action Button's "Currently &lt;state&gt;" readout under the state row (issue #837) rather than a new
+	/// node type for one line of muted, secondary text. An open vocabulary, like <see cref="UiBanner" />'s;
+	/// absent renders as a plain paragraph.</summary>
+	public UiValue<string> Severity { get; init; }
+
+	/// <summary>
+	/// Inline runs of styled text drawn in place of <see cref="Text" />. Absent means the paragraph draws
+	/// <see cref="Text" />.
+	///
+	/// <para>
+	/// A reader that does not know the key draws <see cref="Text" />, so a producer keeps <see cref="Text" />
+	/// the plain equivalent of the spans. A paragraph carrying spans keeps the line breaks in its text.
+	/// </para>
+	/// </summary>
+	public UiValue<IReadOnlyList<UiTextSpan>> Spans { get; init; }
+
+	/// <summary>How the paragraph is set as a block: <c>quote</c>, <c>code-block</c>, <c>heading-1</c>,
+	/// <c>heading-2</c>, <c>heading-3</c> or <c>subtext</c>. An open vocabulary; absent, or a value a reader
+	/// does not know, renders as a plain paragraph. A paragraph carrying a variant keeps the line breaks in
+	/// its text.</summary>
+	public UiValue<string> Variant { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Prose;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Text, Text.Value);
+		properties.Set(UiConfigProperties.Severity, Severity);
+		properties.Set(UiConfigProperties.Spans, Spans);
+		properties.Set(UiConfigProperties.Variant, Variant);
+	}
+}
+
+/// <summary>
+/// An ordered list of <see cref="UiInstruction" /> children. Counterpart of the existing step's instruction
+/// list, which the dialog renders numbered above the fields.
+///
+/// <para>
+/// A container rather than a property holding a list of strings, because an instruction carries copy blocks of
+/// its own - and because a numbered list built out of nodes is one a patch can insert into.
+/// </para>
+/// </summary>
+public sealed record UiInstructions : UiContainer
+{
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Instructions;
+}
+
+/// <summary>
+/// One setup instruction. Counterpart of the existing config flow instruction.
+///
+/// <para>
+/// Deliberately carries <b>no number</b>: the existing model is explicit that an entry's position is the number
+/// the user sees and that an author must never number the text themselves. A <c>number</c> property would
+/// invite exactly that, and a renumbering after an insert would then have to patch every following instruction.
+/// </para>
+/// </summary>
+public sealed record UiInstruction : UiLeaf
+{
+	/// <summary>The instruction. Ends with a colon when a copy block follows it, rather than repeating the
+	/// value inline.</summary>
+	public UiText Text { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Instruction;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Text, Text.Value);
+	}
+}
+
+/// <summary>
+/// A labeled value the user has to carry over to an external service - a redirect URI to register, a device
+/// code to type. Counterpart of the existing config flow copy value, shown verbatim and monospaced with a copy
+/// affordance.
+///
+/// <para>
+/// Raises <b>no event</b>. Copying is client-local: it touches the clipboard and nothing on this side, and an
+/// event reporting it would put a keystroke's worth of user behaviour on the wire for no one to act on.
+/// </para>
+/// </summary>
+public sealed record UiCopyValue : UiLeaf
+{
+	/// <summary>A short caption, not a sentence.</summary>
+	public UiText Label { get; init; }
+
+	/// <summary>The value, passed exactly as the external service must receive it. Never reformatted.</summary>
+	public UiValue<string> Value { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.CopyValue;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Label, Label.Value);
+		properties.Set(UiConfigProperties.Value, Value);
+	}
+}
+
+/// <summary>
+/// A labeled link - setup documentation, a provider's developer portal. Counterpart of the existing config flow
+/// link.
+///
+/// <para>
+/// The host opens an external http or https <see cref="Url" /> in the user's default browser, never inside
+/// the surface, whether or not the link declares <c>activate</c>.
+/// Declare <c>activate</c> only to learn that the link was followed: the event is raised in addition to the
+/// host opening the URL, so a handler must not open the URL again.
+/// </para>
+///
+/// <para>
+/// Behaviour change in hosts released after 3.0.0-beta.6: before, a link that declared <c>activate</c> was
+/// opened by the host only inside the integration setup dialog; everywhere else only the event was raised. A
+/// handler that opened the URL itself to work around that now opens it a second time and should stop.
+/// </para>
+/// </summary>
+public sealed record UiLink : UiLeaf
+{
+	/// <summary>The link text.</summary>
+	public UiText Label { get; init; }
+
+	/// <summary>Where the link goes.</summary>
+	public UiValue<string> Url { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Link;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Label, Label.Value);
+		properties.Set(UiConfigProperties.Url, Url);
+	}
+}
+
+/// <summary>
+/// Fields hidden behind an "advanced configuration" affordance. Counterpart of the existing step's advanced
+/// fields, which the dialog puts behind a switch and gates Continue independently of.
+///
+/// <para>
+/// Carries <see cref="DefaultExpanded" /> and never a current <c>expanded</c>. Expansion is per-client state:
+/// in a shared session one user opening the section would open it for everyone, and the model forbids
+/// client-local state from the tree. What the author decided is authored data; what the user did with it is
+/// not. The <c>expand</c> and <c>collapse</c> events are the client telling this side what happened, which is a
+/// different thing from the tree carrying it.
+/// </para>
+/// </summary>
+public sealed record UiAdvancedSection : UiContainer
+{
+	/// <summary>The switch's caption.</summary>
+	public UiText Label { get; init; }
+
+	/// <summary>Whether the section starts open. The existing dialog opens it on its own when one of the fields
+	/// already carries a value, so a re-shown step never hides something the user typed.</summary>
+	public UiValue<bool> DefaultExpanded { get; init; }
+
+	/// <summary>Whether collapsing the section clears the fields inside it, which the existing dialog does so a
+	/// hidden advanced value cannot silently take effect.</summary>
+	public UiValue<bool> ClearOnCollapse { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.AdvancedSection;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Label, Label.Value);
+		properties.Set(UiConfigProperties.DefaultExpanded, DefaultExpanded);
+		properties.Set(UiConfigProperties.ClearOnCollapse, ClearOnCollapse);
+	}
+}
+
+/// <summary>A visual separator. Counterpart of the existing dialog's rule between the setup guide and the
+/// fields.</summary>
+public sealed record UiDivider : UiLeaf
+{
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Divider;
+}
+
+/// <summary>
+/// A compact, framed line naming what currently governs a setting: an optional leading <see cref="Icon" />, a
+/// muted <see cref="Label" /> and the emphasized <see cref="Value" /> it introduces, such as "Provided by" and
+/// the action that provides a button's state. Children are drawn trailing it, typically an icon-only
+/// <see cref="UiConfigButton" /> that stops what the line names. Contributes no key of its own.
+///
+/// <para>
+/// A renderer that does not know the type declines it like any unknown node and draws its fallback, so give
+/// the node one built from a <see cref="UiProse" /> and the same buttons where that matters.
+/// </para>
+/// </summary>
+public sealed record UiStatus : UiContainer
+{
+	/// <summary>An icon name drawn ahead of the text. Absent draws none.</summary>
+	public UiValue<string> Icon { get; init; }
+
+	/// <summary>The muted text that introduces <see cref="Value" />.</summary>
+	public UiText Label { get; init; }
+
+	/// <summary>The emphasized text: what governs the setting.</summary>
+	public UiText Value { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Status;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Icon, Icon);
+		properties.Set(UiConfigProperties.Label, Label.Value);
+		properties.Set(UiConfigProperties.Value, Value.Value);
+	}
+}
+
+/// <summary>A message about the flow as a whole rather than about one field. Counterpart of the existing
+/// dialog's banner, which carries the error or status message a step returned.</summary>
+public sealed record UiBanner : UiLeaf
+{
+	/// <summary>How serious the message is. An open vocabulary; a renderer that does not know a value shows the
+	/// message plainly.</summary>
+	public UiValue<string> Severity { get; init; }
+
+	/// <summary>The message.</summary>
+	public UiText Text { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Banner;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Severity, Severity);
+		properties.Set(UiConfigProperties.Text, Text.Value);
+	}
+}
+
+/// <summary>
+/// A message about one field. Counterpart of the existing per-field error, which the editor and the dialog both
+/// render under the control it belongs to.
+///
+/// <para>
+/// A node of its own rather than a property on the field, because a message appearing and disappearing is then
+/// one insert and one remove naming that message - not a change to the field, which would put a
+/// <c>set-properties</c> on a control the user is typing into.
+/// </para>
+/// </summary>
+public sealed record UiValidationMessage : UiLeaf
+{
+	/// <summary>The message.</summary>
+	public UiText Text { get; init; }
+
+	/// <summary>The id of the input this message belongs to. An input's id is the name it submits as, which is
+	/// the same key the existing per-field errors are already keyed by.</summary>
+	public UiValue<string> For { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.ValidationMessage;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Text, Text.Value);
+		properties.Set(UiConfigProperties.For, For);
+	}
+}
+
+/// <summary>Work in progress the user has to wait for. Counterpart of the existing dialog's loading and
+/// waiting-for-authorization states, both of which are a spinner plus a line of text.</summary>
+public sealed record UiBusy : UiLeaf
+{
+	/// <summary>What is being waited for.</summary>
+	public UiText Text { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Busy;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Text, Text.Value);
+	}
+}
+
+/// <summary>
+/// A labeled control that does something rather than going somewhere: applying a preset, running a check,
+/// revealing a value. It raises <c>activate</c> and contributes no key to the surrounding transaction, which
+/// is what separates it from every input - a preset that wrote its own key would leave a stray value nothing
+/// reads.
+/// </summary>
+public sealed record UiConfigButton : UiLeaf
+{
+	/// <summary>The control's text, and its accessible name whether or not that text is drawn.</summary>
+	public UiText Label { get; init; }
+
+	/// <summary>
+	/// Draws the control as that icon rather than as its text. The <see cref="Label" /> is still required
+	/// and becomes the accessible name, so an icon-only control is never nameless - a renderer with no
+	/// such icon falls back to drawing the text and loses nothing but the compactness.
+	/// </summary>
+	public UiValue<string> Icon { get; init; }
+
+	/// <summary>
+	/// A question the renderer asks in a dialog before it raises <c>activate</c>; declining raises nothing.
+	/// Absent means the button acts at once. A renderer that predates confirmation raises <c>activate</c>
+	/// without asking, so a button whose action cannot be undone should not rely on it alone.
+	/// </summary>
+	public UiText ConfirmMessage { get; init; }
+
+	/// <summary>The dialog's heading. Absent lets the renderer choose a generic one.</summary>
+	public UiText ConfirmTitle { get; init; }
+
+	/// <summary>The caption of the dialog's accepting control. Absent lets the renderer choose one.</summary>
+	public UiText ConfirmLabel { get; init; }
+
+	/// <summary>Whether accepting destroys something, so the renderer can style the dialog as a warning.</summary>
+	public UiValue<bool> ConfirmDanger { get; init; }
+
+	/// <summary>
+	/// Makes the dialog ask for text, starting with this value, and raise <c>activate</c> with the entered
+	/// text as a string payload. <see cref="Placeholder" /> is the field's hint. A renderer that predates
+	/// prompting raises <c>activate</c> without a payload, which a handler has to tolerate.
+	/// </summary>
+	public UiValue<string> PromptValue { get; init; }
+
+	/// <summary>The hint shown in the prompt's empty text field.</summary>
+	public UiText Placeholder { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Button;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Label, Label.Value);
+		properties.Set(UiConfigProperties.Icon, Icon);
+		properties.Set(UiConfigProperties.ConfirmMessage, ConfirmMessage.Value);
+		properties.Set(UiConfigProperties.ConfirmTitle, ConfirmTitle.Value);
+		properties.Set(UiConfigProperties.ConfirmLabel, ConfirmLabel.Value);
+		properties.Set(UiConfigProperties.ConfirmDanger, ConfirmDanger);
+		properties.Set(UiConfigProperties.PromptValue, PromptValue);
+		properties.Set(UiConfigProperties.Placeholder, Placeholder.Value);
+	}
+}
+
+/// <summary>
+/// A question the surface puts to the user in a modal dialog for as long as this node is in the tree, so the
+/// provider opens it by adding the node (typically inside a <see cref="Dsl.UiWhen" />) and closes it by
+/// removing it. <see cref="Title" /> is the heading and <see cref="Text" /> the message. Child
+/// <see cref="UiConfigButton" />s are the dialog's answers, drawn in order with the last one as the primary
+/// answer (or as a warning when it declares <see cref="UiConfigButton.ConfirmDanger" />); any other children,
+/// such as boolean inputs, are drawn as the dialog's body. Dismissing the dialog without answering raises
+/// <c>cancel</c> on this node, so a provider handles <c>cancel</c> to remove it. A renderer that predates the
+/// type declines it and draws the node's fallback in place.
+/// </summary>
+public sealed record UiConfigDialog : UiContainer
+{
+	/// <summary>The dialog's heading.</summary>
+	public UiText Title { get; init; }
+
+	/// <summary>The message the dialog asks.</summary>
+	public UiText Text { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Dialog;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Title, Title.Value);
+		properties.Set(UiConfigProperties.Text, Text.Value);
+	}
+}
+
+/// <summary>
+/// A compact control that opens a list of actions: its children are <see cref="UiConfigButton" />s, drawn as
+/// the list's entries with their icons and labels, and each raises its own <c>activate</c> (asking first when
+/// it declares a confirmation). <see cref="Label" /> is the control's accessible name, <see cref="Icon" /> its
+/// trigger icon. A renderer that predates the type declines it and draws the node's fallback.
+/// </summary>
+public sealed record UiConfigMenu : UiContainer
+{
+	/// <summary>The control's accessible name.</summary>
+	public UiText Label { get; init; }
+
+	/// <summary>The trigger's icon. Absent lets the renderer use its usual overflow icon.</summary>
+	public UiValue<string> Icon { get; init; }
+
+	/// <inheritdoc />
+	public override string Type => UiConfigPrimitives.Menu;
+
+	/// <inheritdoc />
+	protected internal override void DeclareProperties(UiPropertyDeclaration properties)
+	{
+		ArgumentNullException.ThrowIfNull(properties);
+
+		base.DeclareProperties(properties);
+
+		properties.Set(UiConfigProperties.Label, Label.Value);
+		properties.Set(UiConfigProperties.Icon, Icon);
+	}
+}

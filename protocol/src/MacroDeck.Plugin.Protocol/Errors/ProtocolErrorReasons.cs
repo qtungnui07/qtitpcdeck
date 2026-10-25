@@ -1,0 +1,107 @@
+namespace MacroDeck.Plugin.Protocol.Errors;
+
+/// <summary>
+/// Values for the <c>reason</c> entry a <see cref="ProtocolError" /> may carry in its details. A
+/// reason refines an error code that is deliberately kept generic for older clients; a client that
+/// does not recognise one must fall back to handling the code alone.
+/// </summary>
+public static class ProtocolErrorReasons
+{
+	/// <summary>
+	/// The host refused because Developer Mode is switched off. Applies to enrolment, interactive
+	/// pairing, and session creation for a plugin holding a development credential.
+	/// </summary>
+	public const string DeveloperModeDisabled = "developer_mode_disabled";
+
+	/// <summary>
+	/// Refines <see cref="ProtocolErrorCodes.PluginAlreadyRegistered" /> on enrolment with a Developer
+	/// token: the id belongs to a plugin Macro Deck has installed. Interactive pairing with Developer Mode
+	/// on can take that plugin over temporarily instead; retrying the enrolment never helps.
+	/// </summary>
+	public const string PluginInstalled = "plugin_installed";
+
+	/// <summary>
+	/// Refines <see cref="ProtocolErrorCodes.CapabilityUnavailable" /> on an <c>adb</c> call that changes
+	/// something: Macro Deck is locked, so it runs nothing until it is unlocked.
+	/// </summary>
+	public const string HostLocked = "host_locked";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.InvalidPayload" /> on <c>messaging</c>: a topic or pattern is malformed.</summary>
+	public const string MessagingInvalidTopic = "messaging_invalid_topic";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.CapabilityUnavailable" /> on <c>messaging</c>: nothing handles the topic.</summary>
+	public const string MessagingNoHandler = "messaging_no_handler";
+
+	/// <summary>
+	/// Refines a retryable <see cref="ProtocolErrorCodes.CapabilityUnavailable" /> on <c>messaging</c>: the
+	/// topic has a handler, but it cannot be reached right now, for example while its plugin reconnects.
+	/// </summary>
+	public const string MessagingHandlerUnavailable = "messaging_handler_unavailable";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.CapabilityUnavailable" /> on <c>messaging</c>: the handler failed.</summary>
+	public const string MessagingHandlerFailed = "messaging_handler_failed";
+
+	/// <summary>
+	/// The reason a <c>subscriptions</c> entry was rejected because another participant already handles
+	/// the topic. The rejection names that participant.
+	/// </summary>
+	public const string MessagingTopicHandled = "messaging_topic_handled";
+
+	/// <summary>
+	/// Refines <see cref="ProtocolErrorCodes.CapabilityUnavailable" /> on <c>messaging</c>: the session did
+	/// not declare the <c>messaging</c> capability kind, so nothing can be delivered to it.
+	/// </summary>
+	public const string MessagingNotDeclared = "messaging_not_declared";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: no adb executable was found.</summary>
+	public const string AdbExecutableNotFound = "adb_executable_not_found";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: the adb server could not be reached.</summary>
+	public const string AdbServerUnreachable = "adb_server_unreachable";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: no device with that serial is attached.</summary>
+	public const string AdbDeviceNotFound = "adb_device_not_found";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: the device is attached but offline.</summary>
+	public const string AdbDeviceOffline = "adb_device_offline";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: the device has not authorized this computer.</summary>
+	public const string AdbDeviceUnauthorized = "adb_device_unauthorized";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: adb did not finish in time.</summary>
+	public const string AdbTimeout = "adb_timeout";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: adb ran and reported a failure.</summary>
+	public const string AdbCommandFailed = "adb_command_failed";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: an argument was rejected before adb ran.</summary>
+	public const string AdbInvalidArgument = "adb_invalid_argument";
+
+	/// <summary>Refines <see cref="ProtocolErrorCodes.AdbFailed" />: the device cannot answer this operation.</summary>
+	public const string AdbUnsupported = "adb_unsupported";
+
+	/// <summary>Refines a <c>video-stream-provider</c> or <c>video-streams</c> error: no provider with that id is registered.</summary>
+	public const string VideoStreamUnknownProvider = "video_stream_unknown_provider";
+
+	/// <summary>Refines a <c>video-stream-provider</c> error: the provider offers no stream with that id.</summary>
+	public const string VideoStreamUnknownStream = "video_stream_unknown_stream";
+
+	/// <summary>
+	/// Refines a <c>video-stream-provider</c> or <c>video-streams</c> error: no session with that id is
+	/// open, or it was already closed. An open for a session id that was closed before it arrived is refused
+	/// with this reason too.
+	/// </summary>
+	public const string VideoStreamUnknownSession = "video_stream_unknown_session";
+
+	/// <summary>Refines a <c>video-stream-provider</c> error: the stream exists but cannot be served right now.</summary>
+	public const string VideoStreamStreamUnavailable = "video_stream_stream_unavailable";
+
+	/// <summary>Refines a <c>video-stream-provider</c> error: the provider serves none of the accepted transports.</summary>
+	public const string VideoStreamTransportNotAccepted = "video_stream_transport_not_accepted";
+
+	/// <summary>Refines a <c>video-stream-provider</c> error: the provider cannot open another session right now.</summary>
+	public const string VideoStreamCapacityReached = "video_stream_capacity_reached";
+
+	/// <summary>Refines a <c>video-stream-provider</c> error: the provider is busy. Retrying later can succeed.</summary>
+	public const string VideoStreamBusy = "video_stream_busy";
+}

@@ -1,0 +1,197 @@
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
+using MacroDeckHost.Api.Controllers;
+using MacroDeckHost.Application.Ui.Resources;
+using MacroDeckHost.Auth;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+
+namespace MacroDeckHost.Tests.UnitTests.Ui.Resources;
+
+[TestFixture]
+public class UiResourcesControllerTests
+{
+	private const string Svg = """<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>""";
+
+	private static UiResourceStore StoreWith(out string resourceId, string name = "clear-day")
+	{
+		var store = new UiResourceStore();
+
+		var handle = store.Register(new UiResourceRegistration
+		{
+			OwnerId = "app.macro-deck.weather",
+			Name = name,
+			MediaType = "image/svg+xml",
+			Content = Encoding.UTF8.GetBytes(Svg)
+		});
+
+		resourceId = handle.ResourceId;
+
+		return store;
+	}
+
+	private static UiResourcesController Controller(IUiResourceStore store, string? ifNoneMatch = null)
+	{
+		var httpContext = new DefaultHttpContext();
+
+		if (ifNoneMatch is not null)
+		{
+			httpContext.Request.Headers.IfNoneMatch = ifNoneMatch;
+		}
+
+		return new UiResourcesController(store)
+		{
+			ControllerContext = new ControllerContext { HttpContext = httpContext }
+		};
+	}
+
+	[Test]
+	public void The_endpoint_requires_client_access()
+	{
+		var policy = typeof(UiResourcesController)
+			.GetMethod(nameof(UiResourcesController.Get))!
+			.GetCustomAttribute<AuthorizeAttribute>()
+			?.Policy;
+
+		Assert.That(policy, Is.EqualTo(AuthPolicies.ClientAccess));
+	}
+
+	[Test]
+	public async Task A_served_resource_cannot_be_sniffed_or_run_as_a_document()
+	{
+		var store = StoreWith(out var resourceId);
+		var controller = Controller(store);
+
+		await controller.Get(resourceId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(controller.Response.Headers["X-Content-Type-Options"].ToString(), Is.EqualTo("nosniff"));
+			Assert.That(controller.Response.Headers.ContentSecurityPolicy.ToString(),
+				Does.Contain("default-src 'none'"));
+			Assert.That(controller.Response.Headers.ContentSecurityPolicy.ToString(), Does.Contain("sandbox"));
+		});
+	}
+
+	[Test]
+	public async Task A_registered_resource_is_served_with_its_media_type_and_a_strong_hash_etag()
+	{
+		var store = StoreWith(out var resourceId);
+		var controller = Controller(store);
+
+		var result = await controller.Get(resourceId) as FileContentResult;
+
+		Assert.That(result, Is.Not.Null);
+
+		var expected = $"\"sha256:{Convert.ToHexStringLower(SHA256.HashData(result!.FileContents))}\"";
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.ContentType, Is.EqualTo("image/svg+xml"));
+			Assert.That(Encoding.UTF8.GetString(result.FileContents), Is.EqualTo(Svg));
+			Assert.That(controller.Response.Headers.ETag.ToString(), Is.EqualTo(expected));
+			Assert.That(controller.Response.Headers.ETag.ToString(),
+				Does.Not.StartWith("W/"),
+				"a weak validator would let a client keep a byte-different copy");
+			Assert.That(controller.Response.Headers.CacheControl.ToString(), Does.Contain("private"));
+		});
+	}
+
+	[Test]
+	public async Task A_matching_if_none_match_is_answered_with_304_and_no_body()
+	{
+		var store = StoreWith(out var resourceId);
+		var etag = $"\"sha256:{Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(Svg)))}\"";
+		var controller = Controller(store, etag);
+
+		var result = await controller.Get(resourceId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result, Is.InstanceOf<StatusCodeResult>());
+			Assert.That(((StatusCodeResult)result).StatusCode, Is.EqualTo(StatusCodes.Status304NotModified));
+			Assert.That(controller.Response.Headers.ETag.ToString(), Is.EqualTo(etag));
+		});
+	}
+
+	[Test]
+	public async Task A_stale_if_none_match_is_answered_with_the_full_body()
+	{
+		var store = StoreWith(out var resourceId);
+		var controller = Controller(store, $"\"sha256:{new string('0', 64)}\"");
+
+		Assert.That(await controller.Get(resourceId), Is.InstanceOf<FileContentResult>());
+	}
+
+	[Test]
+	public async Task A_versioned_url_is_cached_only_while_it_names_the_bytes_currently_registered()
+	{
+		var store = new UiResourceStore();
+		var a = Register(store, "<svg id=\"a\"/>");
+		var b = Register(store, "<svg id=\"b\"/>");
+
+		var stale = Controller(store, $"\"{b.ContentHash}\"");
+		var staleResult = await stale.Get(b.ResourceId, a.ContentHash) as FileContentResult;
+		var current = Controller(store);
+		await current.Get(b.ResourceId, b.ContentHash);
+
+		Register(store, "<svg id=\"a\"/>");
+		var backToA = Controller(store);
+		var backToAResult = await backToA.Get(a.ResourceId, a.ContentHash) as FileContentResult;
+		var nowStale = Controller(store);
+		await nowStale.Get(b.ResourceId, b.ContentHash);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(staleResult, Is.Not.Null, "a stale version is answered with the current bytes, never 304");
+			Assert.That(Encoding.UTF8.GetString(staleResult!.FileContents), Is.EqualTo("<svg id=\"b\"/>"));
+			Assert.That(stale.Response.Headers.CacheControl.ToString(), Is.EqualTo("no-store"));
+			Assert.That(stale.Response.Headers.ETag.ToString(), Is.Empty);
+			Assert.That(current.Response.Headers.CacheControl.ToString(), Does.Contain("immutable"));
+			Assert.That(Encoding.UTF8.GetString(backToAResult!.FileContents), Is.EqualTo("<svg id=\"a\"/>"));
+			Assert.That(backToA.Response.Headers.CacheControl.ToString(), Does.Contain("immutable"));
+			Assert.That(nowStale.Response.Headers.CacheControl.ToString(), Is.EqualTo("no-store"));
+		});
+	}
+
+	[Test]
+	public async Task A_request_without_a_version_is_cached_as_before()
+	{
+		var store = StoreWith(out var resourceId);
+		var controller = Controller(store);
+
+		await controller.Get(resourceId);
+
+		Assert.That(controller.Response.Headers.CacheControl.ToString(), Does.Contain("immutable"));
+	}
+
+	private static MacroDeck.Ui.Model.Resources.UiResource Register(UiResourceStore store, string svg)
+	{
+		return store.Register(new UiResourceRegistration
+		{
+			OwnerId = "plugin-0123456789abcdef",
+			Name = "photo",
+			MediaType = "image/svg+xml",
+			Content = Encoding.UTF8.GetBytes(svg)
+		});
+	}
+
+	[TestCase("app.macro-deck.weather.does-not-exist")]
+	[TestCase("../../appsettings.json")]
+	[TestCase("/etc/passwd")]
+	[TestCase("")]
+	public async Task An_unknown_or_unusable_id_is_answered_the_same_way(string resourceId)
+	{
+		var controller = Controller(StoreWith(out _));
+
+		var result = await controller.Get(resourceId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result, Is.InstanceOf<NotFoundResult>());
+			Assert.That(controller.Response.Headers.CacheControl.ToString(), Is.EqualTo("no-store"));
+		});
+	}
+}

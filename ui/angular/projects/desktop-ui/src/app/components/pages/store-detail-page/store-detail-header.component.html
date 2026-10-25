@@ -1,0 +1,112 @@
+<div class="header-layout">
+<div class="header-identity">
+  <div class="header-icon">
+    @if (iconUrl(); as icon) {
+      @if (!iconFailed()) {
+        <img [src]="icon" alt="" loading="lazy" (error)="onIconError()">
+      } @else {
+        <span class="icon icon-{{ kindIcon() }} icon-2xl"></span>
+      }
+    } @else {
+      <span class="icon icon-{{ kindIcon() }} icon-2xl"></span>
+    }
+  </div>
+
+  <div class="header-main">
+    <div class="header-tags">
+      <span class="kind-chip" [attr.data-kind]="extension().kind">
+        <span class="icon icon-{{ kindIcon() }} icon-xs" aria-hidden="true"></span>
+        {{ kindLabel() }}
+      </span>
+      @if (freshness() === 'new') {
+        <span class="store-badge" data-badge="new">{{ 'macrodeck.app:Store.Page.NewBadge' | translate }}</span>
+      } @else if (freshness() === 'updated') {
+        <span class="store-badge" data-badge="updated">{{ 'macrodeck.app:Store.Page.UpdatedBadge' | translate }}</span>
+      }
+      @if (aiBadge(); as badge) {
+        <span class="store-badge" data-badge="ai">
+          <span class="icon icon-sparkles icon-xs" aria-hidden="true"></span>
+          {{ (badge === 'uses' ? 'macrodeck.app:Store.Page.UsesAiBadge' : 'macrodeck.app:Store.Page.MadeWithAiBadge') | translate }}
+        </span>
+      }
+      <app-store-trust-badge
+        [kind]="extension().kind"
+        [trust]="extension().trust"
+        [pluginId]="extension().id"
+        [signingRevoked]="extension().signingRevoked === true" />
+    </div>
+    <h1 class="header-title">{{ extension().name }}</h1>
+    @if (extension().publisher) {
+      <a class="header-publisher" [routerLink]="['/store']" [queryParams]="{ publisher: extension().publisher }">{{ 'macrodeck.app:Store.Page.ByPublisher' | translate:{ publisher: extension().publisher } }}</a>
+    }
+    <div class="header-stats">
+      @if (rating(); as rating) {
+        <button type="button" class="header-rating" (click)="showReviews.emit()">
+          <shared-store-rating-stars [rating]="rating.value" size="sm" />
+          <span class="header-rating-value">{{ rating.text }}</span>
+          <span class="header-stat-muted">({{ rating.count }})</span>
+        </button>
+      }
+      @if (installs(); as installs) {
+        <span class="header-stat">
+          <span class="icon icon-download icon-xs" aria-hidden="true"></span>
+          {{ installs }}
+        </span>
+      }
+    </div>
+    @if (extension().description) {
+      <p class="header-description">{{ extension().description }}</p>
+    }
+  </div>
+</div>
+
+<div class="header-action">
+  <div class="install-row">
+    <shared-store-install-button
+      size="lg"
+      [item]="extension()"
+      [operation]="operation()"
+      [targetVersion]="selectedVersion()"
+      [targetInstallable]="targetInstallable()"
+      [targetUnavailableReason]="targetUnavailableReason()"
+      [otherVersionsAvailable]="otherVersionsAvailable()"
+      [updatesAvailable]="updatesAvailable()"
+      [manageAction]="manageAction()"
+      (manage)="manage.emit($event)"
+      (install)="install.emit()"
+      (installUnsigned)="installUnsigned.emit($event)"
+      (retry)="retry.emit()"
+      (uninstall)="uninstall.emit()"
+      (checkForUpdates)="checkForUpdates.emit()"
+      (chooseVersion)="focusVersionSelect()" />
+
+    @if (shareLinksEnabled && !extension().withdrawal) {
+      <button
+        type="button"
+        class="copy-link"
+        [attr.aria-label]="'macrodeck.app:Store.Page.CopyLinkAction' | translate"
+        [title]="'macrodeck.app:Store.Page.CopyLinkAction' | translate"
+        (click)="copyLink()">
+        <span class="icon icon-share icon-sm" aria-hidden="true"></span>
+      </button>
+    }
+  </div>
+
+  @if (showVersionSelect()) {
+    <label class="version-picker">
+      <span class="version-picker-label">{{ 'macrodeck.app:Store.Page.VersionField' | translate }}</span>
+      <shared-select
+        [options]="versionOptions()"
+        [ngModel]="selectedVersion()"
+        (ngModelChange)="versionChange.emit($event)" />
+    </label>
+  }
+
+  @for (hint of versionHints(); track hint) {
+    <p class="version-hint">
+      <span class="icon icon-info icon-xs" aria-hidden="true"></span>
+      <span>{{ hint }}</span>
+    </p>
+  }
+</div>
+</div>

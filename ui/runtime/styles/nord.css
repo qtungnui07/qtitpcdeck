@@ -1,0 +1,203 @@
+/*
+ * Nord theme for qtitpcdeck.
+ *
+ * Nord is a 16-colour palette in four groups - Polar Night, Snow Storm, Frost and
+ * Aurora - and the whole point of it is that the groups are used for their roles
+ * rather than picked from freely. This file maps those groups onto the runtime
+ * tokens in tokens.css, so nothing downstream has to know Nord exists.
+ *
+ * Loaded after tokens.css: the selectors here are the same specificity as the
+ * defaults, so source order is what makes them win.
+ *
+ * Reference: https://www.nordtheme.com/docs/colors-and-palettes
+ */
+
+:root {
+  /* Polar Night - the dark base. nord0 is the page, each step up is a surface. */
+  --nord0:  #2e3440;
+  --nord1:  #3b4252;
+  --nord2:  #434c5e;
+  --nord3:  #4c566a;
+
+  /* Snow Storm - the light base, and the text ramp on dark. */
+  --nord4:  #d8dee9;
+  --nord5:  #e5e9f0;
+  --nord6:  #eceff4;
+
+  /* Frost - the cool blues. nord8 is the accent. */
+  --nord7:  #8fbcbb;
+  --nord8:  #88c0d0;
+  --nord9:  #81a1c1;
+  --nord10: #5e81ac;
+
+  /* Aurora - the warm accents, used for status and value types. */
+  --nord11: #bf616a;
+  --nord12: #d08770;
+  --nord13: #ebcb8b;
+  --nord14: #a3be8c;
+  --nord15: #b48ead;
+}
+
+/*
+ * Nord Dark. The default theme, so it lands on :root and the .dark class alike -
+ * ThemeService adds .dark for an explicit dark choice and leaves the class off
+ * when the system preference is dark, and both have to look the same.
+ */
+:root,
+.dark {
+  color-scheme: dark;
+
+  --color-bg-primary:    var(--nord0);
+  --color-bg-secondary:  var(--nord1);
+  --color-bg-tertiary:   var(--nord2);
+  --color-bg-elevated:   var(--nord2);
+  --color-bg-hover:      rgba(216, 222, 233, 0.06);
+
+  --color-border:        var(--nord3);
+  --color-border-light:  var(--nord3);
+  --color-border-overlay: rgba(216, 222, 233, 0.1);
+
+  --color-text-primary:   var(--nord6);
+  --color-text-secondary: var(--nord4);
+  /*
+   * nord3 on a nord2 surface is about 1.2:1 - chosen as a "quiet" grey, it is
+   * simply unreadable. This is the lightest grey that still reads as muted
+   * while clearing 4.5:1 against every dark surface (4.7:1 on the elevated
+   * one, where form labels sit).
+   */
+  --color-text-muted:     #b6c0d0;
+
+  /* Frost nord8. ThemeService overrides these three from the user's accent. */
+  --color-accent:        var(--nord8);
+  --color-accent-hover:  var(--nord7);
+  --color-accent-muted:  rgba(136, 192, 208, 0.15);
+
+  --color-on-accent:     var(--nord0);
+
+  --color-danger:        var(--nord11);
+  --color-danger-hover:  #a8545c;
+  --color-danger-muted:  rgba(191, 97, 106, 0.15);
+
+  --color-success:       var(--nord14);
+  --color-success-muted: rgba(163, 190, 140, 0.15);
+
+  --color-warning:       var(--nord13);
+  --color-warning-muted: rgba(235, 203, 139, 0.15);
+  --color-on-warning:    var(--nord0);
+
+  /*
+   * Value-type badges. Nord has no purple-blue for strings, so the Frost ramp
+   * carries the cool types and Aurora the warm ones - the split the palette
+   * already implies, rather than six hues invented to fill six slots.
+   */
+  --type-string-bg:      rgba(129, 161, 193, 0.15);
+  --type-string-fg:      var(--nord9);
+  --type-numeric-bg:     rgba(163, 190, 140, 0.15);
+  --type-numeric-fg:     var(--nord14);
+  --type-boolean-bg:     rgba(235, 203, 139, 0.15);
+  --type-boolean-fg:     var(--nord13);
+  --type-resource-bg:    rgba(208, 135, 112, 0.15);
+  --type-resource-fg:    var(--nord12);
+  --type-system-bg:      rgba(180, 142, 173, 0.15);
+  --type-system-fg:      var(--nord15);
+  --type-integration-bg: rgba(136, 192, 208, 0.15);
+  --type-integration-fg: var(--nord8);
+  --type-widget-bg:      rgba(143, 188, 187, 0.15);
+  --type-widget-fg:      var(--nord7);
+
+  --chip-var-bg:     rgba(163, 190, 140, 0.12);
+  --chip-var-border: rgba(163, 190, 140, 0.45);
+  --chip-var-fg:     var(--nord14);
+
+  --chip-event-bg:     rgba(136, 192, 208, 0.12);
+  --chip-event-border: rgba(136, 192, 208, 0.45);
+  --chip-event-fg:     var(--nord8);
+
+  /*
+   * Shadows. Nord's dark base is lighter than the near-black the defaults were
+   * tuned against, so a pure-black shadow reads as a grey smudge; tinting it
+   * toward nord0 keeps the elevation legible without greying the surface.
+   */
+  --shadow-sm:      0 4px 6px -1px rgba(46, 52, 64, 0.4);
+  --shadow-md:      0 10px 25px rgba(46, 52, 64, 0.45);
+  --shadow-lg:      0 25px 50px -12px rgba(46, 52, 64, 0.6);
+  --shadow-overlay: 0 20px 40px rgba(46, 52, 64, 0.6);
+  --shadow-popover: 0 8px 24px rgba(46, 52, 64, 0.45);
+  --shadow-dialog:
+    0 0 0 1px rgba(216, 222, 233, 0.08),
+    0 2px 4px rgba(46, 52, 64, 0.3),
+    0 12px 28px -8px rgba(46, 52, 64, 0.5),
+    0 32px 64px -20px rgba(46, 52, 64, 0.7);
+
+  --color-scrim: rgba(46, 52, 64, 0.7);
+}
+
+/*
+ * Nord Light. Snow Storm is the base and Polar Night the text ramp, which is the
+ * inversion Nord documents for light mode - the accent stays Frost so the two
+ * themes are recognisably the same product.
+ */
+.light {
+  color-scheme: light;
+
+  --color-bg-primary:    var(--nord6);
+  --color-bg-secondary:  var(--nord5);
+  --color-bg-tertiary:   var(--nord4);
+  --color-bg-elevated:   var(--nord6);
+  --color-bg-hover:      rgba(46, 52, 64, 0.06);
+
+  --color-border:        var(--nord4);
+  --color-border-light:  #c8d0dd;
+  --color-border-overlay: rgba(46, 52, 64, 0.1);
+
+  --color-text-primary:   var(--nord0);
+  --color-text-secondary: var(--nord2);
+  --color-text-muted:     var(--nord3);
+
+  --color-accent:        var(--nord10);
+  --color-accent-hover:  var(--nord9);
+  --color-accent-muted:  rgba(94, 129, 172, 0.15);
+
+  --color-on-accent:     var(--nord6);
+
+  --color-danger:        var(--nord11);
+  --color-danger-hover:  #a8545c;
+  --color-danger-muted:  rgba(191, 97, 106, 0.12);
+
+  --color-success:       #7a9a63;
+  --color-success-muted: rgba(163, 190, 140, 0.2);
+
+  --color-warning:       #b8943f;
+  --color-warning-muted: rgba(235, 203, 139, 0.25);
+  --color-on-warning:    var(--nord0);
+
+  /* Aurora and Frost at their dark-theme values are too pale on Snow Storm. */
+  --type-string-fg:      var(--nord10);
+  --type-numeric-fg:     #7a9a63;
+  --type-boolean-fg:     #b8943f;
+  --type-resource-fg:    #b06a4f;
+  --type-system-fg:      #8f6a8a;
+  --type-integration-fg: #4a7a8c;
+  --type-widget-fg:      #5f8a89;
+
+  --chip-var-bg:     rgba(163, 190, 140, 0.2);
+  --chip-var-border: rgba(122, 154, 99, 0.5);
+  --chip-var-fg:     #7a9a63;
+
+  --chip-event-bg:     rgba(94, 129, 172, 0.12);
+  --chip-event-border: rgba(94, 129, 172, 0.45);
+  --chip-event-fg:     var(--nord10);
+
+  --shadow-sm:      0 2px 4px rgba(46, 52, 64, 0.1);
+  --shadow-md:      0 6px 16px rgba(46, 52, 64, 0.12);
+  --shadow-lg:      0 16px 40px rgba(46, 52, 64, 0.16);
+  --shadow-overlay: 0 12px 32px rgba(46, 52, 64, 0.2);
+  --shadow-popover: 0 8px 24px rgba(46, 52, 64, 0.14);
+  --shadow-dialog:
+    0 0 0 1px rgba(46, 52, 64, 0.08),
+    0 2px 4px rgba(46, 52, 64, 0.06),
+    0 12px 28px -8px rgba(46, 52, 64, 0.14),
+    0 32px 64px -20px rgba(46, 52, 64, 0.2);
+
+  --color-scrim: rgba(46, 52, 64, 0.5);
+}

@@ -1,0 +1,128 @@
+---
+title: Image
+description: Draws a resource handle, fitted into a square box and never cropped.
+---
+
+Draws a registered resource, fitted into a square box. A tree never carries image bytes, only a handle
+that each client fetches and caches by hash.
+
+`ui.image`
+
+## Example
+
+```csharp
+new UiImage
+{
+    Key = "icon",
+    Source = UiValue.From(() => state.Value.ConditionIcon),
+    Size = 0.16,
+    Transition = UiComponentImageTransitions.Crossfade,
+}
+```
+
+![A weather tile with a small yellow sun icon above the temperature 23° and the caption Sunny](../../../../assets/ui/image.png)
+
+A weather-condition icon that fades to the new one when the condition changes, adapted from the built-in
+Weather widget. `ConditionIcon` is a `UiResource` handle.
+
+A plugin registers its own images with `IIntegrationContext.UiResources`; see
+[Registering your own images](/ui/reference/resources/#registering-your-own-images).
+
+## Changing artwork smoothly
+
+```csharp
+Transition = UiComponentImageTransitions.Crossfade,
+```
+
+Without `Transition`, a new `Source` replaces the old image without a fade, as soon as it can be drawn.
+
+## Dimming artwork
+
+```csharp
+Brightness = 0.6,
+Saturation = 0.55,
+```
+
+![The same album cover twice: at full colour on the left, darker and less saturated on the right](../../../../assets/ui/image-dimmed.png)
+
+A paused cover, as the built-in Music player draws it. `Brightness` changes the artwork itself and looks the
+same on any background - use it, not a lower `Opacity`, for "the same picture, darker". `Opacity` lets what
+is behind show through. `Saturation = 0` draws in greys.
+
+## Recolouring an icon
+
+```csharp
+Tint = "#4f8cff",
+```
+
+Draws the image as a silhouette in that colour: every pixel keeps its own transparency, so a white icon on a
+transparent background becomes a blue icon, while an image without transparency becomes a solid rectangle.
+The built-in Slider uses it for its Icon Color setting.
+
+## A source that may be missing
+
+```csharp
+Source = UiValue.Optional(() => state.Value.Icon is { } icon
+    ? UiValue.Of(icon)
+    : UiValue.None<UiResource>()),
+```
+
+An absent or unresolvable source draws nothing. Wrap the image in a `UiWhen` instead if it
+should not take up space either.
+
+## Properties
+
+| Property | Values | Default | Meaning |
+|---|---|---|---|
+| `Source` (`source`) | `UiResource` handle | Nothing is drawn | The resource to draw. |
+| `Size` (`size`) | `UiSize` length | Left to the reader | The edge of the square box the image is fitted into, preserving aspect ratio and never cropped. |
+| `Transition` (`transition`) | `UiComponentImageTransitions`: `crossfade` | The new image replaces the old without a fade | How a change of `Source` is drawn. |
+| `Opacity` (`opacity`) | `0..1` | Fully opaque | How opaque the image is drawn. |
+| `Brightness` (`brightness`) | `0..2` | `1` | A multiplier of the image's own luminance. |
+| `Saturation` (`saturation`) | `0..2` | `1` | A multiplier of the image's own saturation; `0` is greyscale. |
+| `Tint` (`tint`) | `#rrggbb` | The image's own colours | Draws the image in this colour, keeping each pixel's transparency. |
+| `MainSize` (`mainSize`), `Fill` (`fill`) | See [Sizing](/ui/concepts/sizing/) | `Size` | The image's extent along the parent stack's main axis. |
+
+## Events
+
+None. `ui.image` is never interactive. For a tappable image, use a [Button](/ui/components/button/) with
+`Source` set; it adds `Fit`, `Zoom`, `OffsetX` and `OffsetY` framing on top of `Opacity`, `Brightness` and
+`Saturation`.
+
+## Children
+
+None. `ui.image` is a leaf.
+
+## Layout
+
+An image is `size` on both axes, fitted into a square box. Along its parent stack's main axis it takes
+`mainSize` or `fill` if declared, otherwise `size` is what a reader measures it at without a font. See
+[Sizing](/ui/concepts/sizing/).
+
+## Reader behaviour
+
+- A `source` that cannot be resolved draws nothing; it never fails the tree.
+- Fit the image into the square box preserving aspect ratio; never crop.
+- `crossfade` is normative: hold the outgoing artwork until the incoming one has decoded, then reveal it over
+  220 ms on an ease-out curve, from fully transparent at scale 1.02 about its centre to fully opaque at
+  scale 1.
+- Artwork that fails to decode replaces the outgoing artwork at once, with no fade.
+- Without `crossfade`, a new `source` that arrives together with new `opacity`, `brightness`, `saturation` or
+  `tint` values keeps the outgoing image drawn with its own values until the incoming image can be drawn, then
+  switches the image and its values in the same frame. A new value for an unchanged `source` applies at once.
+- `brightness` is normative: multiply each channel by the value, before `saturation` and before
+  compositing at `opacity`, and clamp each channel rather than wrapping it.
+- `saturation` is normative: `out = luma + saturation * (channel - luma)`, with
+  `luma = 0.213 R + 0.715 G + 0.072 B`, applied after `brightness`.
+- `tint` is normative: every pixel takes the colour and keeps its own alpha, then `opacity` applies. A reader
+  that does not implement the key, or whose engine can neither filter nor mask, draws the image in its own
+  colours.
+- An animated image follows [Animated pictures](/ui/reference/resources/#animated-pictures): its own timeline,
+  never restarted by a change of `tint`, `opacity`, `brightness`, `saturation` or `zoom`. An engine that can
+  only mask draws `tint` on a second image, whose play is its own.
+
+## See also
+
+- [Resources](/ui/reference/resources/)
+- [Button](/ui/components/button/)
+- [Sizing](/ui/concepts/sizing/)

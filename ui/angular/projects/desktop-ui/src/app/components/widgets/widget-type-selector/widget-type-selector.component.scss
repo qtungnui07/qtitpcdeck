@@ -1,0 +1,289 @@
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.toolbar .search {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.toolbar .sort {
+  flex: 0 1 11rem;
+  min-width: 8rem;
+}
+
+.type-card[hidden],
+.type-group-heading[hidden] {
+  display: none;
+}
+
+.type-group-heading {
+  grid-column: 1 / -1;
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+}
+
+.widget-types {
+  padding: var(--space-2) 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  /* The grid grows with every widget a future release or an integration adds, so it scrolls rather
+     than pushing the dialog past the viewport. */
+  height: min(60vh, 34rem);
+  align-content: start;
+  overflow-y: auto;
+}
+
+@media (max-width: 40rem) {
+  .widget-types {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 26rem) {
+  .widget-types {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.type-card {
+  position: relative;
+  display: flex;
+}
+
+.type-card .type-select {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background-color: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  transition: all var(--transition-fast);
+  text-align: start;
+  width: 100%;
+}
+
+.type-card .type-select:hover,
+.type-card .type-select:focus-visible {
+  background-color: var(--color-accent-muted);
+  border-color: var(--color-accent);
+}
+
+.type-card .type-select:active {
+  transform: scale(0.98);
+}
+
+.type-favorite {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  color: var(--color-text-secondary);
+  background-color: var(--color-bg-secondary);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+}
+
+.type-favorite svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+.type-favorite:hover,
+.type-favorite:focus-visible {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+.type-favorite.active {
+  color: var(--color-accent);
+}
+
+.type-card .type-favorite {
+  position: absolute;
+  top: calc(var(--space-3) + var(--space-1));
+  right: calc(var(--space-3) + var(--space-1));
+}
+
+@media (hover: hover) {
+  .type-card .type-favorite:not(.active) {
+    opacity: 0;
+  }
+
+  .type-card:hover .type-favorite,
+  .type-card:focus-within .type-favorite {
+    opacity: 1;
+  }
+}
+
+.type-card .type-provider {
+  position: absolute;
+  top: calc(var(--space-3) + var(--space-1) + 0.375rem);
+  left: calc(var(--space-3) + var(--space-1));
+  max-width: calc(100% - 2 * (var(--space-3) + var(--space-1)) - 2rem - var(--space-2));
+  z-index: 1;
+}
+
+/* A square stage the tile sits on with room around it, the way a widget sits in a deck cell rather
+   than bleeding to the edges of whatever is holding it. */
+.type-preview {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1;
+  width: 100%;
+  padding: var(--space-3);
+  box-sizing: border-box;
+  overflow: hidden;
+  background-color: var(--color-bg-primary);
+  border-radius: var(--radius-md);
+  pointer-events: none;
+}
+
+/* Covers the sample area for a type whose provider declined the preview session - the sample tree
+   itself renders nothing to look at in that case, but the card still needs to say what type it is. */
+.type-preview-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2);
+  text-align: center;
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  background-color: var(--color-bg-primary);
+}
+
+// Laid out as one deck cell and scaled to the stage, so a responsive tree picks its one-cell layout.
+// flex: none and the child selector matter: shared-ui-tree-widget's :host sets 100% at this specificity.
+.type-preview > .type-preview-widget {
+  display: block;
+  flex: none;
+  transform-origin: 0 0;
+}
+
+.type-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+}
+
+.type-name {
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+  font-size: var(--text-lg);
+}
+
+.type-description {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+}
+
+.type-provider {
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 0.0625rem var(--space-2);
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  color: var(--type-integration-fg);
+  background-color: var(--type-integration-bg);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.no-matches {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: var(--space-4) 0;
+  text-align: center;
+  color: var(--color-text-secondary);
+}
+
+.widget-types.list {
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.widget-types.list .type-select {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2);
+  padding-inline-end: calc(2rem + 2 * var(--space-3));
+  border-radius: var(--radius-md);
+}
+
+.widget-types.list .type-preview {
+  flex: none;
+  width: 4.5rem;
+  padding: var(--space-1);
+  border-radius: var(--radius-sm);
+}
+
+.widget-types.list .type-preview-placeholder {
+  font-size: var(--text-xs);
+}
+
+.widget-types.list .type-info {
+  flex: 1;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: var(--space-2);
+  row-gap: 0.125rem;
+}
+
+.widget-types.list .type-name {
+  font-size: var(--text-md);
+}
+
+.widget-types.list .type-provider {
+  position: static;
+  justify-self: start;
+  max-width: 100%;
+}
+
+.widget-types.list .type-description {
+  grid-column: 1 / -1;
+  font-size: var(--text-sm);
+}
+
+.widget-types.list .type-favorite {
+  top: 50%;
+  right: var(--space-3);
+  transform: translateY(-50%);
+}
+
+:host-context([dir='rtl']) {
+  .type-card .type-favorite {
+    right: auto;
+    left: calc(var(--space-3) + var(--space-1));
+  }
+
+  .type-card .type-provider {
+    left: auto;
+    right: calc(var(--space-3) + var(--space-1));
+  }
+
+  .widget-types.list .type-favorite {
+    right: auto;
+    left: var(--space-3);
+  }
+}

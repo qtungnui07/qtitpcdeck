@@ -1,0 +1,163 @@
+using MacroDeckHost.Api.Controllers;
+using MacroDeckHost.Application.Plugins.IconPacks;
+using MacroDeckHost.Application.Ui.Resources;
+using MacroDeckHost.Application.Widgets.Icons;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
+
+namespace MacroDeckHost.Tests.UnitTests.Plugins.IconPacks;
+
+[TestFixture]
+internal sealed class PluginIconResourceTests
+{
+	private const string PluginId = "com.example.logos";
+
+	private PluginIconPackTestHost _host = null!;
+
+	[SetUp]
+	public void SetUp()
+	{
+		_host = new PluginIconPackTestHost();
+	}
+
+	[TearDown]
+	public void TearDown()
+	{
+		_host.Dispose();
+	}
+
+	[Test]
+	public async Task A_plugin_icon_handle_is_served_by_the_resource_endpoint_from_a_fresh_store_and_is_not_webp()
+	{
+		await _host.SyncDevelopment(PluginId, ("logos", await _host.BuildArchive("Logos", ("spotify", "green"))));
+		var handle = await _host.UiResources.GetHandleAsync(PluginId, "logos", "Spotify", CancellationToken.None);
+
+		var controller = new UiResourcesController(new UiResourceStore(),
+			new PluginIconUiResources(_host.Icons.Cache, _host.Resolver, WidgetIconSources()))
+		{
+			ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
+		};
+		var served = await controller.Get(handle.Handle!.ResourceId, handle.Handle.ContentHash) as FileContentResult;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(handle.Status, Is.EqualTo(PluginIconResourceStatus.Found));
+			Assert.That(handle.Handle.ResourceId, Does.StartWith(PluginIconReferences.ResourceOwnerId + "."));
+			Assert.That(served, Is.Not.Null);
+			Assert.That(served!.ContentType, Is.Not.EqualTo("image/webp"));
+			Assert.That(served.FileContents.Take(4), Is.Not.EqualTo("RIFF"u8.ToArray()));
+			Assert.That(controller.Response.Headers.ETag.ToString(), Is.EqualTo($"\"{handle.Handle.ContentHash}\""));
+		});
+	}
+
+	[Test]
+	public async Task A_replaced_icon_is_handed_out_with_a_new_content_hash()
+	{
+		await _host.SyncDevelopment(PluginId, ("logos", await _host.BuildArchive("Logos", ("spotify", "green"))));
+		var before = await _host.UiResources.GetHandleAsync(PluginId, "logos", "spotify", CancellationToken.None);
+
+		await _host.SyncDevelopment(PluginId, ("logos", await _host.BuildArchive("Logos", ("spotify", "black"))));
+		var after = await _host.UiResources.GetHandleAsync(PluginId, "logos", "spotify", CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(after.Handle!.ResourceId, Is.EqualTo(before.Handle!.ResourceId));
+			Assert.That(after.Handle.ContentHash, Is.Not.EqualTo(before.Handle.ContentHash));
+		});
+	}
+
+	[Test]
+	public async Task Another_plugins_icon_and_an_unknown_name_are_not_found()
+	{
+		await _host.SyncDevelopment(PluginId, ("logos", await _host.BuildArchive("Logos", ("spotify", "green"))));
+
+		var foreign = await _host.UiResources.GetHandleAsync("com.example.other",
+			"logos",
+			"spotify",
+			CancellationToken.None);
+		var unknown = await _host.UiResources.GetHandleAsync(PluginId, "logos", "tidal", CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(foreign.Status, Is.EqualTo(PluginIconResourceStatus.NotFound));
+			Assert.That(unknown.Status, Is.EqualTo(PluginIconResourceStatus.NotFound));
+		});
+	}
+
+	[Test]
+	public async Task An_icon_of_an_ordinary_pack_is_handed_out_by_id_and_its_handle_resolves_to_its_bytes()
+	{
+		var pack = await _host.Icons.CreatePack();
+		var icon = await _host.Icons.AddReadyIcon(pack.Id, "home", await Png());
+
+		var handle = await _host.UiResources.GetHandleAsync(icon.Id, CancellationToken.None);
+		var content = await _host.UiResources.TryGetAsync(handle.Handle!.ResourceId, CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(handle.Status, Is.EqualTo(PluginIconResourceStatus.Found));
+			Assert.That(handle.Handle.ResourceId, Is.EqualTo(PluginIconReferences.ResourceId(icon.Id)));
+			Assert.That(content, Is.Not.Null);
+			Assert.That(content!.ContentHash, Is.EqualTo(handle.Handle.ContentHash));
+			Assert.That(content.MediaType, Is.EqualTo(handle.Handle.MediaType));
+		});
+	}
+
+	[Test]
+	public async Task A_bundled_plugin_icon_is_handed_out_by_id_to_any_caller()
+	{
+		await _host.SyncDevelopment(PluginId, ("logos", await _host.BuildArchive("Logos", ("spotify", "green"))));
+		var spotify = _host.Icon(_host.PluginPack(PluginId, "logos")!, "spotify");
+
+		var handle = await _host.UiResources.GetHandleAsync(spotify.Id, CancellationToken.None);
+
+		Assert.That(handle.Handle?.ResourceId, Is.EqualTo(PluginIconReferences.ResourceId(spotify.Id)));
+	}
+
+	[Test]
+	public async Task An_unknown_icon_id_is_neither_handed_out_nor_served()
+	{
+		var unknown = Guid.NewGuid();
+
+		var handle = await _host.UiResources.GetHandleAsync(unknown, CancellationToken.None);
+		var content = await _host.UiResources.TryGetAsync(PluginIconReferences.ResourceId(unknown),
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(handle.Status, Is.EqualTo(PluginIconResourceStatus.NotFound));
+			Assert.That(content, Is.Null);
+		});
+	}
+
+	[Test]
+	public void No_registration_can_shadow_a_plugin_icon_handle()
+	{
+		var store = new UiResourceStore();
+
+		Assert.Throws<ArgumentException>(() => store.Register(new UiResourceRegistration
+		{
+			OwnerId = PluginIconReferences.ResourceOwnerId,
+			Name = Guid.NewGuid().ToString(),
+			MediaType = "image/png",
+			Content = new byte[] { 1 }
+		}));
+	}
+
+	private static async Task<byte[]> Png()
+	{
+		using var image = new Image<Rgba32>(4, 4, new Rgba32(200, 40, 40, 255));
+		using var buffer = new MemoryStream();
+		await image.SaveAsPngAsync(buffer);
+		return buffer.ToArray();
+	}
+
+	private WidgetIconSourceRegistry WidgetIconSources()
+	{
+		return new WidgetIconSourceRegistry([
+			new IconPackWidgetIconSource(_host.Icons.Cache, _host.ScopeFactory)
+		]);
+	}
+}

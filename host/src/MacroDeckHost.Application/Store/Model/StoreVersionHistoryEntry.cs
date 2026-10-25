@@ -1,0 +1,18 @@
+namespace MacroDeckHost.Application.Store.Model;
+
+public sealed record StoreVersionHistoryEntry
+{
+	public required string Version { get; init; }
+
+	public DateTimeOffset? ReleasedAt { get; init; }
+
+	public string? Changelog { get; init; }
+
+	public long? Size { get; init; }
+
+	public bool HasRelease { get; init; }
+
+	public StoreDependencyList? Dependencies { get; init; }
+
+	public StoreVersionSource? Source { get; init; }
+}

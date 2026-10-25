@@ -1,0 +1,140 @@
+using MacroDeckHost.Application.Ui.Transport;
+using MacroDeckHost.Application.Ui.Transport.Messages.Devices;
+using Microsoft.AspNetCore.Mvc;
+
+namespace MacroDeckHost.Api.Controllers;
+
+public record RenameDeviceBody(string Name);
+
+public record SetDeviceStartupProfileBody(string? ProfileId);
+
+public record OpenProfileOnDeviceBody(string ProfileId);
+
+public record SetDeviceScreenSaverBody(bool Enabled, int IdleSeconds, string? ScreenSaverId, string? Configuration);
+
+public record SetDeviceSettingsButtonBody(bool Hidden);
+
+[ApiController]
+[Route("api/devices")]
+public class DevicesController : ControllerBase
+{
+	private readonly IUiTransportMessageHandler<GetDevicesRequest, GetDevicesResponse> _getDevices;
+	private readonly IUiTransportMessageHandler<RenameDeviceRequest, RenameDeviceResponse> _renameDevice;
+	private readonly IUiTransportMessageHandler<LogoutDeviceRequest, LogoutDeviceResponse> _logoutDevice;
+	private readonly IUiTransportMessageHandler<RemoveDeviceRequest, RemoveDeviceResponse> _removeDevice;
+
+	private readonly IUiTransportMessageHandler<SetDeviceStartupProfileRequest, SetDeviceStartupProfileResponse>
+		_setStartupProfile;
+
+	private readonly IUiTransportMessageHandler<OpenProfileOnDeviceRequest, OpenProfileOnDeviceResponse>
+		_openProfileOnDevice;
+
+	private readonly IUiTransportMessageHandler<SetDeviceScreenSaverRequest, SetDeviceScreenSaverResponse>
+		_setScreenSaver;
+
+	private readonly IUiTransportMessageHandler<ShowDeviceScreenSaverRequest, ShowDeviceScreenSaverResponse>
+		_showScreenSaver;
+
+	private readonly IUiTransportMessageHandler<SetDeviceSettingsButtonRequest, SetDeviceSettingsButtonResponse>
+		_setSettingsButton;
+
+	public DevicesController(
+		IUiTransportMessageHandler<GetDevicesRequest, GetDevicesResponse> getDevices,
+		IUiTransportMessageHandler<RenameDeviceRequest, RenameDeviceResponse> renameDevice,
+		IUiTransportMessageHandler<LogoutDeviceRequest, LogoutDeviceResponse> logoutDevice,
+		IUiTransportMessageHandler<RemoveDeviceRequest, RemoveDeviceResponse> removeDevice,
+		IUiTransportMessageHandler<SetDeviceStartupProfileRequest, SetDeviceStartupProfileResponse> setStartupProfile,
+		IUiTransportMessageHandler<OpenProfileOnDeviceRequest, OpenProfileOnDeviceResponse> openProfileOnDevice,
+		IUiTransportMessageHandler<SetDeviceScreenSaverRequest, SetDeviceScreenSaverResponse> setScreenSaver,
+		IUiTransportMessageHandler<ShowDeviceScreenSaverRequest, ShowDeviceScreenSaverResponse> showScreenSaver,
+		IUiTransportMessageHandler<SetDeviceSettingsButtonRequest, SetDeviceSettingsButtonResponse> setSettingsButton)
+	{
+		_getDevices = getDevices;
+		_renameDevice = renameDevice;
+		_logoutDevice = logoutDevice;
+		_removeDevice = removeDevice;
+		_setStartupProfile = setStartupProfile;
+		_openProfileOnDevice = openProfileOnDevice;
+		_setScreenSaver = setScreenSaver;
+		_showScreenSaver = showScreenSaver;
+		_setSettingsButton = setSettingsButton;
+	}
+
+	[HttpGet]
+	public Task<GetDevicesResponse> GetAll(CancellationToken ct)
+	{
+		return _getDevices.Handle(new GetDevicesRequest(), ct).AsTask();
+	}
+
+	[HttpPatch("{id:guid}/name")]
+	public Task<RenameDeviceResponse> Rename(Guid id, RenameDeviceBody body, CancellationToken ct)
+	{
+		return _renameDevice.Handle(new RenameDeviceRequest { Id = id, Name = body.Name }, ct).AsTask();
+	}
+
+	[HttpPatch("{id:guid}/startup-profile")]
+	public Task<SetDeviceStartupProfileResponse> SetStartupProfile(
+		Guid id,
+		SetDeviceStartupProfileBody body,
+		CancellationToken ct)
+	{
+		return _setStartupProfile.Handle(new SetDeviceStartupProfileRequest { Id = id, ProfileId = body.ProfileId }, ct)
+			.AsTask();
+	}
+
+	[HttpPatch("{id:guid}/screensaver")]
+	public Task<SetDeviceScreenSaverResponse> SetScreenSaver(
+		Guid id,
+		SetDeviceScreenSaverBody body,
+		CancellationToken ct)
+	{
+		return _setScreenSaver.Handle(new SetDeviceScreenSaverRequest
+				{
+					Id = id,
+					Enabled = body.Enabled,
+					IdleSeconds = body.IdleSeconds,
+					ScreenSaverId = body.ScreenSaverId,
+					Configuration = body.Configuration
+				},
+				ct)
+			.AsTask();
+	}
+
+	[HttpPost("{id:guid}/screensaver/show")]
+	public Task<ShowDeviceScreenSaverResponse> ShowScreenSaver(Guid id, CancellationToken ct)
+	{
+		return _showScreenSaver.Handle(new ShowDeviceScreenSaverRequest { Id = id }, ct).AsTask();
+	}
+
+	[HttpPatch("{id:guid}/settings-button")]
+	public Task<SetDeviceSettingsButtonResponse> SetSettingsButton(
+		Guid id,
+		SetDeviceSettingsButtonBody body,
+		CancellationToken ct)
+	{
+		return _setSettingsButton.Handle(new SetDeviceSettingsButtonRequest { Id = id, Hidden = body.Hidden }, ct)
+			.AsTask();
+	}
+
+	[HttpPost("{id:guid}/open-profile")]
+	public Task<OpenProfileOnDeviceResponse> OpenProfileOnDevice(
+		Guid id,
+		OpenProfileOnDeviceBody body,
+		CancellationToken ct)
+	{
+		return _openProfileOnDevice.Handle(new OpenProfileOnDeviceRequest { Id = id, ProfileId = body.ProfileId }, ct)
+			.AsTask();
+	}
+
+	[HttpPost("{id:guid}/logout")]
+	public Task<LogoutDeviceResponse> Logout(Guid id, CancellationToken ct)
+	{
+		return _logoutDevice.Handle(new LogoutDeviceRequest { Id = id }, ct).AsTask();
+	}
+
+	[HttpDelete("{id:guid}")]
+	public Task<RemoveDeviceResponse> Remove(Guid id, CancellationToken ct)
+	{
+		return _removeDevice.Handle(new RemoveDeviceRequest { Id = id }, ct).AsTask();
+	}
+}

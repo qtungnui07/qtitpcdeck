@@ -1,0 +1,453 @@
+---
+title: Configuring a widget
+description: Describing a widget's configuration as two named regions Macro Deck lays out, and reaching the editors the app already ships.
+---
+
+A widget's configuration is a `config` surface tree under the `widget-config` entry point, made of two
+named regions Macro Deck lays out.
+
+## Example
+
+```csharp
+public sealed class GaugeWidgetUiProvider : IUiProvider
+{
+    private const string GaugeWidgetType = "example.gauge";
+
+    public IReadOnlyList<UiSurfaceDeclaration> Surfaces { get; } =
+    [
+        new() { Kind = UiSurfaceKinds.Widget, SessionMode = UiSessionModes.Shared },
+        new() { Kind = UiSurfaceKinds.Config, SessionMode = UiSessionModes.Exclusive },
+    ];
+
+    public Task<IUiSession?> CreateSessionAsync(UiSessionRequest request, CancellationToken cancellationToken)
+    {
+        var attributes = request.Surface.Attributes;
+        if (request.Surface.Kind != UiSurfaceKinds.Config ||
+            !attributes.TryGetValue(UiConfigSurfaceAttributes.EntryPoint, out var entryPoint) ||
+            entryPoint.GetString() != UiConfigEntryPoints.WidgetConfig ||
+            !attributes.TryGetValue(UiConfigSurfaceAttributes.WidgetType, out var widgetType) ||
+            widgetType.GetString() != GaugeWidgetType)
+        {
+            return Task.FromResult<IUiSession?>(null);
+        }
+
+        attributes.TryGetValue(UiConfigSurfaceAttributes.WidgetData, out var data);
+        var root = GaugeConfigView.Build(data);
+
+        return Task.FromResult<IUiSession?>(new ViewSession(new UiView(request.Surface, root)));
+    }
+}
+
+public static class GaugeConfigView
+{
+    public static UiElement Build(JsonElement data)
+    {
+        var label = new UiState<string>(ReadString(data, "label") ?? string.Empty);
+        var variable = new UiState<string>(ReadString(data, "variable") ?? string.Empty);
+        var maximum = new UiState<double>(100);
+        var flows = new UiState<JsonElement>(data.ValueKind == JsonValueKind.Object &&
+            data.TryGetProperty("flows", out var f) ? f : JsonSerializer.SerializeToElement(Array.Empty<object>()));
+
+        return new UiWidgetConfiguration
+        {
+            Key = "root",
+            Properties = new UiWidgetProperties
+            {
+                Key = "properties",
+                Children =
+                [
+                    new UiStringInput { Key = "label", Label = Strings.Gauge.Label(), Binding = Bind.To(label) },
+                    new UiVariablePickerInput
+                    {
+                        Key = "variable",
+                        Label = Strings.Gauge.Variable(),
+                        VariableTypes = UiValue.Of<IReadOnlyList<string>>(["Integer", "Float"]),
+                        Binding = Bind.To(variable),
+                    },
+                    new UiNumberInput { Key = "maximum", Label = Strings.Gauge.Maximum(), Min = 1, Binding = Bind.To(maximum) },
+                    UiWidgetAppearance.Section(data, UiWidgetAppearanceFields.BackgroundColor | UiWidgetAppearanceFields.Border),
+                ],
+            },
+            Editor = new UiWidgetEditor
+            {
+                Key = "editor",
+                Children = [new UiActionsListEditor { Key = "flows", Binding = Bind.To(flows), CanRun = true }],
+            },
+        };
+    }
+
+    private static string? ReadString(JsonElement data, string key)
+        => data.ValueKind == JsonValueKind.Object && data.TryGetProperty(key, out var v) &&
+           v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+}
+```
+
+A `UiState<JsonElement>` must hold a defined value: `default(JsonElement)` has no JSON form, so building the
+view throws a `UiViewException` that names the node and property. Start from an empty array, as above.
+
+`ViewSession` is the adapter from [Serving a view](/ui/views/sessions/#example). The built-in Clock widget
+(`host/src/MacroDeckHost.Widgets/Clock/ClockWidgetConfigView.cs`) is a complete, larger example.
+
+## The two regions
+
+```csharp
+new UiWidgetConfiguration
+{
+    Key = "root",
+    Properties = new UiWidgetProperties { Key = "properties", Children = [/* fields */] },
+    Editor = new UiWidgetEditor { Key = "editor", Children = [/* room for a big editor */] }, // optional
+};
+```
+
+- `Properties` is the ordinary field list; the desktop editor draws it beside the preview.
+- `Editor` is room a field list would not fit in, and is **optional**. Without it the editor is a single
+  pane, not a split with an empty half.
+
+You supply the fields. Macro Deck supplies the widget preview, the split layout and its narrow-window
+drawer, the visual and JSON modes, scrolling, saving and the unsaved-changes prompt. Which side each region
+lands on is the renderer's decision, and nothing in the contract names a renderer - a future native client
+draws the same tree.
+
+## An input's id is the data key it configures
+
+```csharp
+new UiStringInput { Key = "label" }                 // writes "label"
+new UiObjectInput { Key = "border", Children =
+    [new UiColorInput { Key = "color" }] }          // writes "border.color"
+new UiArrayInput { Key = "states" /* ... */ }       // writes a JSON array
+```
+
+A region opens no input-id scope, so a top-level input's id is the widget data key it writes - in both
+regions, which share one namespace. `UiObjectInput` and `UiArrayInput` do open a scope. Address array
+items by their own stable key, never by position: a positional id loses focus and in-flight edits on
+every reorder.
+
+## The tree edits a draft it does not own
+
+```csharp
+attributes.TryGetValue(UiConfigSurfaceAttributes.WidgetData, out var data); // stored configuration
+```
+
+Nothing your tree does persists anything. Macro Deck accumulates the edits and writes them through the
+ordinary widget save path on save, which keeps schema validation, JSON mode and the unsaved-changes prompt
+working
+([ADR 0050](https://github.com/Macro-Deck-App/Macro-Deck/blob/main/engineering/decisions/0050-ui-sessions-are-host-brokered.md)).
+A plugin cannot read the host's stored widgets, so the configuration arrives on the surface. A key your
+tree never mentions survives a save untouched, so a partial configuration drops nothing.
+
+| `UiConfigSurfaceAttributes` | Value |
+| --- | --- |
+| `WidgetId` | The widget being configured. |
+| `WidgetType` | Its type id. Check it before serving. |
+| `WidgetData` | Its stored configuration. |
+| `WidgetWidth`, `WidgetHeight` | Its size on the deck. That belongs to the deck: never part of `WidgetData`, never written back. |
+
+## Reaching an editor Macro Deck already has
+
+```csharp
+new UiActionsListEditor { Key = "flows", Binding = Bind.To(flows), CanRun = true }
+```
+
+| Node type | DSL element | Configures |
+| --- | --- | --- |
+| `actions-list-editor` | `UiActionsListEditor` | The list of action flows, with triggers, ordering and nesting |
+| `action-picker` | `UiActionPickerInput` | One action from the catalog of everything installed |
+| `variable-picker` | `UiVariablePickerInput` | One variable, optionally narrowed to types (`VariableTypes`) or writable ones (`WritableOnly`). In the widget editor it lists global variables and the edited widget's own widget variables, never another widget's |
+| `device-picker` | `UiDevicePickerInput` | One connected device |
+| `integration-picker` | `UiIntegrationPickerInput` | One integration, or one of its configuration entries |
+| `icon` | `UiIconReferenceInput` | One icon, as a typed provider reference |
+| `icon-display` | `UiIconDisplayInput` | An icon's framing (fit, zoom, offset, opacity) over a preview of `Icon` at `AspectRatio` against `Background`; with `Tint` set, the preview draws the icon in that colour, keeping its transparency. Reset is always offered and writes **null**, not a copy of the defaults, so a `Bind.Custom` setter must handle null |
+| `thresholds` | `UiThresholdsInput` | A range divided into coloured bands, edited on a bar with a draggable handle between each pair - see [Colour thresholds](#colour-thresholds) |
+
+Each renderer maps these onto the editors it already ships; a plugin ships no renderer code for them.
+
+To preselect one of your plugin's [bundled icons](/ui/reference/resources/#icons-from-your-bundled-icon-packs)
+in the `icon` picker, give the input a plugin-icon default:
+
+```csharp
+new UiIconReferenceInput
+{
+    Key = "icon",
+    Binding = Bind.To(icon),
+    DefaultValue = UiIconReference.PluginIcon("logos", "spotify"),
+}
+```
+
+Macro Deck resolves the reference against your own bundled packs and replaces it with the matching
+`icon-pack` reference before the form reaches a client, so the picker shows the icon and the user can
+change it like any other. The value that comes back to your plugin, and the one that is saved, is therefore
+an `icon-pack` reference, never a `plugin-icon` one. A key or name your packs do not hold arrives as no
+default. There is no separate "suggested value": the default is how a form proposes an icon. The picker
+lists your bundled packs, read-only, alongside the user's own packs.
+
+For a file, folder or image path, use the
+[path inputs](/ui/views/configuration/#letting-the-user-pick-a-file-folder-or-image), which work in both
+regions like any other input.
+
+`UiActionsListEditor.Triggers` names the trigger tabs the editor offers, such as `["onDoublePress"]` for a
+single Double Tap tab. Leave it unset for the default press tabs: Short Press, Long Press, Touch Start, Touch
+End and Double Tap. Event triggers, which run a flow when an integration or Macro Deck event fires, are
+offered alongside those tabs either way. The host runs a widget's event flows only from the top-level
+`flows` key of its stored configuration, so bind the editor there, as in the example above, for them to
+fire. Press flows run only for built-in widgets and for a widget type registered with
+[`SupportsFlows`](/ui/views/widget-types/#running-the-users-actions).
+
+- **`device-picker`** only populates where the viewer holds admin scope, because the device list is an
+  administrative endpoint. The desktop editor does; prefer another picker where you have the choice.
+- **A renderer without such an editor declines the type** like any unknown node type, and draws the node's
+  `Fallback`. To stay configurable there, give the node a fallback built from primitives - a `json` input
+  over the same value is usually enough.
+
+### Letting the user adopt a provider action
+
+A widget that follows an action's state or icon, like the Action Button, can let the user adopt one of the
+actions in its own flows as that provider, right from the action list:
+
+```csharp
+new UiActionsListEditor
+{
+    Key = "flows",
+    Binding = Bind.To(flows),
+    OffersStateProvider = true,
+    OffersIconProvider = true,
+    StateProviderBlockId = UiValue.From(() => stateProvider.Value?.BlockId ?? string.Empty),
+    Events = [UiEventHandler.OnAsync(UiConfigEvents.Provide, (data, _) => AdoptAsync(data))],
+}
+```
+
+| Property | Meaning |
+| --- | --- |
+| `OffersStateProvider`, `OffersIconProvider` | The renderer marks actions that can provide states or an icon, and puts a control on each such action in the list. |
+| `StateProviderBlockId`, `IconProviderBlockId` | The block the widget currently uses, so that control shows as active. Empty means none. |
+
+Using a control raises `provide` on the node, with the payload
+`{ "capability": "state" | "icon", "blockId": "...", "enabled": true | false }`. It is a request: your handler
+decides whether to adopt, switch or stop, and the two block id properties report the result. The offer
+properties do nothing unless the node also handles `provide`, so a renderer never shows a control that
+cannot answer. A renderer or host that predates these properties and the event ignores them, and the action
+list looks the way it always did. To show which action currently provides, the Action Button uses a
+[status line](/ui/views/configuration/#showing-what-governs-a-setting).
+
+## Standard appearance fields
+
+```csharp
+Properties = new UiWidgetProperties
+{
+    Key = "properties",
+    Children =
+    [
+        new UiStringInput { Key = "variable", Label = Strings.Gauge.Variable(), Binding = Bind.To(variable) },
+        UiWidgetAppearance.Section(data, UiWidgetAppearanceFields.All),
+    ],
+},
+```
+
+`UiWidgetAppearance.Section` builds Macro Deck's own appearance fields, already translated: background
+colour, label, label colour, accent colour, font (face, size, alignment, position) and border. Pick the groups
+with `UiWidgetAppearanceFields`, named after the `WidgetAppearanceProperty` values a
+[widget type declares](/ui/views/widget-types/#standard-appearance), so declare the same ones there for the
+appearance actions to reach them.
+
+- The fields write the [documented keys](/ui/views/widget-types/#standard-appearance) and own them as input
+  ids, together with the heading keys `appearance-heading` and `border-heading`: do not use those ids for
+  inputs of your own.
+- Saving without touching a field leaves its key as it was stored. An empty label or border colour is
+  removed rather than stored empty.
+- The font field lists the host's fonts from the `macrodeck.fonts` option source. The desktop editor
+  resolves that source for your tree; it is the only host source it resolves for a provider's tree. The
+  list includes fonts the user imported and can change while the host runs, so do not cache it.
+- A choice whose options carry a `fontFaceId` entry in `Metadata` is drawn by the desktop editor as a
+  searchable list that shows each option in that face, loaded once the row scrolls into view. It is a
+  rendering hint only: the stored value is still the option's `Value`, and a client that does not know the
+  key draws an ordinary choice.
+- On a Macro Deck release older than these fields, the font list stays empty and the field labels show as
+  `[[macrodeck:...]]` keys, because Macro Deck resolves the `macrodeck` catalog from its own copy.
+- Transparency is opt-in. Add `UiWidgetAppearanceFields.TransparentBackground` next to `BackgroundColor`
+  and the background field also offers **Transparent**, which stores the literal `transparent`. Add it only
+  when your view passes that value on to its root node (see
+  [widget types](/ui/views/widget-types/#standard-appearance)). `All` does not include it, and on its own it
+  builds nothing.
+- Colour variables are opt-in too. Add `UiWidgetAppearanceFields.ColorVariables` and every colour field of
+  the section offers the **Color** | **Variable** tabs described in
+  [Offering a colour variable](#offering-a-colour-variable). `All` does not include it, and on its own it
+  builds nothing.
+
+## How a colour input looks
+
+The desktop editor draws a `UiColorInput` as one compact field: a swatch with the value next to it (the hex
+code, the variable's name, **Transparent**, or **Not set**). Selecting it opens a popover with a colour
+picker (saturation and brightness, hue, an opacity slider where the value may be translucent, hex input)
+and the user's colour palette: Macro Deck's default colours until the user changes them in **Settings >
+Appearance**, plus whatever they add with **+**. The palette is shared by every colour field in Macro
+Deck, your plugin's included, and may even be empty. A field that cannot store opacity only offers the
+palette colours that are fully opaque. With `SupportsReset` the reset control sits at the right of the
+field's caption, or next to the field when `HideLabel` is set. `Disabled` greys the field out and keeps
+the popover closed.
+
+Nothing of this changes the value your binding receives. The palette lives in the user's settings, not in
+your tree, so there is nothing to declare for it.
+
+To put a colour and the number that belongs to it on one line, as the Action Button does for its label
+outline and its width, use a horizontal stack that does not wrap and hide the number's caption. Its
+control then lines up with the colour field:
+
+```csharp
+new UiConfigStack
+{
+    Key = "outline-row",
+    Direction = "horizontal",
+    Wrap = false,
+    Children =
+    [
+        new UiColorInput { Key = "outlineColor", Label = Strings.Outline(), Binding = Bind.To(color), RowWeight = 2 },
+        new UiNumberInput
+        {
+            Key = "outlineWidth",
+            Label = Strings.OutlineWidth(), // still the accessible name
+            HideLabel = true,
+            Binding = Bind.To(width),
+            RowWeight = 1,
+        },
+    ],
+}
+```
+
+## Offering a transparent colour
+
+```csharp
+new UiColorInput
+{
+    Key = "backgroundColor",
+    Label = Strings.Background(),
+    Binding = Bind.To(background),
+    SupportsReset = true,
+    DefaultValue = "",
+    AllowTransparent = true,
+}
+```
+
+`AllowTransparent` puts a **Transparent** swatch in the picker's popover, ahead of the user's palette.
+Choosing it stores the literal `transparent` instead of a `#rrggbb` value. Set it only for a value your widget knows how to read: a stack or
+button `background` accepts it, a modifier's does not. Without the flag, or on a Macro Deck release that
+does not know it, the picker offers colours only and the node is serialised exactly as before.
+
+## Offering a colour variable
+
+```csharp
+new UiColorInput { Key = "accentColor", Binding = Bind.To(accent), AllowVariables = true }
+new UiThresholdsInput { Key = "thresholds", Binding = Bind.To(thresholds), AllowVariables = true }
+```
+
+`AllowVariables` adds **Color** | **Variable** tabs to the picker's popover, or to each band's colour, so the
+user can follow a [Color variable](/features/variables/#color-variables) with modifiers instead of a fixed colour.
+The stored value is then a reference string, not a colour:
+
+```text
+{{ vars.primary | color | color_darken: 20 | color_opacity: 70 }}
+```
+
+Your binding receives that string as it is; in a `UiThresholds` it is the band's `color`. Set the flag only
+when your code can take it. When Macro Deck opens your widget's session, the widget data it hands over in
+`UiWidgetSurfaceAttributes.Data` has every reference already resolved to `#rrggbb` or `#rrggbbaa`, or to
+an empty string when the variable is unavailable, so draw your default colour then. A value you read
+anywhere else, such as your own settings or a config flow, still holds the reference: resolve it with
+[`IColorApi`](/features/variables/#resolving-colours-yourself). Without the flag, or on a Macro Deck release
+that does not know it, the picker offers fixed colours only.
+
+## Colour thresholds
+
+```csharp
+UiThresholds.TryParse(data.TryGetProperty("thresholds", out var raw) ? raw : default, out var stored);
+var thresholds = new UiState<UiThresholds>(stored!); // null until the user edits
+
+new UiThresholdsInput
+{
+    Key = "thresholds",
+    Label = Strings.ColourThresholds(),
+    Binding = Bind.To(thresholds),
+    Min = 0,
+    Max = 100,
+    Step = 1,
+    Unit = "%",
+    DefaultValue = new UiThresholds([
+        new UiThresholdBand("ok", "#34c759"),
+        new UiThresholdBand("busy", "#ffcc00", 60),
+        new UiThresholdBand("hot", "#ff3b30", 85),
+    ]),
+    SupportsReset = true,
+}
+```
+
+The editor draws a bar from `Min` to `Max`, coloured band by band, with a draggable handle on every boundary;
+the selected handle shows its value in `Unit`, and every band lists its range below the bar. Clicking the bar
+adds a boundary at that point, and the user recolours and removes bands from the list; on a focused range, `+`
+splits it and `Delete` removes it. The Slider, History Graph and Gauges widgets use the same editor for their own
+colour thresholds. It works in a [config flow](/ui/views/configuration/) as well as in a widget
+configuration.
+
+The value is a `UiThresholds`, stored and sent as:
+
+```json
+{ "bands": [
+  { "id": "ok", "color": "#34c759" },
+  { "id": "busy", "color": "#ffcc00", "from": 60 },
+  { "id": "hot", "color": "#ff3b30", "from": 85 }
+] }
+```
+
+Each band runs from its `from` up to the next band's. The first band has no `from` and covers everything
+below the second. Later starts are finite and strictly increasing, so handles never cross. A value carries 1
+to 64 bands with unique, non-empty ids and `#rgb`, `#rrggbb` or `#rrggbbaa` colours, normalised to lowercase
+`#rrggbb` or `#rrggbbaa`. With [`AllowVariables`](#offering-a-colour-variable) a band's
+colour can also be a colour reference. When its variable is missing or unavailable, that band has no colour
+of its own in the resolved data, so the range falls back to the widget's own colour while the other bands keep theirs. The
+`UiThresholds` constructor throws on anything else, and a `change` that breaks a rule is rejected before it
+reaches your binding.
+
+| Property | Meaning |
+| --- | --- |
+| `Min`, `Max` | The bar's extent. A boundary outside it widens the bar instead of being moved. |
+| `Step` | What a handle moves by, and the narrowest a band can be dragged. |
+| `Unit` | Drawn after every value. A `UiText`, so a word unit can be localized. |
+| `DefaultValue` | The bands shown while the value is null, and what reset returns to. |
+| `SupportsReset` | Offers a reset while the value differs from the defaults. Reset writes **null**, not a copy of the defaults. |
+| `Disabled` | Read-only: the bar and list show, nothing can be changed. |
+| `FixedCount` | No adding or removing: the number of bands stays the default's. Handles still move and colours still change. |
+| `FixedColors` | No recolouring and no new band. Handles still move and bands can still be removed. |
+| `MaxCount` | Caps adding. A stored value already above it stays editable. |
+
+- **Null means "use the defaults".** Bind a null until the user edits and give your defaults as
+  `DefaultValue`, so a widget whose defaults depend on another setting keeps following that setting. Read the
+  stored value with `UiThresholds.TryParse`, which never throws, and fall back to your defaults:
+
+  ```csharp
+  var colour = (stored ?? defaults).ColorAt(reading); // "#ffcc00" for 70 in the example above
+  ```
+
+- **The modes are enforced on your binding only.** A change that breaks `Disabled`, `FixedCount`,
+  `FixedColors` or `MaxCount` never reaches a writable binding. A read-only binding paired with your own
+  `change` handler receives every change unchecked. A widget's stored configuration is drafted by the client
+  and can hold any value that is valid in shape, so read it with `TryParse` and tolerate any band count.
+- **A Macro Deck release that predates `thresholds`** declines the node and draws its `Fallback`, or shows the
+  field as unsupported without one. A `json` input cannot stand in for it, because its value is text.
+
+## Declining
+
+```csharp
+if (widgetType.GetString() != GaugeWidgetType)
+{
+    return Task.FromResult<IUiSession?>(null);
+}
+```
+
+Returning `null` declines and is not an error. But unlike an action or a config flow, a widget has **no
+declared field list to fall back to**: a declined widget configuration leaves the user with JSON mode only.
+Decline only widgets you genuinely do not configure, and check `WidgetType` rather than assuming the
+surface is yours.
+
+## See also
+
+- [Serving a configuration view](/ui/views/configuration/)
+- [Deck widget views](/ui/views/widget/)
+- [Widget types](/ui/views/widget-types/)
+- [Serving a view](/ui/views/sessions/)

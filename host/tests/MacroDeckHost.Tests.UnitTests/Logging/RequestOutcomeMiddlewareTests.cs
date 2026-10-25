@@ -1,0 +1,127 @@
+using System.Globalization;
+using MacroDeckHost.Logging;
+using Microsoft.AspNetCore.Http;
+using Serilog;
+using Serilog.Core;
+using Serilog.Events;
+
+namespace MacroDeckHost.Tests.UnitTests.Logging;
+
+public class RequestOutcomeMiddlewareTests
+{
+	[TestCase(200)]
+	[TestCase(204)]
+	public async Task Successful_Request_Outcomes_Are_Only_Logged_At_Debug(int status)
+	{
+		var atInformation = await Run(status, LogEventLevel.Information);
+		var atDebug = await Run(status, LogEventLevel.Debug);
+
+		Assert.That(atDebug, Has.Count.EqualTo(1));
+		Assert.Multiple(() =>
+		{
+			Assert.That(atInformation, Is.Empty);
+			Assert.That(atDebug[0].Level, Is.EqualTo(LogEventLevel.Debug));
+			Assert.That(atDebug[0].RenderMessage(CultureInfo.InvariantCulture),
+				Does.Contain(status.ToString(CultureInfo.InvariantCulture)).And.Contain("/api/thing"));
+		});
+	}
+
+	[TestCase(400, LogEventLevel.Information)]
+	[TestCase(404, LogEventLevel.Information)]
+	[TestCase(409, LogEventLevel.Information)]
+	[TestCase(500, LogEventLevel.Warning)]
+	[TestCase(503, LogEventLevel.Warning)]
+	public async Task Failed_Request_Outcomes_Are_Logged_At_The_Information_Minimum(
+		int status,
+		LogEventLevel expected)
+	{
+		var events = await Run(status, LogEventLevel.Information);
+
+		Assert.That(events, Has.Count.EqualTo(1));
+		Assert.Multiple(() =>
+		{
+			Assert.That(events[0].Level, Is.EqualTo(expected));
+			Assert.That(events[0].RenderMessage(CultureInfo.InvariantCulture),
+				Does.Contain(status.ToString(CultureInfo.InvariantCulture)).And.Contain("/api/thing"));
+		});
+	}
+
+	[Test]
+	public void A_Request_Whose_Pipeline_Throws_Is_Still_Logged()
+	{
+		var sink = new CollectingSink();
+		using var logger = new LoggerConfiguration()
+			.MinimumLevel.Is(LogEventLevel.Information)
+			.WriteTo.Sink(sink)
+			.CreateLogger();
+		var middleware = new RequestOutcomeMiddleware(_ => throw new InvalidOperationException("boom"), logger);
+
+		var httpContext = new DefaultHttpContext
+		{
+			Request =
+			{
+				Method = "GET",
+				Path = "/api/thing"
+			}
+		};
+
+		Assert.ThrowsAsync<InvalidOperationException>(() => middleware.Invoke(httpContext));
+
+		Assert.That(sink.Events, Has.Count.EqualTo(1));
+		Assert.Multiple(() =>
+		{
+			Assert.That(sink.Events[0].Level, Is.EqualTo(LogEventLevel.Warning));
+			Assert.That(sink.Events[0].RenderMessage(CultureInfo.InvariantCulture),
+				Does.Contain("500").And.Contain("/api/thing"));
+		});
+	}
+
+	[Test]
+	public async Task A_request_path_cannot_forge_a_log_line_or_carry_a_terminal_escape()
+	{
+		var events = await Run(404, LogEventLevel.Information, "/nope\n2026-09-30 [ERR] [Host] forged\u001b[31m");
+
+		var rendered = events.Single().RenderMessage(CultureInfo.InvariantCulture);
+		Assert.Multiple(() =>
+		{
+			Assert.That(rendered.Any(char.IsControl), Is.False);
+			Assert.That(rendered, Does.Contain("/nope").And.Contain("forged"));
+		});
+	}
+
+	private static async Task<List<LogEvent>> Run(int status, LogEventLevel minimum, string path = "/api/thing")
+	{
+		var sink = new CollectingSink();
+		using var logger = new LoggerConfiguration().MinimumLevel.Is(minimum).WriteTo.Sink(sink).CreateLogger();
+		var middleware = new RequestOutcomeMiddleware(context =>
+			{
+				context.Response.StatusCode = status;
+
+				return Task.CompletedTask;
+			},
+			logger);
+
+		var httpContext = new DefaultHttpContext
+		{
+			Request =
+			{
+				Method = "GET",
+				Path = path
+			}
+		};
+
+		await middleware.Invoke(httpContext);
+
+		return sink.Events;
+	}
+
+	private sealed class CollectingSink : ILogEventSink
+	{
+		public List<LogEvent> Events { get; } = [];
+
+		public void Emit(LogEvent logEvent)
+		{
+			Events.Add(logEvent);
+		}
+	}
+}

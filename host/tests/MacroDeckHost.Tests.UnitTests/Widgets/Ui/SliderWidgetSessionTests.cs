@@ -1,0 +1,1256 @@
+using System.Globalization;
+using System.Text.Json;
+using MacroDeck.Localization;
+using MacroDeck.Sdk.Ui;
+using MacroDeck.Ui.Model.Nodes;
+using MacroDeck.Sdk;
+using MacroDeck.Sdk.Actions;
+using MacroDeck.Sdk.Variables;
+using MacroDeck.Ui.Model.Patches;
+using MacroDeck.Ui.Model.Surfaces;
+using MacroDeck.Ui.Runtime;
+using MacroDeck.Ui.Testing;
+using MacroDeck.Ui.Components;
+using MacroDeckHost.Application.Actions;
+using MacroDeckHost.Application.MusicPlayer;
+using MacroDeckHost.Application.Rendering;
+using MacroDeckHost.Application.Persistence;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Application.Ui.Transport;
+using MacroDeckHost.Application.Variables;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Domain.Common;
+using MacroDeckHost.Domain.Entities;
+using MacroDeckHost.Domain.Enums;
+using MacroDeckHost.Domain.Widgets;
+using MacroDeckHost.Localization;
+using MacroDeckHost.Tests.UnitTests.Delegation;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using MacroDeckHost.Tests.UnitTests.Triggers;
+using MacroDeckHost.Widgets.Slider;
+using Microsoft.Extensions.DependencyInjection;
+using DomainVariableType = MacroDeckHost.Domain.Enums.VariableType;
+using SdkVariableType = MacroDeck.Sdk.Variables.VariableType;
+
+namespace MacroDeckHost.Tests.UnitTests.Widgets.Ui;
+
+[TestFixture]
+public class SliderWidgetSessionTests
+{
+	[Test]
+	public async Task An_adjust_moves_the_level_and_pushes_the_mapped_value_in_the_variables_units()
+	{
+		var slider = Writable(0, 100, 0, 50);
+
+		var result = slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.7);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.IsAccepted, Is.True);
+			Assert.That(slider.Host.ById("slider.track").Number("level"), Is.EqualTo(0.7).Within(1e-9));
+			Assert.That(slider.Provider.Writes, Has.Count.EqualTo(1));
+			Assert.That(slider.Provider.Writes[0], Is.EqualTo(70).Within(1e-9));
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task
+		A_commit_on_release_variables_adjust_moves_the_level_but_pushes_nothing_and_the_following_change_pushes_once()
+	{
+		var slider = Writable(0, 100, 0, 50, true);
+
+		var adjustResult = slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.3);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(adjustResult.IsAccepted, Is.True);
+			Assert.That(slider.Host.ById("slider.track").Number("level"),
+				Is.EqualTo(0.3).Within(1e-9),
+				"The readout must still follow the finger even though the variable is not written yet (#469).");
+			Assert.That(slider.Provider.Writes, Is.Empty);
+		});
+
+		var changeResult = slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.3);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(changeResult.IsAccepted, Is.True);
+			Assert.That(slider.Provider.Writes, Has.Count.EqualTo(1));
+			Assert.That(slider.Provider.Writes[0], Is.EqualTo(30).Within(1e-9));
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task An_adjust_snaps_onto_the_variables_grid_anchored_at_its_minimum()
+	{
+		// min 3, max 103, step 10: the retired client anchored its snap at zero - round(raw/step)*step -
+		// which lands on 50, a value the variable's own grid does not contain. Anchoring at the minimum gives
+		// 53. (Snapping in fraction space is not the distinction: a fraction is measured from the minimum
+		// too, so it is the same arithmetic.)
+		var slider = Writable(3, 103, 10, 3);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.47);
+		await slider.Host.SettleAsync();
+
+		Assert.That(slider.Provider.Writes.Single(), Is.EqualTo(53));
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task Grid_snapping_rounds_an_exact_tie_away_from_zero()
+	{
+		// min 0, max 10, step 1: a level of 0.25 lands exactly on raw 2.5, a tie between step 2 and 3. C#'s
+		// default Math.Round would bank to 2 (even); JavaScript's half-up Math.round gives 3. The host must
+		// match the client's half-up behaviour, or the same drag ends on a different value on each side.
+		var slider = Writable(0, 10, 1, 0);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.25);
+		await slider.Host.SettleAsync();
+
+		Assert.That(slider.Provider.Writes.Single(), Is.EqualTo(3));
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_fractional_step_lands_on_a_clean_value_rather_than_a_binary_float_artefact()
+	{
+		// min 0, max 1, step 0.1: the seventh step is 0.7, but rebuilding it as 7 * 0.1 in binary floating
+		// point gives 0.7000000000000001 - which the variable would be written with and which the readout
+		// beside the track would spell out to the user.
+		var slider = Writable(0, 1, 0.1, 0);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.7);
+		await slider.Host.SettleAsync();
+
+		Assert.That(slider.Provider.Writes.Single(), Is.EqualTo(0.7));
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task
+		A_reading_reporting_the_old_value_during_the_hold_does_not_move_the_level_back_and_one_after_expiry_does()
+	{
+		var slider = Writable(0, 100, 0, 50);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.9);
+		await slider.Host.SettleAsync();
+
+		Assert.That(slider.Host.ById("slider.track").Number("level"),
+			Is.EqualTo(0.9).Within(1e-9),
+			"the change landed");
+
+		// A reading landing while the hold is active and far from the held value must not snap the level back.
+		slider.Report("40");
+
+		Assert.That(slider.Host.ById("slider.track").Number("level"),
+			Is.EqualTo(0.9).Within(1e-9),
+			"a reading during the hold must not fight the value the user just set");
+
+		// Once the hold has expired, the same stale-looking reading is adopted.
+		slider.TimeProvider.Now += TimeSpan.FromMilliseconds(3001);
+		slider.Report("40");
+
+		Assert.That(slider.Host.ById("slider.track").Number("level"),
+			Is.EqualTo(0.4).Within(1e-9),
+			"once the hold expires the provider's own value takes over");
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_dispatch_while_the_host_is_locked_is_rejected_and_pushes_nothing()
+	{
+		var slider = Writable(0, 100, 0, 50, locked: true);
+
+		var result = slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.7);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.IsAccepted, Is.False, "a locked host must refuse before any state is touched");
+			Assert.That(slider.Host.ById("slider.track").Number("level"),
+				Is.EqualTo(0.5).Within(1e-9),
+				"the level must not move");
+			Assert.That(slider.Provider.Writes, Is.Empty);
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_value_change_produces_only_set_properties_operations_never_a_structural_patch()
+	{
+		var slider = Writable(0, 100, 0, 50);
+
+		slider.Host.ClearPatches();
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.2);
+		await slider.Host.SettleAsync();
+
+		slider.Report("65");
+
+		var ops = slider.Host.Patches.SelectMany(p => p.Operations).Select(o => o.Op).ToList();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(ops, Is.Not.Empty, "the scenario must actually have produced patches to assert on");
+			Assert.That(ops,
+				Has.All.EqualTo(UiPatchOperations.SetProperties),
+				"rapid updates must patch properties in place, never rebuild the tree");
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_burst_of_dispatches_is_coalesced_but_still_ends_on_the_value_the_user_landed_on()
+	{
+		// A client that ignores its own throttle - or simply a slow provider - must not be able to lose the
+		// last value. Intermediate values may be dropped, which is the point of coalescing; the one the
+		// interaction ended on may not.
+		var slider = Writable(0, 100, 0, 0);
+
+		for (var i = 1; i <= 10; i++)
+		{
+			slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, i / 10d);
+		}
+
+		// The trailing call waits out the minimum interval, so the clock has to reach it.
+		for (var i = 0; i < 200 && slider.Provider.LastWrite != 100d; i++)
+		{
+			slider.TimeProvider.Advance(TimeSpan.FromMilliseconds(50));
+			await Task.Delay(1);
+		}
+
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(slider.Provider.LastWrite,
+				Is.EqualTo(100d),
+				"the value the interaction ended on has to arrive");
+			Assert.That(slider.Provider.Writes,
+				Has.Count.LessThan(10),
+				"ten dispatches must not be ten writes to the provider");
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_slider_follows_the_variable_with_no_interaction()
+	{
+		var slider = UserOwned(0, 100, 1, "75");
+
+		Assert.That(slider.Host.ById("slider.track").Number("level"), Is.EqualTo(0.75).Within(1e-9));
+
+		slider.Report("30");
+
+		Assert.That(slider.Host.ById("slider.track").Number("level"), Is.EqualTo(0.30).Within(1e-9));
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task An_out_of_range_variable_clamps_the_level_and_never_writes()
+	{
+		var slider = UserOwned(0, 100, 1, "160");
+
+		Assert.That(slider.Host.ById("slider.track").Number("level"), Is.EqualTo(1.0).Within(1e-9));
+
+		// Refresh several times with no interaction at all.
+		for (var i = 0; i < 3; i++)
+		{
+			slider.Report("160");
+		}
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(slider.Host.ById("slider.track").Number("level"), Is.EqualTo(1.0).Within(1e-9));
+			Assert.That(slider.Provider.Writes, Is.Empty, "no drag ever happened, so nothing may have been written");
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	/// <summary>
+	/// The variable's own volatile range is what a drag maps onto - a gain-boosted input reports a ceiling
+	/// above the widget config's, and a write mapped onto the config's range instead would land somewhere
+	/// the user never dragged to.
+	/// </summary>
+	[Test]
+	public async Task A_drag_maps_onto_the_variables_own_range_not_the_widget_configs()
+	{
+		var slider = Writable(0,
+			100,
+			1,
+			0,
+			configMin: -60,
+			configMax: 0,
+			configStep: 0.5);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.5);
+		await slider.Host.SettleAsync();
+
+		Assert.That(slider.Provider.Writes.Single(),
+			Is.EqualTo(50).Within(1e-9),
+			"the write must land in the variable's own units (50), never the widget config's (-30)");
+
+		await slider.DisposeAsync();
+	}
+
+	/// <summary>A variable that declares no range of its own leaves the widget config's Min/Max/Step in
+	/// place, per field - which is what a plain user variable relies on to be draggable at all.</summary>
+	[Test]
+	public async Task A_variable_declaring_no_range_falls_back_to_the_configured_one()
+	{
+		var slider = UserOwned(-60, 0, 0.5, "-10");
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.5);
+		await slider.Host.SettleAsync();
+
+		Assert.That(slider.Value, Is.EqualTo("-30"));
+
+		await slider.DisposeAsync();
+	}
+
+	[TestCase(5, 0.43, 45)]
+	[TestCase(15, 0.5, 45)]
+	public async Task A_custom_step_replaces_the_step_the_variable_declares(
+		double widgetStep,
+		double level,
+		double written)
+	{
+		var slider = Writable(0, 100, 1, 0, configStep: widgetStep, customStep: true);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, level);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(slider.Provider.Writes.Single(), Is.EqualTo(written).Within(1e-9));
+			Assert.That(slider.Host.ById("slider.track").Number("step"), Is.EqualTo(widgetStep / 100).Within(1e-9));
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[TestCase(0)]
+	[TestCase(-5)]
+	[TestCase(500)]
+	public async Task A_custom_step_that_cannot_form_a_grid_falls_back_to_the_step_the_variable_declares(
+		double widgetStep)
+	{
+		var slider = Writable(0, 100, 1, 0, configStep: widgetStep, customStep: true);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.4321);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(slider.Provider.Writes.Single(), Is.EqualTo(43).Within(1e-9));
+			Assert.That(slider.Host.ById("slider.track").Number("step"), Is.EqualTo(0.01).Within(1e-9));
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task Without_a_custom_step_the_step_the_variable_declares_still_wins()
+	{
+		var slider = Writable(0, 100, 1, 0, configStep: 5);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.43);
+		await slider.Host.SettleAsync();
+
+		Assert.That(slider.Provider.Writes.Single(), Is.EqualTo(43).Within(1e-9));
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_slider_whose_variable_declares_no_write_capability_is_inert_on_drag()
+	{
+		var slider = ReadOnlyIntegrationOwned(0, 100, 1, "75");
+
+		var result = slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.2);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.IsAccepted, Is.False, "an unwritable slider must refuse the drag");
+			Assert.That(slider.Host.ById("slider.track").Number("level"),
+				Is.EqualTo(0.75).Within(1e-9),
+				"the thumb must not move and snap back");
+			Assert.That(slider.Provider.Writes, Is.Empty);
+			Assert.That(slider.Value, Is.EqualTo("75"));
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_slider_whose_variable_is_user_owned_writes_it_on_drag()
+	{
+		var slider = UserOwned(0, 100, 1, "75");
+
+		var result = slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.2);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.IsAccepted, Is.True);
+			Assert.That(slider.Provider.Writes, Is.Empty, "a user variable is stored, never handed to a provider");
+			Assert.That(slider.Value, Is.EqualTo("20"));
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_non_numeric_variable_renders_a_defined_level_and_value_text_never_NaN()
+	{
+		await AssertUnresolvedVariableRendersSafely(UserOwned(0,
+			100,
+			1,
+			"abc",
+			DomainVariableType.Text));
+	}
+
+	[Test]
+	public async Task An_unavailable_variable_renders_a_defined_level_and_value_text_never_NaN()
+	{
+		var slider = UserOwned(0, 100, 1, "75");
+		slider.Registry.SetAvailable(slider.Entity.Id, false);
+		slider.Report("75");
+
+		await AssertUnresolvedVariableRendersSafely(slider);
+	}
+
+	[Test]
+	public async Task A_missing_variable_renders_a_defined_level_and_value_text_never_NaN()
+	{
+		await AssertUnresolvedVariableRendersSafely(Missing());
+	}
+
+	/// <summary>
+	/// The slider's target is stored as a plain name, which ADR 0081 keeps true of every place a variable is
+	/// stored as a reference rather than written as template text. A dotted key is therefore a name nothing
+	/// declares - not an attribute path - and a slider is not a way to drag a variable's unit.
+	/// </summary>
+	[Test]
+	public async Task An_attribute_path_is_not_a_slider_target()
+	{
+		await AssertUnresolvedVariableRendersSafely(BoundTo("vol.max"));
+	}
+
+	private static async Task AssertUnresolvedVariableRendersSafely(SliderUnderTest slider)
+	{
+		var level = slider.Host.ById("slider.track").Number("level");
+		var valueNode = slider.Host.ById("slider.header.value");
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(double.IsFinite(level!.Value), Is.True, "the level must never be NaN or infinite");
+			Assert.That(level, Is.EqualTo(0.0).Within(1e-9), "an unresolved reading renders at the minimum end");
+			Assert.That(valueNode.HasProperty("text"), Is.True, "the value text must be defined, never blank");
+			Assert.That(LocalizedTextKey(valueNode),
+				Is.EqualTo(AppStrings.Widgets.Slider.ValueUnavailable().Key),
+				"an unresolved reading must fall back to the unavailable text, never a NaN-bearing value");
+			Assert.That(slider.Provider.Writes, Is.Empty);
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	/// <summary>The localization key a rendered <c>text</c> property resolves to - see
+	/// <c>LocalizedTextJsonConverter</c> for the wire shape a localized reference (as opposed to a
+	/// literal string) always takes.</summary>
+	private static LocalizationKey LocalizedTextKey(UiTestNode node)
+	{
+		var localized = node.Property("text")!.Value.GetProperty("$localized");
+
+		return new LocalizationKey(localized.GetProperty("scope").GetString()!,
+			localized.GetProperty("key").GetString()!);
+	}
+
+	[Test]
+	public async Task The_declared_event_set_does_not_depend_on_whether_the_variable_exists()
+	{
+		var slider = Missing();
+
+		Assert.That(slider.Session.BuildEvents(),
+			Is.Not.Empty,
+			"the declared event set is a pure function of stored config, not of runtime variable state");
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_double_tap_runs_its_flow_after_the_second_taps_own_write_and_the_slider_shows_the_result()
+	{
+		var slider = Writable(0, 100, 0, 50, doublePressFlow: true);
+		var writesWhenTheFlowRan = -1;
+		slider.Trigger.OnExecute = () =>
+		{
+			writesWhenTheFlowRan = slider.Provider.Writes.Count;
+			slider.Report("20");
+		};
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Change, 0.8);
+		var result = slider.Host.ById("slider.track").Raise(UiComponentEvents.DoublePress);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.IsAccepted, Is.True);
+			Assert.That(slider.Trigger.Calls, Is.EqualTo(new[] { WidgetTriggerTypes.DoublePress }));
+			Assert.That(writesWhenTheFlowRan, Is.EqualTo(1), "the flow must run after the tap's own write landed");
+			Assert.That(slider.Value, Is.EqualTo("20"));
+			Assert.That(slider.Host.ById("slider.track").Number("level"), Is.EqualTo(0.2).Within(1e-9));
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_double_tap_while_the_host_is_locked_is_rejected_and_runs_no_flow()
+	{
+		var slider = Writable(0, 100, 0, 50, locked: true, doublePressFlow: true);
+
+		var result = slider.Host.ById("slider.track").Raise(UiComponentEvents.DoublePress);
+		await slider.Host.SettleAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(result.IsAccepted, Is.False);
+			Assert.That(slider.Trigger.Calls, Is.Empty);
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task A_slider_without_a_double_tap_flow_declares_exactly_the_events_it_always_has()
+	{
+		var slider = Writable(0, 100, 0, 50);
+
+		Assert.That(slider.Session.BuildEvents().Select(handler => handler.Name).Distinct(),
+			Is.EquivalentTo(new[] { UiComponentEvents.Adjust, UiComponentEvents.Change }));
+
+		await slider.DisposeAsync();
+	}
+
+	[Test]
+	public async Task An_unbound_deck_tile_gets_its_own_slider_value_once_and_takes_input_through_it()
+	{
+		var registry = new VariableRegistry();
+		var provider = ProviderWith(registry);
+		var widgetId = Guid.NewGuid();
+
+		var events = await OpenAsync(provider, UiSurfaceKinds.Widget, widgetId, new { min = 10 });
+		var created = registry.FindByName(VariableScope.Widget, widgetId.ToString(), SliderDefaultVariable.Name);
+		var initial = created?.Value;
+		created!.Value = "42";
+		await OpenAsync(provider, UiSurfaceKinds.Widget, widgetId, new { min = 10 });
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(events, Is.EquivalentTo(new[] { UiComponentEvents.Adjust, UiComponentEvents.Change }));
+			Assert.That(created.Classification, Is.EqualTo(VariableClassification.User));
+			Assert.That(created.Type, Is.EqualTo(DomainVariableType.Numeric));
+			Assert.That(initial, Is.EqualTo("10"));
+			Assert.That(registry.FindByName(VariableScope.Widget, widgetId.ToString(), SliderDefaultVariable.Name)!
+					.Value,
+				Is.EqualTo("42"),
+				"reopening must never reset the slider's own value");
+		});
+	}
+
+	[Test]
+	public async Task The_editor_preview_never_creates_slider_value_and_takes_no_input()
+	{
+		var registry = new VariableRegistry();
+		var widgetId = Guid.NewGuid();
+
+		var events = await OpenAsync(ProviderWith(registry),
+			UiSurfaceKinds.Preview,
+			widgetId,
+			new { },
+			UiWidgetSurfaceAttributes.VariableScopeWidgetId);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(events, Is.Empty);
+			Assert.That(registry.FindByName(VariableScope.Widget, widgetId.ToString(), SliderDefaultVariable.Name),
+				Is.Null);
+		});
+	}
+
+	[Test]
+	public void A_global_slider_value_never_captures_a_slider_using_its_default()
+	{
+		var registry = new VariableRegistry();
+		registry.Upsert(NumericUserVariable(SliderDefaultVariable.Name, VariableScope.Global, null));
+
+		Assert.That(SliderDefaultVariable.Find(registry, Guid.NewGuid(), null), Is.Null);
+	}
+
+	[Test]
+	public void A_picked_name_resolves_the_widgets_own_variable_before_a_global_of_the_same_name()
+	{
+		var registry = new VariableRegistry();
+		var widgetId = Guid.NewGuid();
+		registry.Upsert(NumericUserVariable("vol", VariableScope.Global, null));
+		registry.Upsert(NumericUserVariable("vol", VariableScope.Widget, widgetId.ToString()));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(SliderDefaultVariable.Find(registry, widgetId, "vol")?.Scope, Is.EqualTo(VariableScope.Widget));
+			Assert.That(SliderDefaultVariable.Find(registry, Guid.NewGuid(), "vol")?.Scope,
+				Is.EqualTo(VariableScope.Global));
+		});
+	}
+
+	[Test]
+	public async Task A_label_template_shows_the_variables_value_and_follows_its_changes()
+	{
+		var registry = new VariableRegistry();
+		var notifier = new VariableChangeNotifier();
+		var strip = TextUserVariable("strip_name", "Strip A");
+		registry.Upsert(strip);
+
+		var session = await OpenLabelledAsync(ProviderWith(registry, notifier),
+			Guid.NewGuid(),
+			"{{ vars.strip_name }}");
+		var initial = LabelText(session);
+
+		strip.Value = "Mic";
+		notifier.Publish("strip_name");
+		var updated = LabelText(session);
+		await session.DisposeAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(initial, Is.EqualTo("Strip A"));
+			Assert.That(updated, Is.EqualTo("Mic"));
+		});
+	}
+
+	[Test]
+	public async Task A_label_template_resolves_a_widget_scoped_variable_in_the_widgets_own_scope()
+	{
+		var widgetId = Guid.NewGuid();
+		var registry = new VariableRegistry();
+		registry.Upsert(NumericUserVariable("gain", VariableScope.Widget, widgetId.ToString()));
+
+		var session = await OpenLabelledAsync(ProviderWith(registry), widgetId, "Gain {{ vars.gain }}");
+		var text = LabelText(session);
+		await session.DisposeAsync();
+
+		Assert.That(text, Is.EqualTo("Gain 5"));
+	}
+
+	[Test]
+	public async Task A_label_template_naming_a_missing_variable_is_rendered_rather_than_shown_raw()
+	{
+		var session = await OpenLabelledAsync(ProviderWith(new VariableRegistry()),
+			Guid.NewGuid(),
+			"Gain {{ vars.nothing_here }}");
+		var text = LabelText(session);
+		await session.DisposeAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(text, Does.StartWith("Gain"));
+			Assert.That(text, Does.Not.Contain("{{"));
+		});
+	}
+
+	[Test]
+	public async Task A_plain_label_is_shown_verbatim()
+	{
+		var session = await OpenLabelledAsync(ProviderWith(new VariableRegistry()), Guid.NewGuid(), "Volume");
+		var text = LabelText(session);
+		await session.DisposeAsync();
+
+		Assert.That(text, Is.EqualTo("Volume"));
+	}
+
+	private static VariableEntity TextUserVariable(string name, string value)
+	{
+		return new VariableEntity
+		{
+			Id = Guid.NewGuid(),
+			Name = name,
+			Scope = VariableScope.Global,
+			Type = DomainVariableType.Text,
+			Classification = VariableClassification.User,
+			Value = value,
+			UpdatedAt = DateTime.UtcNow
+		};
+	}
+
+	private static async Task<IUiSession> OpenLabelledAsync(
+		SliderWidgetUiProvider provider,
+		Guid widgetId,
+		string label)
+	{
+		var surface = new UiSurface
+		{
+			Kind = UiSurfaceKinds.Widget,
+			SessionMode = UiSessionModes.Shared,
+			Attributes = new Dictionary<string, JsonElement>(StringComparer.Ordinal)
+			{
+				[UiWidgetSurfaceAttributes.Data] = JsonSerializer.SerializeToElement(new { label, showLabel = true }),
+				[UiWidgetSurfaceAttributes.WidgetId] = JsonSerializer.SerializeToElement(widgetId.ToString())
+			}
+		};
+
+		return (await provider.CreateSessionAsync(new UiSessionRequest { Surface = surface, UiModelVersion = 1 },
+			CancellationToken.None))!;
+	}
+
+	private static string? LabelText(IUiSession session)
+	{
+		return Walk(session.BuildTree().Root)
+			.Single(node => node.Id == "slider.header.lead.label")
+			.Properties["text"]
+			.GetString();
+	}
+
+	private static VariableEntity NumericUserVariable(string name, VariableScope scope, string? scopeRefId)
+	{
+		return new VariableEntity
+		{
+			Id = Guid.NewGuid(),
+			Name = name,
+			Scope = scope,
+			ScopeRefId = scopeRefId,
+			Type = DomainVariableType.Numeric,
+			Classification = VariableClassification.User,
+			Value = "5",
+			UpdatedAt = DateTime.UtcNow
+		};
+	}
+
+	private static async Task<IReadOnlyList<string>> OpenAsync(
+		SliderWidgetUiProvider provider,
+		string kind,
+		Guid widgetId,
+		object data,
+		string widgetIdAttribute = UiWidgetSurfaceAttributes.WidgetId)
+	{
+		var surface = new UiSurface
+		{
+			Kind = kind,
+			SessionMode = UiSessionModes.Shared,
+			Attributes = new Dictionary<string, JsonElement>(StringComparer.Ordinal)
+			{
+				[UiWidgetSurfaceAttributes.Data] = JsonSerializer.SerializeToElement(data),
+				[widgetIdAttribute] = JsonSerializer.SerializeToElement(widgetId.ToString())
+			}
+		};
+
+		var session = await provider.CreateSessionAsync(new UiSessionRequest { Surface = surface, UiModelVersion = 1 },
+			CancellationToken.None);
+		var track = Walk(session!.BuildTree().Root).Single(node => node.Type == UiComponents.Slider);
+		await session.DisposeAsync();
+
+		return track.Properties.TryGetValue("events", out var declared)
+			? declared.EnumerateArray().Select(name => name.GetString()!).ToList()
+			: [];
+	}
+
+	private static IEnumerable<UiNode> Walk(UiNode node)
+	{
+		return node.Children.SelectMany(Walk).Prepend(node);
+	}
+
+	[Test]
+	public async Task A_colour_only_save_recolours_the_track_in_place_without_losing_the_users_value()
+	{
+		var slider = Writable(0, 100, 0, 50);
+		var signals = new WidgetRenderSignals();
+		var widgetId = Guid.NewGuid();
+		slider.Session.FollowAccentColor(signals, widgetId.ToString(), slider.Config, slider.Accent);
+
+		slider.Host.ById("slider.track").Raise(UiComponentEvents.Adjust, 0.7);
+		await slider.Host.SettleAsync();
+
+		var recoloured = signals.RaiseDataChanged(SavedSlider(widgetId, slider.Config with { Color = "#ef4444" }));
+		await slider.Host.SettleAsync();
+		var redTrack = slider.Host.ById("slider.track");
+		var redColour = redTrack.Text("levelColor");
+		var redLevel = redTrack.Number("level");
+
+		var reset = signals.RaiseDataChanged(SavedSlider(widgetId, slider.Config));
+		await slider.Host.SettleAsync();
+		var themed = slider.Host.ById("slider.track").HasProperty("levelColor");
+
+		var rangeChange = signals.RaiseDataChanged(SavedSlider(widgetId, slider.Config with { Max = 50 }));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(recoloured, Is.True, "a colour-only save must not reopen the session");
+			Assert.That(redColour, Is.EqualTo("#ef4444"));
+			Assert.That(redLevel, Is.EqualTo(0.7).Within(1e-9), "the value the user dragged to survives");
+			Assert.That(reset, Is.True);
+			Assert.That(themed, Is.False, "a reset goes back to the reader's theme accent");
+			Assert.That(rangeChange, Is.False, "anything but the colour still rebuilds the session");
+		});
+
+		await slider.DisposeAsync();
+	}
+
+	private static WidgetEntity SavedSlider(Guid widgetId, SliderWidgetData config)
+	{
+		return new WidgetEntity
+		{
+			Id = widgetId,
+			Type = WidgetTypeIds.Slider,
+			Data = JsonSerializer.Serialize(new
+			{
+				valueVariable = config.ValueVariable,
+				showValue = config.ShowValue,
+				min = config.Min,
+				max = config.Max,
+				step = config.Step,
+				color = config.Color
+			})
+		};
+	}
+
+	private static SliderWidgetUiProvider ProviderWith(
+		VariableRegistry registry,
+		VariableChangeNotifier? notifier = null)
+	{
+		var integrations = new ConfigurableIntegrationRegistry([]);
+		var scopeFactory = new ServiceCollection()
+			.AddSingleton(registry)
+			.AddSingleton(new VariableCatalogProviders(integrations))
+			.AddSingleton<IUserVariableStore>(new NullUserVariableStore())
+			.AddSingleton<Mediator.IMediator>(new RecordingMediator())
+			.AddSingleton<IVariableRefreshSignal>(new VariableRefreshSignal())
+			.AddSingleton<IMusicPlayerPollNudge>(new MusicPlayerPollNudge(integrations))
+			.AddTestFileVariables()
+			.AddSingleton<Serilog.ILogger>(Serilog.Core.Logger.None)
+			.AddScoped<IVariableService, VariableService>()
+			.BuildServiceProvider()
+			.GetRequiredService<IServiceScopeFactory>();
+
+		return new SliderWidgetUiProvider(new SliderWidgetConfigTests.FakeWidgetIconResources(),
+			new FakeHostLockState(),
+			new SliderWidgetConfigTests.PassThroughSampleText(),
+			TimeProvider.System,
+			registry,
+			notifier ?? new VariableChangeNotifier(),
+			scopeFactory,
+			new RecordingTriggerService(),
+			new StubFolderCache(),
+			new NullUiTransport(),
+			new RecordingRenderSignals(),
+			new Devices.Surfaces.StubIconPackCache());
+	}
+
+	private static SliderUnderTest Writable(
+		double min,
+		double max,
+		double step,
+		double value,
+		bool commitOnRelease = false,
+		bool locked = false,
+		double configMin = 0,
+		double configMax = 100,
+		double configStep = 0,
+		bool doublePressFlow = false,
+		bool customStep = false)
+	{
+		return SliderUnderTest.Build(entity =>
+			{
+				entity.Classification = VariableClassification.Integration;
+				entity.OwnerIntegrationId = RecordingVariableProvider.IntegrationId;
+				entity.DefinitionId = "vol";
+				entity.Value = value.ToString(CultureInfo.InvariantCulture);
+				entity.Min = min;
+				entity.Max = max;
+				entity.Step = step;
+				entity.Write = new VariableWriteCapability { CommitOnRelease = commitOnRelease };
+			},
+			configMin,
+			configMax,
+			configStep,
+			locked,
+			doublePressFlow: doublePressFlow,
+			customStep: customStep);
+	}
+
+	private static SliderUnderTest ReadOnlyIntegrationOwned(double min, double max, double step, string value)
+	{
+		return SliderUnderTest.Build(entity =>
+			{
+				entity.Classification = VariableClassification.Integration;
+				entity.OwnerIntegrationId = RecordingVariableProvider.IntegrationId;
+				entity.DefinitionId = "vol";
+				entity.Value = value;
+			},
+			min,
+			max,
+			step);
+	}
+
+	private static SliderUnderTest UserOwned(
+		double min,
+		double max,
+		double step,
+		string value,
+		DomainVariableType type = DomainVariableType.Numeric)
+	{
+		return SliderUnderTest.Build(entity =>
+			{
+				entity.Type = type;
+				entity.Value = value;
+			},
+			min,
+			max,
+			step);
+	}
+
+	private static SliderUnderTest Missing()
+	{
+		return SliderUnderTest.Build(null, 0, 100, 1);
+	}
+
+	private static SliderUnderTest BoundTo(string bindingName)
+	{
+		return SliderUnderTest.Build(entity => entity.Value = "75", 0, 100, 1, bindingName: bindingName);
+	}
+
+	/// <summary>One assembled slider: the real registry, variable service and session, with the owning
+	/// provider's writes recorded at the one boundary a variable write actually leaves the host through.
+	/// </summary>
+	private sealed class SliderUnderTest
+	{
+		private const string VariableName = "vol";
+
+		private SliderUnderTest(
+			UiTestHost host,
+			SliderWidgetSession session,
+			RecordingVariableProvider provider,
+			VariableRegistry registry,
+			VariableChangeNotifier notifier,
+			FakeTimeProvider timeProvider,
+			VariableEntity? entity,
+			RecordingTriggerService trigger,
+			SliderWidgetData config,
+			UiState<string?> accent)
+		{
+			Config = config;
+			Accent = accent;
+			Host = host;
+			Session = session;
+			Provider = provider;
+			Trigger = trigger;
+			Registry = registry;
+			Notifier = notifier;
+			TimeProvider = timeProvider;
+			_entity = entity;
+		}
+
+		private readonly VariableEntity? _entity;
+
+		public SliderWidgetData Config { get; }
+
+		public UiState<string?> Accent { get; }
+
+		public UiTestHost Host { get; }
+
+		public SliderWidgetSession Session { get; }
+
+		public RecordingVariableProvider Provider { get; }
+
+		public RecordingTriggerService Trigger { get; }
+
+		public VariableRegistry Registry { get; }
+
+		public VariableChangeNotifier Notifier { get; }
+
+		public FakeTimeProvider TimeProvider { get; }
+
+		public VariableEntity Entity => _entity!;
+
+		public string Value => Registry.FindByName(VariableScope.Global, null, VariableName)!.Value;
+
+		/// <summary>What a provider reporting a fresh reading looks like from the session's side: the
+		/// registry entry moves and the change is published.</summary>
+		public void Report(string value)
+		{
+			Registry.FindByName(VariableScope.Global, null, VariableName)!.Value = value;
+			Notifier.Publish(VariableName);
+		}
+
+		public async Task DisposeAsync()
+		{
+			await Session.DisposeAsync();
+		}
+
+		public static SliderUnderTest Build(
+			Action<VariableEntity>? entity,
+			double configMin,
+			double configMax,
+			double configStep,
+			bool locked = false,
+			string? bindingName = null,
+			bool doublePressFlow = false,
+			bool customStep = false)
+		{
+			var registry = new VariableRegistry();
+			var provider = new RecordingVariableProvider(registry);
+
+			VariableEntity? stored = null;
+			if (entity is not null)
+			{
+				stored = new VariableEntity
+				{
+					Id = Guid.NewGuid(),
+					Name = VariableName,
+					Scope = VariableScope.Global,
+					Type = DomainVariableType.Numeric,
+					Classification = VariableClassification.User,
+					Value = string.Empty,
+					UpdatedAt = DateTime.UtcNow
+				};
+				entity(stored);
+				registry.Upsert(stored);
+			}
+
+			var integrations = new ConfigurableIntegrationRegistry([provider]);
+			var providers = new VariableCatalogProviders(integrations);
+			var scopeFactory = new ServiceCollection()
+				.AddSingleton(registry)
+				.AddSingleton(providers)
+				.AddSingleton<IUserVariableStore>(new NullUserVariableStore())
+				.AddSingleton<Mediator.IMediator>(new RecordingMediator())
+				.AddSingleton<IVariableRefreshSignal>(new VariableRefreshSignal())
+				.AddSingleton<IMusicPlayerPollNudge>(new MusicPlayerPollNudge(integrations))
+				.AddTestFileVariables()
+				.AddSingleton<Serilog.ILogger>(Serilog.Core.Logger.None)
+				.AddScoped<IVariableService, VariableService>()
+				.BuildServiceProvider()
+				.GetRequiredService<IServiceScopeFactory>();
+
+			var notifier = new VariableChangeNotifier();
+			var timeProvider = new FakeTimeProvider();
+			var boundName = bindingName ?? VariableName;
+			var binding = new SliderVariableBinding(boundName,
+				configMin,
+				configMax,
+				configStep,
+				registry,
+				notifier,
+				scopeFactory,
+				CustomStep: customStep);
+			var state = new UiState<SliderWidgetReadout>(SliderWidgetReadout.Empty);
+
+			var trigger = new RecordingTriggerService();
+			SliderDoublePressBinding? doublePress = null;
+
+			if (doublePressFlow)
+			{
+				var widget = new WidgetEntity { Id = Guid.NewGuid(), Type = WidgetTypeIds.Slider, Data = "{}" };
+				var folderCache = new StubFolderCache();
+				widget.FolderId = folderCache.AddFolder(widget).Id;
+				doublePress = new SliderDoublePressBinding(widget.Id, folderCache, trigger, new NullUiTransport());
+			}
+
+			var session = new SliderWidgetSession(state,
+				new FakeHostLockState { IsLocked = locked },
+				timeProvider,
+				true,
+				binding,
+				doublePress);
+
+			var config = new SliderWidgetData
+			{
+				ValueVariable = boundName,
+				ShowValue = true,
+				Min = configMin,
+				Max = configMax,
+				Step = configStep,
+				CustomStep = customStep
+			};
+			var accent = new UiState<string?>(config.Color);
+			var element = SliderWidgetView.Build(config, state, null, session.BuildEvents(), accentColor: accent);
+			var view = new UiView(new UiSurface { Kind = UiSurfaceKinds.Widget, SessionMode = UiSessionModes.Shared },
+				element);
+
+			session.Attach(view);
+
+			return new SliderUnderTest(UiTestHost.Render(view),
+				session,
+				provider,
+				registry,
+				notifier,
+				timeProvider,
+				stored,
+				trigger,
+				config,
+				accent);
+		}
+	}
+
+	internal sealed class RecordingTriggerService : IWidgetTriggerService
+	{
+		public List<string> Calls { get; } = [];
+
+		public Action? OnExecute { get; set; }
+
+		public Task<ActionExecutionDispatch> ExecuteAsync(
+			WidgetEntity widget,
+			string triggerType,
+			string? originClientId,
+			Guid? originDeviceId,
+			CancellationToken cancellationToken)
+		{
+			Calls.Add(triggerType);
+			OnExecute?.Invoke();
+
+			return Task.FromResult(new ActionExecutionDispatch(Guid.NewGuid(), null));
+		}
+	}
+
+	internal sealed class NullUiTransport : IUiTransport
+	{
+		public Task Send<T>(T message, CancellationToken cancellationToken = default)
+			where T : class
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task SendToGroup<T>(string group, T message, CancellationToken cancellationToken = default)
+			where T : class
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task SendToConnection<T>(string connectionId, T message, CancellationToken cancellationToken = default)
+			where T : class
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task AddToGroup(string connectionId, string group, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task RemoveFromGroup(string connectionId, string group, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+	}
+
+	/// <summary>The owning integration of an integration-classified variable, recording what
+	/// <see cref="IVariableService.SetValue" /> dispatched to it and applying it to the registry the way a
+	/// real provider's next reading would.</summary>
+	private sealed class RecordingVariableProvider : IIntegration, IVariableProvider
+	{
+		internal const string IntegrationId = "integration";
+
+		private readonly VariableRegistry _registry;
+		private readonly List<double> _writes = [];
+
+		public RecordingVariableProvider(VariableRegistry registry)
+		{
+			_registry = registry;
+		}
+
+		public string Id => IntegrationId;
+
+		public LocalizedText Name => IntegrationId;
+
+		public string Version => "1.0.0";
+
+		public IReadOnlyList<IActionDefinition> Actions => [];
+
+		public bool IsInitialized => true;
+
+		public IReadOnlyList<VariableDefinition> Variables { get; } =
+			[VariableDefinition.Eager("vol", SdkVariableType.Numeric)];
+
+		public List<double> Writes
+		{
+			get
+			{
+				lock (_writes)
+				{
+					return [.. _writes];
+				}
+			}
+		}
+
+		public double? LastWrite
+		{
+			get
+			{
+				lock (_writes)
+				{
+					return _writes.Count == 0 ? null : _writes[^1];
+				}
+			}
+		}
+
+		public Task InitializeAsync(IIntegrationContext context)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task ShutdownAsync()
+		{
+			return Task.CompletedTask;
+		}
+
+		public ValueTask<VariableReading> ReadAsync(string localId, CancellationToken cancellationToken = default)
+		{
+			return ValueTask.FromResult(VariableReading.Unavailable);
+		}
+
+		public ValueTask<VariableWriteResult> SetValueAsync(
+			string localId,
+			object? value,
+			CancellationToken cancellationToken = default)
+		{
+			if (value is double number)
+			{
+				lock (_writes)
+				{
+					_writes.Add(number);
+				}
+			}
+
+			return ValueTask.FromResult(VariableWriteResult.Applied());
+		}
+	}
+
+	private sealed class NullUserVariableStore : IUserVariableStore
+	{
+		public IReadOnlyList<VariableEntity> Load()
+		{
+			return [];
+		}
+
+		public void Save(IEnumerable<VariableEntity> userVariables)
+		{
+		}
+	}
+}

@@ -1,0 +1,544 @@
+using MacroDeck.Plugin.Hosting.Integrations;
+using MacroDeck.Plugin.Hosting.Integrations.HostApis;
+using MacroDeck.Plugin.Hosting.Tests.UnitTests.Support;
+using MacroDeck.Plugin.Hosting.Transport;
+using MacroDeck.Plugin.Protocol.Callbacks;
+using MacroDeck.Plugin.Protocol.Envelope;
+using MacroDeck.Sdk;
+using MacroDeck.Sdk.ConfigFlow;
+using MacroDeck.Sdk.Decks;
+using MacroDeck.Sdk.Events;
+using MacroDeck.Sdk.Notifications;
+using MacroDeck.Sdk.Scripts;
+using MacroDeck.Sdk.Variables;
+using MacroDeck.Sdk.Widgets;
+using MacroDeck.Plugin.Testing.Fakes;
+using MacroDeck.Sdk.Devices;
+using MacroDeck.Sdk.Layouts;
+using MacroDeck.Sdk.ScreenSavers;
+using MacroDeck.Plugin.Protocol.Errors;
+using Microsoft.Extensions.DependencyInjection;
+using System.Text.Json;
+using MacroDeck.Plugin.Protocol.Capabilities;
+using MacroDeck.Plugin.Protocol.Capabilities.VideoStreamProvider;
+using MacroDeck.Plugin.Protocol.Serialization;
+using MacroDeck.Sdk.VideoStreams;
+
+namespace MacroDeck.Plugin.Hosting.Tests.UnitTests;
+
+/// <summary>
+/// <see cref="IntegrationLifecycleHostedService" />'s <see cref="HostStateCache.ConfigChanged" />
+/// subscription - the SDK-side half of issue #413's config-change gap. A host-pushed
+/// <c>host.state{config}</c> must re-run every integration's <c>InitializeAsync</c> the same way a
+/// non-resumed reconnect already does, since that is the only place a plugin picks its new config back
+/// up.
+/// </summary>
+[TestFixture]
+public class IntegrationLifecycleHostedServiceTests
+{
+	private static IntegrationLifecycleHostedService Service(
+		TestIntegration integration,
+		PluginConnectionState connectionState,
+		HostStateCache stateCache)
+	{
+		return new IntegrationLifecycleHostedService([integration],
+			TestMetadata.Default,
+			new NoOpIntegrationContext(),
+			new FakeDeviceProviderContext(),
+			new NoOpHostInvoker(),
+			new ServiceCollection().BuildServiceProvider(),
+			new FakeLayoutProviderContext(),
+			new FakeFolderViewProviderContext(),
+			new FakeWidgetTypeProviderContext(),
+			new FakeScreenSaverProviderContext(),
+			connectionState,
+			stateCache,
+			Serilog.Core.Logger.None);
+	}
+
+	[Test]
+	public async Task A_host_state_config_push_re_runs_InitializeAsync()
+	{
+		var connectionState = new PluginConnectionState();
+		var stateCache = new HostStateCache(new PluginConnectionState());
+		var integration = new TestIntegration();
+
+		var service = Service(integration, connectionState, stateCache);
+		await service.StartAsync(CancellationToken.None);
+
+		connectionState.RaiseConnected(false);
+		await WaitForAsync(() => integration.IsInitialized);
+		Assert.That(integration.ShutdownCount, Is.Zero);
+
+		stateCache.Apply(ConfigPush());
+		await WaitForAsync(() => integration.ShutdownCount == 1);
+
+		Assert.Multiple(() =>
+		{
+			// Re-initialized, not merely re-read in place: shut down once (the stale InitializeAsync
+			// state discarded) and initialized a second time.
+			Assert.That(integration.ShutdownCount, Is.EqualTo(1));
+			Assert.That(integration.IsInitialized, Is.True);
+		});
+
+		await service.StopAsync(CancellationToken.None);
+	}
+
+	[Test]
+	public async Task A_host_state_push_for_a_different_api_does_not_reinitialize()
+	{
+		var connectionState = new PluginConnectionState();
+		var stateCache = new HostStateCache(new PluginConnectionState());
+		var integration = new TestIntegration();
+
+		var service = Service(integration, connectionState, stateCache);
+		await service.StartAsync(CancellationToken.None);
+
+		connectionState.RaiseConnected(false);
+		await WaitForAsync(() => integration.IsInitialized);
+
+		stateCache.Apply(StatePush(HostApis.Scripts));
+
+		// Nothing to await for a negative assertion - give the (synchronous, event-driven) subscriber a
+		// moment it would have used had it fired, then assert it did not.
+		await Task.Delay(50);
+		Assert.That(integration.ShutdownCount, Is.Zero);
+
+		await service.StopAsync(CancellationToken.None);
+	}
+
+	[Test]
+	public async Task StopAsync_unsubscribes_so_a_later_config_push_does_nothing()
+	{
+		var connectionState = new PluginConnectionState();
+		var stateCache = new HostStateCache(new PluginConnectionState());
+		var integration = new TestIntegration();
+
+		var service = Service(integration, connectionState, stateCache);
+		await service.StartAsync(CancellationToken.None);
+		connectionState.RaiseConnected(false);
+		await WaitForAsync(() => integration.IsInitialized);
+
+		await service.StopAsync(CancellationToken.None);
+		var shutdownsAtStop = integration.ShutdownCount;
+
+		stateCache.Apply(ConfigPush());
+		await Task.Delay(50);
+
+		Assert.That(integration.ShutdownCount, Is.EqualTo(shutdownsAtStop));
+	}
+
+	private static ProtocolEnvelope ConfigPush()
+	{
+		return StatePush(HostApis.Config);
+	}
+
+	private static ProtocolEnvelope StatePush(string api)
+	{
+		return new ProtocolEnvelope
+		{
+			Type = MessageTypes.HostState,
+			Id = Guid.NewGuid().ToString(),
+			Payload = FakePluginSocket.Payload(new HostStatePayload { Api = api })
+		};
+	}
+
+	[Test]
+	public async Task A_device_provider_starts_with_the_integration_and_stops_before_it()
+	{
+		var connectionState = new PluginConnectionState();
+		var stateCache = new HostStateCache(new PluginConnectionState());
+		var integration = new DeviceProvidingIntegration();
+		var devices = new FakeDeviceProviderContext();
+
+		var service = new IntegrationLifecycleHostedService([integration],
+			TestMetadata.Default,
+			new NoOpIntegrationContext(),
+			devices,
+			new NoOpHostInvoker(),
+			new ServiceCollection().BuildServiceProvider(),
+			new FakeLayoutProviderContext(),
+			new FakeFolderViewProviderContext(),
+			new FakeWidgetTypeProviderContext(),
+			new FakeScreenSaverProviderContext(),
+			connectionState,
+			stateCache,
+			Serilog.Core.Logger.None);
+
+		await service.StartAsync(CancellationToken.None);
+		connectionState.RaiseConnected(false);
+		await WaitForAsync(() => integration.DeviceContext is not null);
+
+		await service.StopAsync(CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(integration.DeviceContext, Is.SameAs(devices));
+			Assert.That(integration.ProviderShutdownCount, Is.EqualTo(1));
+			Assert.That(integration.ProviderStoppedBeforeIntegration,
+				Is.True,
+				"a provider must let go of its hardware before the integration behind it is torn down");
+		});
+	}
+
+	[Test]
+	public async Task A_layout_provider_starts_before_the_device_provider()
+	{
+		var connectionState = new PluginConnectionState();
+		var stateCache = new HostStateCache(new PluginConnectionState());
+		var integration = new LayoutAndDeviceProvidingIntegration();
+		var devices = new FakeDeviceProviderContext();
+		var layouts = new FakeLayoutProviderContext();
+
+		var service = new IntegrationLifecycleHostedService([integration],
+			TestMetadata.Default,
+			new NoOpIntegrationContext(),
+			devices,
+			new NoOpHostInvoker(),
+			new ServiceCollection().BuildServiceProvider(),
+			layouts,
+			new FakeFolderViewProviderContext(),
+			new FakeWidgetTypeProviderContext(),
+			new FakeScreenSaverProviderContext(),
+			connectionState,
+			stateCache,
+			Serilog.Core.Logger.None);
+
+		await service.StartAsync(CancellationToken.None);
+		connectionState.RaiseConnected(false);
+		await WaitForAsync(() => integration.DeviceContext is not null);
+
+		await service.StopAsync(CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(integration.LayoutContext, Is.SameAs(layouts));
+			Assert.That(integration.DeviceContext, Is.SameAs(devices));
+			Assert.That(integration.LayoutInitializedBeforeDevice,
+				Is.True,
+				"a device may reference a layout by id, so the layout must exist before the device registers");
+		});
+	}
+
+	private sealed class LayoutAndDeviceProvidingIntegration : TestIntegration, IDeviceProvider, ILayoutProvider
+	{
+		private bool _layoutInitialized;
+
+		public ILayoutProviderContext? LayoutContext { get; private set; }
+
+		public IDeviceProviderContext? DeviceContext { get; private set; }
+
+		public bool LayoutInitializedBeforeDevice { get; private set; }
+
+		Task ILayoutProvider.InitializeAsync(ILayoutProviderContext context, CancellationToken cancellationToken)
+		{
+			LayoutContext = context;
+			_layoutInitialized = true;
+			return Task.CompletedTask;
+		}
+
+		public Task InitializeAsync(IDeviceProviderContext context, CancellationToken cancellationToken = default)
+		{
+			DeviceContext = context;
+			LayoutInitializedBeforeDevice = _layoutInitialized;
+			return Task.CompletedTask;
+		}
+
+		public Task ShutdownAsync(CancellationToken cancellationToken)
+		{
+			return Task.CompletedTask;
+		}
+	}
+
+	[Test]
+	public async Task A_screensaver_provider_on_a_host_without_screensavers_still_starts_its_device_provider()
+	{
+		var connectionState = new PluginConnectionState();
+		var stateCache = new HostStateCache(new PluginConnectionState());
+		var integration = new ScreenSaverAndDeviceProvidingIntegration();
+		var devices = new FakeDeviceProviderContext();
+		var screenSavers = new RemoteScreenSaverProviderContext(new UnsupportedApiHostInvoker(),
+			Serilog.Core.Logger.None);
+
+		var service = new IntegrationLifecycleHostedService([integration],
+			TestMetadata.Default,
+			new NoOpIntegrationContext(),
+			devices,
+			new NoOpHostInvoker(),
+			new ServiceCollection().BuildServiceProvider(),
+			new FakeLayoutProviderContext(),
+			new FakeFolderViewProviderContext(),
+			new FakeWidgetTypeProviderContext(),
+			screenSavers,
+			connectionState,
+			stateCache,
+			Serilog.Core.Logger.None);
+
+		await service.StartAsync(CancellationToken.None);
+		connectionState.RaiseConnected(false);
+		await WaitForAsync(() => integration.DeviceContext is not null);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(integration.Registration, Is.Not.Null);
+			Assert.That(integration.Registration!.ScreenSaverId, Is.Empty);
+			Assert.That(integration.DeviceContext, Is.SameAs(devices));
+		});
+	}
+
+	private sealed class ScreenSaverAndDeviceProvidingIntegration : TestIntegration, IScreenSaverProvider,
+		IDeviceProvider
+	{
+		public ScreenSaverRegistration? Registration { get; private set; }
+
+		public IDeviceProviderContext? DeviceContext { get; private set; }
+
+		async Task IScreenSaverProvider.InitializeAsync(
+			IScreenSaverProviderContext context,
+			CancellationToken cancellationToken)
+		{
+			Registration = await context.RegisterScreenSaverAsync(
+				new ScreenSaverDescriptor("clock", MacroDeck.Localization.LocalizedText.FromLiteral("Clock")),
+				cancellationToken);
+		}
+
+		public Task InitializeAsync(IDeviceProviderContext context, CancellationToken cancellationToken = default)
+		{
+			DeviceContext = context;
+			return Task.CompletedTask;
+		}
+
+		public Task ShutdownAsync(CancellationToken cancellationToken)
+		{
+			return Task.CompletedTask;
+		}
+	}
+
+	private sealed class UnsupportedApiHostInvoker : IHostInvoker
+	{
+		public Task<JsonElement?> InvokeAsync(
+			string api,
+			string operation,
+			object? arguments,
+			CancellationToken cancellationToken)
+		{
+			throw HostInvocationException.CreateNonRetryable(ProtocolErrorCodes.CapabilityUnsupported,
+				$"'{api}' is not a host api this host knows.");
+		}
+
+		public bool TryComplete(ProtocolEnvelope result)
+		{
+			return false;
+		}
+	}
+
+	private sealed class DeviceProvidingIntegration : TestIntegration, IDeviceProvider
+	{
+		public IDeviceProviderContext? DeviceContext { get; private set; }
+
+		public int ProviderShutdownCount { get; private set; }
+
+		public bool ProviderStoppedBeforeIntegration { get; private set; }
+
+		public Task InitializeAsync(IDeviceProviderContext context, CancellationToken cancellationToken = default)
+		{
+			DeviceContext = context;
+			return Task.CompletedTask;
+		}
+
+		public Task ShutdownAsync(CancellationToken cancellationToken)
+		{
+			ProviderShutdownCount++;
+			ProviderStoppedBeforeIntegration = ShutdownCount == 0;
+			return Task.CompletedTask;
+		}
+	}
+
+	private static IntegrationLifecycleHostedService VideoService(
+		TestVideoIntegration integration,
+		VideoStreamFixture video,
+		HostStateCache stateCache)
+	{
+		return new IntegrationLifecycleHostedService([integration],
+			TestMetadata.Default,
+			new NoOpIntegrationContext(),
+			new FakeDeviceProviderContext(),
+			new NoOpHostInvoker(),
+			new ServiceCollection().AddSingleton(video.Registry).BuildServiceProvider(),
+			new FakeLayoutProviderContext(),
+			new FakeFolderViewProviderContext(),
+			new FakeWidgetTypeProviderContext(),
+			new FakeScreenSaverProviderContext(),
+			video.State,
+			stateCache,
+			Serilog.Core.Logger.None);
+	}
+
+	private static async Task<IReadOnlyList<VideoStreamProviderDto>> DescribeVideoAsync(VideoStreamFixture video)
+	{
+		return (await video.InvokeAsync(CapabilityOperations.VideoStreamProvider.Describe)).Data!.Value
+			.Deserialize<VideoStreamProviderDescribePayload>(PluginProtocolJson.Options)!.Providers;
+	}
+
+	[Test]
+	public async Task A_video_stream_integration_starts_after_the_integration_itself()
+	{
+		using var video = new VideoStreamFixture();
+		var integration = new TestVideoIntegration();
+		var service = VideoService(integration, video, new HostStateCache(new PluginConnectionState()));
+		await service.StartAsync(CancellationToken.None);
+
+		video.State.RaiseConnected(false);
+		await WaitForAsync(() => integration.Context is not null);
+
+		Assert.That(integration.WasInitializedBeforeVideo, Is.True);
+		await service.StopAsync(CancellationToken.None);
+	}
+
+	[Test]
+	public async Task
+		Reinitializing_withdraws_the_providers_and_closes_their_sessions_before_the_integration_shuts_down()
+	{
+		using var video = new VideoStreamFixture();
+		var provider = new TestVideoProvider();
+		var shutdownsAtClose = new List<int>();
+		var integration = new TestVideoIntegration
+			{ OnVideoInitialize = context => context.RegisterProviderAsync(provider) };
+		provider.OnClose = (_, _) =>
+		{
+			shutdownsAtClose.Add(integration.ShutdownCount);
+			return Task.CompletedTask;
+		};
+		var stateCache = new HostStateCache(new PluginConnectionState());
+		var service = VideoService(integration, video, stateCache);
+		await service.StartAsync(CancellationToken.None);
+		video.State.RaiseConnected(false);
+		await WaitForAsync(() => integration.Context is not null);
+		var firstRegistration = (await DescribeVideoAsync(video)).Single().RegistrationId;
+		await video.OpenAsync("s1");
+
+		stateCache.Apply(ConfigPush());
+		await WaitForAsync(() => integration.ShutdownCount == 1 && integration.IsInitialized);
+		await WaitForAsync(() => video.Registry.Snapshot().Count == 1);
+		var providers = await DescribeVideoAsync(video);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(provider.Closes, Is.EqualTo(new[] { ("s1", VideoStreamSessionReason.ProviderRemoved) }));
+			Assert.That(shutdownsAtClose, Is.EqualTo(new[] { 0 }));
+			Assert.That(providers.Single().RegistrationId, Is.Not.EqualTo(firstRegistration));
+		});
+
+		await service.StopAsync(CancellationToken.None);
+	}
+
+	[Test]
+	public async Task Stopping_closes_the_sessions_and_withdraws_the_providers()
+	{
+		using var video = new VideoStreamFixture();
+		var provider = new TestVideoProvider();
+		var integration = new TestVideoIntegration
+			{ OnVideoInitialize = context => context.RegisterProviderAsync(provider) };
+		var service = VideoService(integration, video, new HostStateCache(new PluginConnectionState()));
+		await service.StartAsync(CancellationToken.None);
+		video.State.RaiseConnected(false);
+		await WaitForAsync(() => integration.Context is not null);
+		await video.OpenAsync("s1");
+
+		await service.StopAsync(CancellationToken.None);
+		var providers = await DescribeVideoAsync(video);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(provider.Closes, Is.EqualTo(new[] { ("s1", VideoStreamSessionReason.ProviderRemoved) }));
+			Assert.That(providers, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task A_failed_video_initialization_leaves_no_provider_registered()
+	{
+		using var video = new VideoStreamFixture();
+		var integration = new TestVideoIntegration
+		{
+			OnVideoInitialize = async context =>
+			{
+				await context.RegisterProviderAsync(new TestVideoProvider());
+				throw new InvalidOperationException("The camera is not configured.");
+			}
+		};
+		var service = VideoService(integration, video, new HostStateCache(new PluginConnectionState()));
+		await service.StartAsync(CancellationToken.None);
+
+		video.State.RaiseConnected(false);
+		await WaitForAsync(() => video.Invoker.Calls.Count == 2);
+		var providers = await DescribeVideoAsync(video);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(providers, Is.Empty);
+			Assert.That(video.Invoker.Calls.Select(call => call.Operation),
+				Is.All.EqualTo(HostOperations.VideoStreams.ProvidersChanged));
+		});
+
+		await service.StopAsync(CancellationToken.None);
+	}
+
+	private static async Task WaitForAsync(Func<bool> condition, TimeSpan? timeout = null)
+	{
+		var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(5));
+
+		while (DateTime.UtcNow < deadline)
+		{
+			if (condition())
+			{
+				return;
+			}
+
+			await Task.Delay(5);
+		}
+
+		Assert.Fail("The condition was never met.");
+	}
+
+	/// <summary>Every <see cref="IIntegrationContext" /> member throwing - never exercised, since
+	/// <see cref="TestIntegration.InitializeAsync" /> only records the context it was handed rather than
+	/// calling through it.</summary>
+	private sealed class NoOpIntegrationContext : IIntegrationContext
+	{
+		public IVariableApi Variables => throw new NotSupportedException();
+
+		public IUserVariableApi UserVariables => throw new NotSupportedException();
+
+		public IIntegrationConfig Config => throw new NotSupportedException();
+
+		public IDeckNavigator Deck => throw new NotSupportedException();
+
+		public IScriptApi Scripts => throw new NotSupportedException();
+
+		public IWidgetApi Widgets => throw new NotSupportedException();
+
+		public IEventPublisher Events => throw new NotSupportedException();
+
+		public IUserNotifier Notifications => throw new NotSupportedException();
+	}
+
+	/// <summary>Every <see cref="IHostInvoker" /> member throwing - never exercised by a test in this
+	/// file, none of which registers a variable-catalog integration.</summary>
+	private sealed class NoOpHostInvoker : IHostInvoker
+	{
+		public Task<JsonElement?> InvokeAsync(
+			string api,
+			string operation,
+			object? arguments,
+			CancellationToken cancellationToken)
+		{
+			throw new NotSupportedException();
+		}
+
+		public bool TryComplete(ProtocolEnvelope result)
+		{
+			throw new NotSupportedException();
+		}
+	}
+}

@@ -1,0 +1,165 @@
+name: NuGet publish
+
+# Pushes an already-packed package artifact to nuget.org. Reusable so the manual NuGet workflow and the
+# release build publish through exactly the same steps, and so this is the only job in the repository
+# that ever holds a publishing credential.
+#
+# This file must stay the ONLY place NuGet/login appears. Trusted publishing validates the workflow file
+# in which the login step actually runs, so a single nuget.org policy naming nuget-publish.yml covers
+# every caller; inlining a login step into a calling workflow would silently need a policy of its own.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version the artifact was packed at - verified before anything is pushed
+        type: string
+        required: true
+      artifact:
+        description: Name of the artifact holding the .nupkg/.snupkg files
+        type: string
+        default: nuget-packages
+      run_id:
+        description: Run the artifact was uploaded by. Empty means this run - the release publish passes the build run it is publishing, because that is a different run.
+        type: string
+        default: ''
+      require_credentials:
+        description: Fail instead of skipping when no nuget.org credential is configured. The manual workflow sets this - publishing is its whole purpose - while a release skips, so forks and pre-setup runs still produce a release.
+        type: boolean
+        default: false
+      allow_failure:
+        description: Report a failed push as a warning instead of failing the job. The release publish sets this - the GitHub release is already out by then, and nuget.yml can push the packages afterwards - while the manual workflow fails loudly.
+        type: boolean
+        default: false
+    secrets:
+      NUGET_USER:
+        description: nuget.org account (profile) name that owns the trusted publishing policy
+        required: false
+
+env:
+  NODE_VERSION: 22
+  # Exact, equal to global.json: a floating 10.0.x outruns the release metadata the bundled
+  # runtime is resolved from (ci/scripts/resolve-dotnet-runtime.mjs).
+  DOTNET_VERSION: 10.0.401
+
+jobs:
+  publish:
+    name: Publish to NuGet
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # A caller cannot set this - the environment has to be declared where the job is.
+    environment: production
+    permissions:
+      contents: read
+      # Reading an artifact from another run needs this; the same-run case does not.
+      actions: read
+      # Lets the job request the OIDC token nuget.org exchanges for a short-lived API key.
+      id-token: write
+    steps:
+      # secrets are not available to a job-level if, so the gate is a step that exports the decision.
+      - name: Check nuget.org credentials
+        id: credentials
+        env:
+          NUGET_USER: ${{ secrets.NUGET_USER }}
+          REQUIRE_CREDENTIALS: ${{ inputs.require_credentials }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NUGET_USER}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+          if [ "${REQUIRE_CREDENTIALS}" = "true" ]; then
+            echo "::error::NUGET_USER is not configured, so nothing can be published."
+            exit 1
+          fi
+          echo "::warning::NUGET_USER is not configured - skipping the NuGet push. The packages remain available as a workflow artifact."
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        if: ${{ steps.credentials.outputs.configured == 'true' }}
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: ${{ steps.credentials.outputs.configured == 'true' }}
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # For ci/scripts/verify-nuget-packages.mjs below.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: ${{ steps.credentials.outputs.configured == 'true' }}
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download packages
+        id: download
+        if: ${{ steps.credentials.outputs.configured == 'true' }}
+        continue-on-error: ${{ inputs.allow_failure }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}/packages
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id || github.run_id }}
+
+      # The artifact was verified when it was packed; re-checking here is what makes the version input
+      # meaningful - a caller wiring the wrong artifact or version fails before anything is pushed,
+      # because a push to nuget.org cannot be taken back.
+      - name: Verify packages
+        id: verify
+        if: ${{ steps.credentials.outputs.configured == 'true' && steps.download.outcome == 'success' }}
+        continue-on-error: ${{ inputs.allow_failure }}
+        run: node ci/scripts/verify-nuget-packages.mjs "${{ runner.temp }}/packages" "${{ inputs.version }}"
+
+      # As late as possible: the issued key is valid for one hour, and one token yields one key.
+      - name: NuGet login
+        id: login
+        if: ${{ steps.credentials.outputs.configured == 'true' && steps.verify.outcome == 'success' }}
+        continue-on-error: ${{ inputs.allow_failure }}
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      # Only *.nupkg is pushed: the client uploads the sibling .snupkg automatically, and pushing it a
+      # second time would come back as a 409. No --skip-duplicate - a version that is already published
+      # must fail the run rather than pass silently.
+      - name: Push packages
+        id: push
+        if: ${{ steps.credentials.outputs.configured == 'true' && steps.login.outcome == 'success' }}
+        continue-on-error: ${{ inputs.allow_failure }}
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+          PACKAGE_DIR: ${{ runner.temp }}/packages
+        run: |
+          set -euo pipefail
+          for package in "${PACKAGE_DIR}"/*.nupkg; do
+            echo "Pushing $(basename "${package}")"
+            dotnet nuget push "${package}" \
+              --api-key "${NUGET_API_KEY}" \
+              --source https://api.nuget.org/v3/index.json
+          done
+
+      # A tolerated failure still has to be visible: the job is green, so nothing else says the
+      # packages never made it out.
+      - name: Report a tolerated failure
+        if: ${{ steps.download.outcome == 'failure' || steps.verify.outcome == 'failure' || steps.login.outcome == 'failure' || steps.push.outcome == 'failure' }}
+        run: |
+          echo "::warning::Publishing ${{ inputs.version }} to nuget.org failed. Everything else in this release is published - rerun the NuGet workflow at this version once the cause is fixed."
+          {
+            echo "## NuGet publish failed"
+            echo
+            echo "Version \`${{ inputs.version }}\` was not pushed. The rest of the release is unaffected;"
+            echo "run the NuGet workflow at this version to publish the packages."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize
+        if: ${{ steps.credentials.outputs.configured == 'true' && steps.push.outcome == 'success' }}
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/packages
+        run: |
+          {
+            echo "## Published to NuGet"
+            echo
+            echo "Version \`${{ inputs.version }}\` from artifact \`${{ inputs.artifact }}\`."
+            echo
+            for package in "${PACKAGE_DIR}"/*.nupkg; do
+              echo "- \`$(basename "${package}")\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

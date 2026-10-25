@@ -1,0 +1,272 @@
+using MacroDeckHost.Integrations.Keyboard.Models;
+using MacroDeckHost.Integrations.Keyboard.Native;
+using Serilog;
+
+namespace MacroDeckHost.Tests.UnitTests.Keyboard;
+
+public class KeyboardSequenceExecutorTests
+{
+	private static readonly string[] _expectedComboAndTextCalls = ["combo:Control+Cx1", "text:Hello World"];
+	private static readonly string[] _expectedDownUpCalls = ["down:None+W", "up:None+W"];
+
+	private FakeKeyboardInputService _input = null!;
+	private KeyboardSequenceExecutor _executor = null!;
+
+	[SetUp]
+	public void SetUp()
+	{
+		_input = new FakeKeyboardInputService();
+		_executor = new KeyboardSequenceExecutor(_input, new KeyboardLayoutService(), Log.Logger);
+	}
+
+	[Test]
+	public async Task Executes_steps_in_order()
+	{
+		var sequence = new KeyboardSequence
+		{
+			Steps =
+			[
+				new KeyComboStep { Modifiers = ["Ctrl"], Key = "C" },
+				new DelayStep { Milliseconds = 0 },
+				new TextStep { Text = "Hello World" }
+			]
+		};
+
+		await _executor.ExecuteAsync(sequence);
+
+		Assert.That(_input.Calls, Is.EqualTo(_expectedComboAndTextCalls));
+	}
+
+	[Test]
+	public async Task Repeats_the_whole_sequence()
+	{
+		var sequence = new KeyboardSequence
+		{
+			Repeat = 3,
+			Steps = [new KeyComboStep { Key = "Enter" }]
+		};
+
+		await _executor.ExecuteAsync(sequence);
+
+		Assert.That(_input.Calls.Count(c => c == "combo:None+Enterx1"), Is.EqualTo(3));
+	}
+
+	[Test]
+	public async Task Dispatches_key_down_and_up_steps()
+	{
+		var sequence = new KeyboardSequence
+		{
+			Steps =
+			[
+				new KeyDownStep { Key = "W" },
+				new KeyUpStep { Key = "W" }
+			]
+		};
+
+		await _executor.ExecuteAsync(sequence);
+
+		Assert.That(_input.Calls, Is.EqualTo(_expectedDownUpCalls));
+	}
+
+	[Test]
+	public void Honours_cancellation()
+	{
+		using var cts = new CancellationTokenSource();
+		cts.Cancel();
+
+		var sequence = new KeyboardSequence { Steps = [new TextStep { Text = "x" }] };
+
+		Assert.ThrowsAsync<OperationCanceledException>(async () =>
+			await _executor.ExecuteAsync(sequence, cancellationToken: cts.Token));
+		Assert.That(_input.Calls, Is.Empty);
+	}
+
+	[Test]
+	public async Task Skips_unresolvable_keys()
+	{
+		var sequence = new KeyboardSequence { Steps = [new KeyComboStep { Key = "NotAKey" }] };
+		await _executor.ExecuteAsync(sequence);
+		Assert.That(_input.Calls, Is.Empty);
+	}
+
+	[Test]
+	public async Task Skips_the_whole_sequence_when_the_target_cannot_be_honoured()
+	{
+		_input.OpenSessionReturnsNull = true;
+		var sequence = new KeyboardSequence { Steps = [new KeyComboStep { Modifiers = ["Ctrl"], Key = "C" }] };
+
+		await _executor.ExecuteAsync(sequence, new KeyboardTarget("code", KeyboardTargetMode.Background));
+
+		Assert.That(_input.Calls, Is.Empty);
+	}
+
+	[Test]
+	public async Task A_background_sequence_needing_modifiers_the_platform_cannot_deliver_runs_no_step()
+	{
+		_input.BackgroundModifiers = KeyModifier.None;
+		var sequence = new KeyboardSequence
+		{
+			Steps =
+			[
+				new TextStep { Text = "Hello World" },
+				new KeyComboStep { Modifiers = ["Ctrl"], Key = "C" }
+			]
+		};
+
+		var unavailable = await _executor.ExecuteAsync(sequence,
+			new KeyboardTarget("code", KeyboardTargetMode.Background));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(unavailable,
+				Is.EqualTo(KeyboardSessionUnavailableReason.BackgroundModifiersUnsupported));
+			Assert.That(_input.Calls, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task A_background_sequence_without_modifier_combos_still_runs()
+	{
+		_input.BackgroundModifiers = KeyModifier.None;
+		var sequence = new KeyboardSequence
+		{
+			Steps =
+			[
+				new TextStep { Text = "Hello World" },
+				new KeyDownStep { Key = "W" },
+				new KeyUpStep { Key = "W" }
+			]
+		};
+
+		var unavailable = await _executor.ExecuteAsync(sequence,
+			new KeyboardTarget("code", KeyboardTargetMode.Background));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(unavailable, Is.Null);
+			Assert.That(_input.Calls, Is.EqualTo(new[] { "text:Hello World", "down:None+W", "up:None+W" }));
+		});
+	}
+
+	[Test]
+	public async Task A_background_sequence_holding_a_modifier_the_platform_cannot_deliver_runs_no_step()
+	{
+		_input.BackgroundModifiers = KeyModifier.None;
+		var sequence = new KeyboardSequence
+		{
+			Steps =
+			[
+				new TextStep { Text = "Hello World" },
+				new KeyDownStep { Key = "Ctrl" },
+				new KeyComboStep { Key = "C" },
+				new KeyUpStep { Key = "Ctrl" }
+			]
+		};
+
+		var unavailable = await _executor.ExecuteAsync(sequence,
+			new KeyboardTarget("code", KeyboardTargetMode.Background));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(unavailable,
+				Is.EqualTo(KeyboardSessionUnavailableReason.BackgroundModifiersUnsupported));
+			Assert.That(_input.Calls, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task A_background_sequence_holds_and_releases_keys_inside_the_target()
+	{
+		var (_, provider, target, executor) = BackgroundPlatform();
+		var sequence = new KeyboardSequence
+		{
+			Steps =
+			[
+				new KeyDownStep { Key = "Shift" },
+				new KeyComboStep { Key = "A" },
+				new KeyUpStep { Key = "Shift" }
+			]
+		};
+
+		var unavailable = await executor.ExecuteAsync(sequence,
+			new KeyboardTarget("code", KeyboardTargetMode.Background));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(unavailable, Is.Null);
+			Assert.That(target.Events,
+				Is.EqualTo(new[]
+				{
+					(KeyCode.LeftShift, true),
+					(KeyCode.A, true),
+					(KeyCode.A, false),
+					(KeyCode.LeftShift, false)
+				}));
+			Assert.That(provider.Events, Is.Empty);
+		});
+	}
+
+	[Test]
+	public void A_cancelled_background_sequence_still_releases_the_keys_it_held()
+	{
+		var (_, provider, target, executor) = BackgroundPlatform();
+		var sequence = new KeyboardSequence
+		{
+			Steps =
+			[
+				new KeyDownStep { Key = "W" },
+				new DelayStep { Milliseconds = 60_000 }
+			]
+		};
+		using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+		Assert.CatchAsync<OperationCanceledException>(() =>
+			executor.ExecuteAsync(sequence, new KeyboardTarget("code", KeyboardTargetMode.Background), cts.Token));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(target.Events, Is.EqualTo(new[] { (KeyCode.W, true), (KeyCode.W, false) }));
+			Assert.That(provider.Events, Is.Empty);
+		});
+	}
+
+	[Test]
+	public async Task An_untargeted_release_step_releases_a_key_held_in_a_background_app()
+	{
+		var (service, _, target, executor) = BackgroundPlatform();
+		await service.KeyDownAsync(KeyModifier.None,
+			KeyCode.W,
+			new KeyboardTarget("code", KeyboardTargetMode.Background));
+
+		await executor.ExecuteAsync(new KeyboardSequence { Steps = [new KeyUpStep { Key = "W" }] });
+
+		Assert.That(target.Events, Is.EqualTo(new[] { (KeyCode.W, true), (KeyCode.W, false) }));
+	}
+
+	private static (KeyboardInputService Service, FakeKeyboardInputProvider Provider, FakeTargetWindow Target,
+		KeyboardSequenceExecutor Executor) BackgroundPlatform()
+	{
+		var target = new FakeTargetWindow();
+		var provider = new FakeKeyboardInputProvider
+		{
+			SupportsWindowTargeting = true,
+			SupportsBackgroundSend = true,
+			BackgroundModifiers = KeyModifier.Control | KeyModifier.Shift | KeyModifier.Alt | KeyModifier.Meta,
+			Target = target
+		};
+		var layout = new KeyboardLayoutService();
+		var service = new KeyboardInputService(provider, layout);
+		return (service, provider, target, new KeyboardSequenceExecutor(service, layout, Log.Logger));
+	}
+
+	[Test]
+	public async Task Opens_the_session_once_with_the_requested_target()
+	{
+		var sequence = new KeyboardSequence { Steps = [new KeyComboStep { Key = "Enter" }] };
+		var target = new KeyboardTarget("code", KeyboardTargetMode.FocusThenSend);
+
+		await _executor.ExecuteAsync(sequence, target);
+
+		Assert.That(_input.LastSessionTarget, Is.EqualTo(target));
+	}
+}

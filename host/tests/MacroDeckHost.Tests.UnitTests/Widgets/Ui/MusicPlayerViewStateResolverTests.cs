@@ -1,0 +1,313 @@
+using MacroDeckHost.Application.Ui.Transport.Messages.MusicPlayer;
+using MacroDeckHost.Widgets.MusicPlayer;
+
+namespace MacroDeckHost.Tests.UnitTests.Widgets.Ui;
+
+/// <summary>
+/// The resolver is where the migration's efficiency requirement actually lands: a timeline the reader is
+/// already extrapolating correctly must not be re-anchored, because that is the difference between a
+/// playing track costing one small patch every two seconds and costing nothing at all.
+/// </summary>
+[TestFixture]
+public class MusicPlayerViewStateResolverTests
+{
+	[Test]
+	public async Task A_playing_track_anchors_its_position_and_leaves_the_rate_unstated()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(42_000));
+
+		var state = await harness.ResolveAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(state.Position!.PositionMs, Is.EqualTo(42_000));
+			Assert.That(state.Position.DurationMs, Is.EqualTo(215_000));
+			Assert.That(state.Position.Anchor, Is.EqualTo(harness.Now));
+			// Absent means normal speed, which is what keeps the common case key-free on the wire.
+			Assert.That(state.Position.Rate, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task A_position_the_reader_is_already_extrapolating_correctly_is_left_exactly_as_it_was()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(42_000));
+		var first = await harness.ResolveAsync();
+
+		// Two seconds later the provider reports two seconds further along - precisely what the reference
+		// already predicts, so re-anchoring would spend a patch to change nothing.
+		harness.Advance(TimeSpan.FromSeconds(2));
+		harness.Record(Playing(44_000));
+		var second = await harness.ResolveAsync(first);
+
+		Assert.That(second.Position, Is.SameAs(first.Position));
+	}
+
+	[Test]
+	public async Task A_position_that_has_drifted_past_the_tolerance_is_re_anchored()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(42_000));
+		var first = await harness.ResolveAsync();
+
+		// A seek: two seconds passed, but playback jumped a minute.
+		harness.Advance(TimeSpan.FromSeconds(2));
+		harness.Record(Playing(104_000));
+		var second = await harness.ResolveAsync(first);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(second.Position, Is.Not.SameAs(first.Position));
+			Assert.That(second.Position!.PositionMs, Is.EqualTo(104_000));
+			Assert.That(second.Position.Anchor, Is.EqualTo(harness.Now));
+		});
+	}
+
+	[Test]
+	public async Task Pausing_re_anchors_even_where_the_position_itself_did_not_move()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(42_000));
+		var first = await harness.ResolveAsync();
+
+		harness.Record(Playing(42_000, isPlaying: false));
+		var second = await harness.ResolveAsync(first);
+
+		Assert.Multiple(() =>
+		{
+			// Rate is the whole difference: an unchanged reference would keep counting up while paused.
+			Assert.That(second.Position!.Rate, Is.Zero);
+			Assert.That(second.IsPaused, Is.True);
+		});
+	}
+
+	[Test]
+	public async Task A_track_change_re_anchors_even_where_the_new_position_matches_the_prediction()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(42_000));
+		var first = await harness.ResolveAsync();
+
+		harness.Advance(TimeSpan.FromSeconds(2));
+		harness.Record(Playing(44_000, "Nannou"));
+		var second = await harness.ResolveAsync(first);
+
+		Assert.That(second.Position, Is.Not.SameAs(first.Position));
+	}
+
+	[Test]
+	public async Task A_player_with_no_length_still_carries_a_position_to_advance()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(3_600_000, durationMs: null));
+
+		var state = await harness.ResolveAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(state.Position, Is.Not.Null);
+			// Absent, never zero: a live stream has a position and no end, and a bar must not divide by it.
+			Assert.That(state.Position!.DurationMs, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task A_player_that_has_not_answered_yet_is_loading_rather_than_disconnected()
+	{
+		var harness = new MusicPlayerTestHarness();
+
+		var state = await harness.ResolveAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(state.IsLoading, Is.True);
+			Assert.That(state.IsConnected, Is.False);
+			Assert.That(state.Position, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task Cover_art_travels_as_a_resource_and_is_fetched_once_per_track()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(1_000));
+
+		var first = await harness.ResolveAsync();
+		harness.Advance(TimeSpan.FromSeconds(2));
+		harness.Record(Playing(3_000));
+		var second = await harness.ResolveAsync(first);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(first.Artwork, Is.Not.Null);
+			Assert.That(first.Accent, Is.EqualTo("#aabbcc"));
+			Assert.That(first.Background, Is.EqualTo("#112233"));
+			// The same cover must not be refetched and re-analysed on every poll.
+			Assert.That(harness.ArtworkFetches, Is.EqualTo(1));
+			Assert.That(second.Artwork, Is.EqualTo(first.Artwork));
+		});
+	}
+
+	[Test]
+	public async Task A_track_with_no_cover_drops_the_colours_with_it()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(1_000));
+		var first = await harness.ResolveAsync();
+
+		harness.Record(Playing(1_000, artworkId: null));
+		var second = await harness.ResolveAsync(first);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(second.Artwork, Is.Null);
+			Assert.That(second.Accent, Is.Null);
+			Assert.That(second.Background, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task A_selection_that_no_longer_exists_falls_back_and_says_so()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(1_000));
+
+		var state = await harness.ResolveAsync(config: new MusicPlayerWidgetData { InstanceId = "gone" });
+
+		Assert.Multiple(() =>
+		{
+			// Falling back silently would be indistinguishable from a broken connection.
+			Assert.That(state.InstanceMissing, Is.True);
+			Assert.That(state.TrackName, Is.EqualTo("Windowlicker"));
+		});
+	}
+
+	[Test]
+	public async Task An_unbound_widget_follows_the_player_the_host_marks_active()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(1_000));
+		harness.RecordSecond(Playing(5_000, "Flim"));
+		harness.Focus(StubRegistry.SecondInstanceId);
+
+		var state = await harness.ResolveAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(state.TrackName, Is.EqualTo("Flim"));
+			Assert.That(state.InstanceMissing, Is.False);
+		});
+	}
+
+	[Test]
+	public async Task An_unbound_widget_shows_the_first_player_while_none_is_active()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(1_000));
+		harness.RecordSecond(Playing(5_000, "Flim"));
+
+		var state = await harness.ResolveAsync();
+
+		Assert.That(state.TrackName, Is.EqualTo("Windowlicker"));
+	}
+
+	[Test]
+	public async Task A_bound_widget_ignores_the_active_player()
+	{
+		var harness = new MusicPlayerTestHarness();
+		harness.Record(Playing(1_000));
+		harness.RecordSecond(Playing(5_000, "Flim"));
+		harness.Focus(StubRegistry.SecondInstanceId);
+
+		var state = await harness.ResolveAsync(config: new MusicPlayerWidgetData
+			{ InstanceId = MusicPlayerTestHarness.InstanceId });
+
+		Assert.That(state.TrackName, Is.EqualTo("Windowlicker"));
+	}
+
+	[Test]
+	public async Task The_providers_source_and_badge_reach_the_view()
+	{
+		var harness = new MusicPlayerTestHarness();
+		var payload = Playing(1_000);
+		payload.DeviceName = "Firefox";
+		payload.Badge = "2/3";
+		harness.Record(payload);
+
+		var state = await harness.ResolveAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(state.SourceName, Is.EqualTo("Firefox"));
+			Assert.That(state.Badge, Is.EqualTo("2/3"));
+		});
+	}
+
+	[Test]
+	public async Task A_blank_source_or_badge_is_no_source_or_badge()
+	{
+		var harness = new MusicPlayerTestHarness();
+		var payload = Playing(1_000);
+		payload.DeviceName = "  ";
+		payload.Badge = "";
+		harness.Record(payload);
+
+		var state = await harness.ResolveAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(state.SourceName, Is.Null);
+			Assert.That(state.Badge, Is.Null);
+		});
+	}
+
+	[Test]
+	public async Task An_oversized_badge_is_bounded_without_splitting_a_character()
+	{
+		var harness = new MusicPlayerTestHarness();
+		var payload = Playing(1_000);
+		payload.Badge = string.Concat(Enumerable.Repeat("e\u0301", 40));
+		harness.Record(payload);
+
+		var state = await harness.ResolveAsync();
+
+		Assert.That(state.Badge, Is.EqualTo(string.Concat(Enumerable.Repeat("e\u0301", 32))));
+	}
+
+	[Test]
+	public async Task A_badge_longer_than_the_widget_shows_is_passed_on_unchanged()
+	{
+		var harness = new MusicPlayerTestHarness();
+		var payload = Playing(1_000);
+		payload.Badge = "Track 12 of 30";
+		harness.Record(payload);
+
+		var state = await harness.ResolveAsync();
+
+		Assert.That(state.Badge, Is.EqualTo("Track 12 of 30"));
+	}
+
+	private static MusicPlayerStatePayload Playing(
+		long positionMs,
+		string trackName = "Windowlicker",
+		string? artworkId = "cover-1",
+		long? durationMs = 215_000,
+		bool isPlaying = true)
+	{
+		return new MusicPlayerStatePayload
+		{
+			InstanceId = MusicPlayerTestHarness.InstanceId,
+			IsConnected = true,
+			IsPlaying = isPlaying,
+			PlaybackState = isPlaying ? "playing" : "paused",
+			TrackName = trackName,
+			ArtistName = "Aphex Twin",
+			AlbumName = "Windowlicker",
+			ArtworkId = artworkId,
+			PositionMs = positionMs,
+			DurationMs = durationMs
+		};
+	}
+}

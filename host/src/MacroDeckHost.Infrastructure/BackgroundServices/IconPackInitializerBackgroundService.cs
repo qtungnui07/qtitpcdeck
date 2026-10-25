@@ -1,0 +1,114 @@
+using MacroDeckHost.Application.Caching;
+using MacroDeckHost.Application.Icons.Included;
+using MacroDeckHost.Application.Paths;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Application.Store.Installation;
+using MacroDeckHost.Domain.Entities;
+using Microsoft.Extensions.Hosting;
+using ILogger = Serilog.ILogger;
+
+namespace MacroDeckHost.Infrastructure.BackgroundServices;
+
+public class IconPackInitializerBackgroundService : HostReadyBackgroundService
+{
+	private readonly IIconPackCache _iconPackCache;
+	private readonly IStoreInstallationReconciler _installationReconciler;
+	private readonly IIncludedIconPackSync _includedIconPackSync;
+	private readonly IMacroDeckPaths _paths;
+	private readonly StartupReadiness _readiness;
+	private readonly ILogger _logger;
+
+	public IconPackInitializerBackgroundService(
+		IHostApplicationLifetime lifetime,
+		IIconPackCache iconPackCache,
+		IStoreInstallationReconciler installationReconciler,
+		IIncludedIconPackSync includedIconPackSync,
+		IMacroDeckPaths paths,
+		StartupReadiness readiness,
+		ILogger logger)
+		: base(lifetime)
+	{
+		_iconPackCache = iconPackCache;
+		_installationReconciler = installationReconciler;
+		_includedIconPackSync = includedIconPackSync;
+		_paths = paths;
+		_readiness = readiness;
+		_logger = logger;
+	}
+
+	protected override async Task ExecuteWhenReady(CancellationToken stoppingToken)
+	{
+		try
+		{
+			SweepLegacyDirectories();
+
+			await _iconPackCache.InitializeCache();
+
+			// Must run after InitializeCache(): the reconciler resolves each record's TargetIds against the
+			// cache, and calling it any earlier would see every record as orphaned and prune installs that
+			// are actually present.
+			_installationReconciler.PruneOrphanedIconPackRecords();
+
+			if (_iconPackCache.GetDefaultPack() is null)
+			{
+				_logger.Information("Creating default 'Imported Icons' pack");
+				await _iconPackCache.AddOrUpdatePack(new IconPackEntity
+				{
+					Id = Guid.CreateVersion7(),
+					Name = "Imported Icons",
+					Description = "User imported icons",
+					IsDefault = true,
+					CreatedAt = DateTime.UtcNow
+				});
+			}
+
+			await SyncIncludedIconPack(stoppingToken);
+
+			_readiness.MarkIconPacksReady();
+		}
+		catch (Exception ex)
+		{
+			_readiness.MarkIconPacksFailed(ex);
+			throw;
+		}
+	}
+
+	// Never fails the initializer: plugin icon pack sync waits on icon pack readiness, so a broken included
+	// pack must not hold back every other pack.
+	private async Task SyncIncludedIconPack(CancellationToken cancellationToken)
+	{
+		try
+		{
+			await _includedIconPackSync.SyncAsync(cancellationToken);
+		}
+		catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+		{
+		}
+		catch (Exception ex)
+		{
+			_logger.Error(ex, "Failed to sync the included icon pack");
+		}
+	}
+
+	private void SweepLegacyDirectories()
+	{
+		try
+		{
+			foreach (var directory in Directory.EnumerateDirectories(_paths.IconsDirectory))
+			{
+				if (string.Equals(directory, _paths.IconPacksDirectory, StringComparison.Ordinal)
+					|| string.Equals(directory, _paths.IconStagingDirectory, StringComparison.Ordinal))
+				{
+					continue;
+				}
+
+				_logger.Information("Removing legacy icon directory {Directory}", directory);
+				Directory.Delete(directory, true);
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger.Warning(ex, "Failed to sweep legacy icon directories");
+		}
+	}
+}

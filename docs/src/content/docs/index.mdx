@@ -1,0 +1,128 @@
+---
+title: Macro Deck Docs
+description: Install and use Macro Deck 3, and build, test, package and publish plugins for it.
+template: splash
+head:
+  # Without this the tab repeats the site title twice.
+  - tag: title
+    content: Macro Deck Docs
+hero:
+  image:
+    file: ../../assets/macro-deck-logo.svg
+  tagline: Start building something great!
+  actions:
+    - text: Install Macro Deck
+      link: /guide/installation/
+      icon: right-arrow
+    - text: Build your first plugin
+      link: /introduction/quickstart/
+      icon: right-arrow
+      variant: minimal
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## Use Macro Deck
+
+<CardGrid>
+	<LinkCard
+		title="Installation"
+		href="/guide/installation/"
+		description="Install Macro Deck on Windows, macOS or Linux."
+	/>
+	<LinkCard
+		title="Getting started"
+		href="/guide/getting-started/"
+		description="Set up your account, connect a device and build your first button."
+	/>
+	<LinkCard
+		title="Concepts"
+		href="/guide/concepts/"
+		description="Profiles, folders, widgets, actions, variables and events."
+	/>
+	<LinkCard
+		title="Compatibility"
+		href="/guide/compatibility/"
+		description="Supported operating systems, devices and browsers."
+	/>
+</CardGrid>
+
+## Build plugins
+
+<CardGrid>
+	<LinkCard
+		title="Quickstart"
+		href="/introduction/quickstart/"
+		description="Create, run and package a working plugin in about five minutes."
+	/>
+	<LinkCard
+		title="Your first action"
+		href="/introduction/first-action/"
+		description="Add a button action with a parameter and trigger it."
+	/>
+	<LinkCard
+		title="Features"
+		href="/features/"
+		description="Actions, button states, variables, events, setup flows, devices and everything else a plugin can add."
+	/>
+	<LinkCard
+		title="Macro Deck UI"
+		href="/ui/"
+		description="Draw widgets, folder views and configuration screens with a declarative C# UI."
+	/>
+	<LinkCard
+		title="Plugin CLI"
+		href="/cli/"
+		description="macrodeck-plugin: scaffold, build, validate, pack, run and test without installing a host."
+	/>
+	<LinkCard
+		title="Debugging plugins"
+		href="/guides/debugging/"
+		description="Run against the desktop host, use launchSettings.json and stop on breakpoints in your IDE."
+	/>
+	<LinkCard
+		title="Publishing to the Store"
+		href="/guides/publishing/"
+		description="Check a plugin before it goes to the Store, and how signing and updates work."
+	/>
+	<LinkCard
+		title="Manifest reference"
+		href="/reference/manifest/"
+		description="Every field of manifest.json, its constraints and defaults, with a worked example."
+	/>
+	<LinkCard
+		title="Plugin protocol"
+		href="/reference/protocol/"
+		description="The wire contract: the envelope, negotiation, errors, limits, backpressure and reconnection."
+	/>
+	<LinkCard
+		title="Compatibility policy"
+		href="/policies/compatibility/"
+		description="Which surfaces are frozen, what counts as a break, and how contracts are evolved instead."
+	/>
+</CardGrid>
+
+## Publish to the Store
+
+<CardGrid>
+	<LinkCard
+		title="Creator Portal"
+		href="/creator-portal/"
+		description="Create Projects and follow each submission through review."
+	/>
+	<LinkCard
+		title="Publish a plugin"
+		href="/creator-portal/publish-plugin/"
+		description="Connect a repository, add the release workflow and submit a build."
+	/>
+	<LinkCard
+		title="Publish an icon pack"
+		href="/creator-portal/publish-icon-pack/"
+		description="Upload a .macroDeckIconPack and submit it for review."
+	/>
+	<LinkCard
+		title="Release workflow reference"
+		href="/creator-portal/release-workflow/"
+		description="Inputs, permissions and error responses of publish-plugin.yml."
+	/>
+</CardGrid>

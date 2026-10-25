@@ -1,0 +1,50 @@
+/*
+ * The app's global stylesheet.
+ *
+ * The runtime package owns the design tokens, the reset, the keyframes and the
+ * icon masks, and the Nord palette sits on top of the tokens - so the order here
+ * is load-bearing: tokens first, then the theme that overrides them, then
+ * everything that reads either.
+ *
+ * These are plain CSS imports rather than a Sass pipeline. The runtime sheets are
+ * already plain CSS (issue #824) and Svelte compiles the component styles itself,
+ * so nothing in this app needs a Sass toolchain.
+ */
+@import '@macro-deck/runtime/styles/tokens.css';
+@import '@macro-deck/runtime/styles/nord.css';
+@import '@macro-deck/runtime/styles/reset.css';
+@import '@macro-deck/runtime/styles/animations.css';
+@import '@macro-deck/runtime/styles/icons.css';
+@import '@macro-deck/runtime/styles/widget-metrics.css';
+@import '@macro-deck/runtime/styles/renderer.css';
+@import '@macro-deck/runtime/styles/widget-border.css';
+@import '@macro-deck/runtime/styles/grid.css';
+
+/*
+ * The shell is a fixed 100vh layout, so the document never scrolls - but WebKit
+ * still rubber-bands the viewport past it on macOS and flashes the black area
+ * behind the page (issue #583). Set on both html and body: the viewport takes its
+ * value from the root, and spelling out both leaves no room for a propagation
+ * difference between engines.
+ */
+html,
+body {
+  height: 100%;
+  overscroll-behavior: none;
+}
+
+#app {
+  height: 100%;
+}
+
+/*
+ * Placeholders were left to the engine default (#757575), which on the dark
+ * surfaces is about 2.8:1 - dimmer than the surrounding label it is meant to
+ * illustrate. They use the muted text token instead, so a theme (Nord dark,
+ * Nord light, a user accent) keeps them legible.
+ */
+input::placeholder,
+textarea::placeholder {
+  color: var(--color-text-muted);
+  opacity: 1;
+}

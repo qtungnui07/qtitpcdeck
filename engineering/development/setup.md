@@ -1,0 +1,108 @@
+# Development Setup
+
+Macro Deck 3 consists of a .NET host, the framework-free client packages under `ui/runtime/` and `ui/web-client/`, an Angular workspace, and a Tauri bootstrapper. For the component boundaries, see [architecture.md](../architecture.md).
+
+## Prerequisites
+
+- .NET SDK as pinned by [`global.json`](../../global.json).
+- Node.js and npm.
+- Stable Rust toolchain through rustup.
+- Git.
+- On Linux, the native packages required by Tauri/WebKitGTK.
+
+Use the workspace-local Angular and Tauri tooling. A global Angular CLI installation is not required.
+
+`ui/` is one npm workspace. Install its dependencies from there:
+
+```bash
+npm install
+```
+
+## One command
+
+The root [`Makefile`](../../Makefile) wraps the steps below. `make dev` starts the host, the desktop UI dev server and the built web client on the host's public port; `make dev-ui` leaves out the web client, and `make dev-app` opens the desktop UI in the bootstrapper window. Ctrl+C stops every process it started. `make help` lists all targets.
+
+## Run the host
+
+From the repository root:
+
+```bash
+dotnet build MacroDeck.slnx
+dotnet run --project host/src/MacroDeckHost
+```
+
+Development builds keep their data in the repository-local `.data` directory unless a data-directory override is configured. Development and installed builds use separate identities and defaults so they can run side by side.
+
+The development desktop UI reaches the trusted loopback listener. The web client reaches the public listener and therefore exercises the normal client authentication flow. See [architecture.md](../architecture.md) and the relevant ADRs for the trust model rather than duplicating the port and authentication implementation here.
+
+The loopback listener requires a secret ([ADR 0098](../decisions/0098-loopback-trust-requires-a-per-launch-secret.md)). A host started without one generates it on every start and writes it to `config/loopback-secret` in its data directory; the path is in the host log. The `ng serve` proxy and a debug build of the bootstrapper read `.data/config/loopback-secret` in the repository, which is where it lands when the host runs from the repository root as above. Otherwise point `MACRODECK_LOOPBACK_SECRET_FILE` at the file, or export the same `MACRODECK_LOOPBACK_SECRET` for the host and the tools. For `curl`, send it as a header:
+
+```bash
+curl -H "X-MacroDeck-Loopback-Secret: $(cat .data/config/loopback-secret)" http://127.0.0.1:5191/api/profiles
+```
+
+Anyone who can read that file is admin on your development host, and so is anyone who reaches the `ng serve` port, which is why it must stay bound to `localhost`.
+
+## Run the UI
+
+The desktop UI is the Angular application. It consumes the built `shared` package, and the npm scripts handle the required build order.
+
+From `ui/angular/`:
+
+```bash
+npm run start
+```
+
+This starts the desktop UI development server.
+
+The web client is framework-free and has no development server: it is built, and the host serves the result. From `ui/web-client/`:
+
+```bash
+npm run build
+```
+
+The output in `dist/` reaches a running host through [`ci/scripts/stage-host.sh`](../../ci/scripts/stage-host.sh), which stages a published host with the client in its `wwwroot`. A development host started with `dotnet run` serves only its API and answers every other address with a placeholder page, unless `ASPNETCORE_WEBROOT` points at `ui/web-client/dist`, which is what `make dev` and `make host-web-client` do. Rebuild with `make web-client` and reload the page. The scripts in [`ui/web-client/package.json`](../../ui/web-client/package.json) cover the device-target builds and the compatibility passes; see [adding a Web Client target](web-client-targets.md).
+
+### The Svelte desktop UI
+
+The Svelte rewrite under [`ui/svelte/`](../../ui/svelte/) is what the host stages at `/admin` in production. For a local run of it against a real host:
+
+```bash
+make host-svelte
+```
+
+This builds the Svelte app, assembles a dev `wwwroot` under `.data/` (web client at `/`, Svelte UI at `/admin`) and starts the host serving it on `:7193`. Open `http://localhost:7193/admin`.
+
+The first-run setup screen only accepts loopback-trusted requests, and a browser served from the public port carries no loopback secret, so in this host-only loop the account is created from the command line with the secret the host writes for local tools:
+
+```bash
+tools/dev/setup-account.sh <username> <password>
+```
+
+Then sign in at `http://localhost:7193/admin` with that account.
+
+`stage-host.sh` prefers the Svelte dist and falls back to the Angular build when the Svelte one has not been built, so the packaged pipeline keeps working while the Angular app is still around. For development without a host, the Svelte dev server runs on `:4300` (`npm run dev` in `ui/svelte/`) — the Angular dev server owns `:4200` and the two can run side by side.
+
+To launch the Tauri bootstrapper against the development UI, run from `ui/bootstrapper/`:
+
+```bash
+npm run dev
+```
+
+The host must be running separately.
+
+For the combined Angular/Tauri loop, run from `ui/`:
+
+```bash
+npm run dev
+```
+
+This does not start the .NET host.
+
+## Clean state
+
+Stop the development host and remove `.data/` when a clean local first run is required. Do not point development builds at production data unless the task specifically requires it.
+
+## Next steps
+
+Build and test commands are in [building-and-testing.md](building-and-testing.md). Repository conventions are in [coding-style.md](coding-style.md).

@@ -1,0 +1,86 @@
+:host {
+  display: block;
+  min-width: 0;
+}
+
+/*
+ * The Liquid trigger sits inside the field rather than beside it (issue #665), so the shell is
+ * just a positioning context around a single full-width control - the row that used to hold the
+ * field and its helper buttons is gone, and with it the horizontal space it reserved.
+ */
+.pi-shell {
+  position: relative;
+  min-width: 0;
+}
+
+/* The inner control host fills the shell; the control itself owns border,
+   padding and focus styling via the design-system mixins. */
+.pi-field {
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+// The shell owns the geometry of the overlaid action. It publishes the band and the gutter
+// together: a publisher that sets one without the other under-reserves the field that reads it.
+.pi-has-liquid {
+  // Wide enough for the five-character {{ }} glyph with room to spare for a fallback mono font -
+  // the trigger must never wrap, and the gutter below is derived from this width.
+  --tb-trigger-width: 2.5rem;
+  --tb-trigger-height: 1.5rem;
+  --pi-liquid-inset: var(--space-2);
+}
+
+.pi-has-liquid:not(.pi-multiline) {
+  --input-action-inline-gutter: calc(var(--tb-trigger-width) + var(--space-2));
+  --input-action-inline-band: calc(var(--input-action-inline-gutter) + var(--space-3));
+}
+
+// The field's scrollport is its padding box, so it paints content through the band it reserved.
+// Depends on the field staying at z-index auto: a z-index there lifts the text back over this.
+.pi-has-liquid:not(.pi-multiline) .pi-field::after {
+  content: '';
+  position: absolute;
+  inset-block: 1px;
+  inset-inline-end: 1px;
+  width: var(--input-action-inline-band);
+  border-start-end-radius: calc(var(--radius-md) - 1px);
+  border-end-end-radius: calc(var(--radius-md) - 1px);
+  background-color: var(--color-bg-primary);
+  pointer-events: none;
+}
+
+// The field dims itself from inside, so the band has to dim with it or it reads as a solid block.
+.pi-shell.pi-disabled .pi-field::after {
+  opacity: 0.55;
+}
+
+/*
+ * A multi-line field reserves block space instead: the action sits under the text rather than
+ * beside it, so every line keeps the full width of the box.
+ */
+.pi-has-liquid.pi-multiline {
+  --input-action-block-gutter: calc(var(--tb-trigger-height) + var(--space-2));
+}
+
+.pi-liquid {
+  position: absolute;
+  right: var(--pi-liquid-inset);
+}
+
+/*
+ * A single-line control is one line tall, so "bottom right" is the right edge - level with the
+ * caret of a neighbouring select or combobox rather than a pixel or two below it.
+ *
+ * Centred by arithmetic rather than translateY(-50%) on purpose: the trigger's host also contains
+ * the template-builder modal, and a transform on an ancestor becomes the containing block for its
+ * position: fixed overlay - which trapped the whole dialog inside this 40px box (see the ancestor
+ * warning in modal.component.scss).
+ */
+.pi-shell:not(.pi-multiline) .pi-liquid {
+  top: calc(50% - var(--tb-trigger-height) / 2);
+}
+
+.pi-shell.pi-multiline .pi-liquid {
+  bottom: var(--space-1);
+}

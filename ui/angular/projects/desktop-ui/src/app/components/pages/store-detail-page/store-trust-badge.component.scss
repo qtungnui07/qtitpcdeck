@@ -1,0 +1,31 @@
+@use '../../../../styles/index' as ds;
+
+.trust-badge {
+  @include ds.chip;
+  color: var(--color-success);
+  background-color: var(--color-success-muted);
+
+  .icon {
+    background-color: var(--color-success);
+  }
+}
+
+.takeover-badge {
+  @include ds.chip;
+  color: var(--color-warning);
+  background-color: var(--color-warning-muted);
+
+  .icon {
+    background-color: var(--color-warning);
+  }
+}
+
+.revoked-badge {
+  @include ds.chip;
+  color: var(--color-danger);
+  background-color: var(--color-danger-muted);
+
+  .icon {
+    background-color: var(--color-danger);
+  }
+}

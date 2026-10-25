@@ -1,0 +1,1453 @@
+import {
+  ClientAppStrings, DEFAULT_WEB_CLIENT_TARGET, VideoStreamClient, WidgetType, type GridWidget, type UiNode,
+  type UiRenderHost, type WebClientTarget,
+} from '@macro-deck/runtime';
+import { Appearance } from './appearance';
+import { Client } from './client';
+import { notification } from './notification-fixtures';
+import { RenderingModeStore } from './rendering-mode';
+import { ServerClock } from './server-clock';
+import { Shell, type ShellServices } from './shell';
+import { dismissAllToasts } from './ui';
+import { WakeLock } from './wake-lock';
+import { WidgetSessions } from './widget-sessions';
+
+const host: UiRenderHost = {
+  localization: { translate: (scope, key) => `${scope}:${key}` },
+  resourceUrl: () => null,
+  now: () => 0,
+  culture: () => 'en',
+  simpleRendering: () => false,
+  fontFamily: () => null,
+  fontReady: () => true,
+  emit: () => undefined,
+};
+
+const folder = (id: string) => ({
+  id, name: id, parentId: null, order: 0, isExpanded: false, isDefault: true,
+  cols: 3, rows: 2, background: '', spacing: null, borderRadius: null,
+  viewId: 'macrodeck.widget-grid', viewConfiguration: null, widgets: [],
+}) as never;
+
+const gridWidget = (id: string, x: number, y: number): GridWidget =>
+  ({ id, folderId: 'root', x, y, w: 1, h: 1, type: WidgetType.ActionButton, data: {} }) as GridWidget;
+
+const folderWithWidgets = (id: string, widgetIds: readonly string[]) => ({
+  ...(folder(id) as unknown as Record<string, unknown>),
+  widgets: widgetIds.map((widgetId, index) => gridWidget(widgetId, index, 0)),
+}) as never;
+
+const tree = (text: string): UiNode =>
+  ({ id: 'root', type: 'ui.text', properties: { text } }) as UiNode;
+
+const iconTree = (resourceId: string): UiNode =>
+  ({
+    id: 'root',
+    type: 'ui.image',
+    properties: { size: { basis: 0.5 }, source: { resourceId, contentHash: 'h1' } },
+  }) as UiNode;
+
+function pointerEvent(type: string): Event {
+  const event = new Event(type) as Event & { clientX: number; clientY: number; pointerId: number; button: number };
+  event.clientX = 0;
+  event.clientY = 0;
+  event.pointerId = 1;
+  event.button = 0;
+  return event;
+}
+
+class FakeConnection {
+  private next = 0;
+
+  request<T>(type: string): Promise<T> {
+    if (type === 'OpenWidgetUiSession') {
+      return Promise.resolve({ accepted: true, sessionId: `s${++this.next}` } as unknown as T);
+    }
+    if (type === 'AttachUiSession') return Promise.resolve({ accepted: true } as unknown as T);
+    return Promise.resolve(undefined as T);
+  }
+}
+
+const settle = async () => { for (let turn = 0; turn < 6; turn++) await Promise.resolve(); };
+
+class SyncScheduler {
+  private callback: (() => void) | null = null;
+
+  readonly schedule = (callback: () => void): void => {
+    this.callback = callback;
+  };
+
+  flush(): void {
+    const callback = this.callback;
+    this.callback = null;
+    if (callback) callback();
+  }
+}
+
+describe('Shell', () => {
+  let root: HTMLElement;
+  let client: Client;
+
+  beforeEach(() => {
+    root = document.createElement('div');
+    Object.defineProperty(root, 'clientWidth', { value: 600, configurable: true });
+    Object.defineProperty(root, 'clientHeight', { value: 400, configurable: true });
+    document.body.appendChild(root);
+    client = new Client(() => 'http://host', 'client-1');
+  });
+
+  afterEach(() => root.remove());
+
+  const services = (): ShellServices => ({
+    target: DEFAULT_WEB_CLIENT_TARGET,
+    appearance: new Appearance(),
+    rendering: new RenderingModeStore(),
+    wakeLock: new WakeLock('web-client', null),
+    pwa: {
+      update: {
+        phase: () => 'idle',
+        updatePending: () => false,
+        onPhaseChange: () => undefined,
+        check: () => Promise.resolve(),
+        backgroundCheck: () => Promise.resolve(),
+        activateNow: () => Promise.resolve(),
+        destroy: () => undefined,
+      },
+      install: {
+        displayMode: () => 'browser',
+        availability: () => 'unsupported',
+        onChange: () => undefined,
+        promptInstall: () => Promise.resolve('unavailable'),
+        destroy: () => undefined,
+      },
+      workerRegistered: false,
+      destroy: () => undefined,
+    } as unknown as ShellServices['pwa'],
+    clock: new ServerClock({ get: () => new Promise(() => undefined) } as never),
+  });
+
+  const mount = (schedule?: (callback: () => void) => void) =>
+    new Shell(root, client, host, { ...services(), schedule });
+
+  const text = (key: string) => client.translate(key);
+
+  it('says what it is doing before the host has answered', () => {
+    mount();
+
+    expect(root.textContent).toContain(text(ClientAppStrings.WebClient.Connecting));
+  });
+
+  it('tells the user where to unlock a locked key ring', () => {
+    mount();
+    client.app.set({ probed: true, keyRingLocked: true });
+
+    expect(root.textContent).toContain(text(ClientAppStrings.KeyRing.Unlock.WebClient));
+  });
+
+  it('points first-time setup at the desktop app', () => {
+    mount();
+    client.app.set({ probed: true, setupRequired: true });
+
+    expect(root.textContent).toContain(text(ClientAppStrings.WebClient.Setup.Body));
+  });
+
+  it('offers a pairing-code sign-in once setup is done, and says where to find the code', () => {
+    mount();
+    client.app.set({ probed: true });
+
+    expect(root.querySelector('.wc-login')).not.toBeNull();
+    expect(root.querySelectorAll('input[name="pairing-code"]').length).toBe(1);
+    expect(root.querySelectorAll('input[type="password"]').length).toBe(0);
+    expect(root.querySelector('.wc-login-hint')?.textContent).toBe(text(ClientAppStrings.Auth.PairingCodeHint));
+  });
+
+  it('switches to username and password, where it says how to reset a forgotten password', () => {
+    mount();
+    client.app.set({ probed: true });
+
+    const toggle = Array.prototype.slice.call(root.querySelectorAll('.wc-login .wc-seg-option'))
+      .filter((button: HTMLButtonElement) => button.textContent === text(ClientAppStrings.Auth.Password))[0] as HTMLButtonElement;
+    toggle.click();
+
+    expect(root.querySelectorAll('input[type="password"]').length).toBe(1);
+    expect(root.querySelectorAll('input[name="username"]').length).toBe(1);
+    expect(root.querySelectorAll('input[name="pairing-code"]').length).toBe(0);
+    expect(root.querySelector('.wc-login-hint')?.textContent).toBe(text(ClientAppStrings.Auth.ForgotPasswordHint));
+  });
+
+  it('does not leave a dialog standing over the screen that replaced it', () => {
+    mount();
+    client.app.set({ probed: true, authenticated: true, deckRendered: true });
+
+    const trigger = root.querySelector('.wc-client-settings-trigger') as HTMLElement;
+    expect(trigger).withContext('the settings gear').not.toBeNull();
+    trigger.click();
+    expect(document.querySelector('.wc-client-settings-backdrop')).not.toBeNull();
+
+    // Signing out from inside that panel is the way most people reach the sign-in card, and the
+    // panel's backdrop swallows every press: the form is on screen, looks ready, and cannot be
+    // signed in with.
+    client.app.set({ authenticated: false, deckRendered: false });
+
+    expect(root.querySelector('.wc-login')).withContext('the sign-in card').not.toBeNull();
+    expect(document.querySelector('.wc-client-settings-backdrop')).toBeNull();
+  });
+
+  it('shows one screen at a time', () => {
+    mount();
+    client.app.set({ probed: true });
+    client.app.set({ authenticated: true });
+
+    expect(root.querySelectorAll('.wc-panel').length).toBe(1);
+    expect(root.querySelector('.wc-login')).toBeNull();
+    expect(root.textContent).toContain(text(ClientAppStrings.WebClient.Connecting));
+  });
+
+  it('draws the deck once connected', () => {
+    mount();
+    client.deck.load([folder('root')]);
+    client.app.set({ probed: true, authenticated: true, connected: true });
+
+    expect(root.querySelector('.wc-deck')).not.toBeNull();
+    expect(root.querySelectorAll('.deck-grid-cell').length).toBe(6);
+  });
+
+  it('reserves no margin between the deck and the edge of the display', () => {
+    // The grid keeps 16px per side by default, which is right in the editor, where a deck sits
+    // inside a page. A client that owns the whole screen spends it on the bezel twice over, and on
+    // a 1024px display it is the difference between the deck reaching the edge and not.
+    // jsdom measures every box as zero, and a grid solved for a zero box reserves nothing whatever
+    // its margin - so the deck is given a real one to solve against before it is drawn.
+    const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+    const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
+    Object.defineProperty(HTMLElement.prototype, 'clientWidth', { value: 1024, configurable: true });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', { value: 600, configurable: true });
+    try {
+      mount();
+      client.deck.load([folder('root')]);
+      client.app.set({ probed: true, authenticated: true, connected: true });
+
+      // The grid keeps a border of its own, equal to the widget gap, so the cells do not start at
+      // zero. What "no outer margin" means is that the surface reaches the edge of the box it was
+      // given on whichever axis constrains it - the other one letterboxes, which is the grid's
+      // shape rather than a margin. With the 16px default it would reach neither.
+      const surface = root.querySelector('.deck-grid') as HTMLElement;
+      const width = Math.round(parseFloat(surface.style.width));
+      const height = Math.round(parseFloat(surface.style.height));
+
+      expect(width === 1024 || height === 600).toBeTrue();
+    } finally {
+      if (width) Object.defineProperty(HTMLElement.prototype, 'clientWidth', width);
+      if (height) Object.defineProperty(HTMLElement.prototype, 'clientHeight', height);
+    }
+  });
+
+  it('keeps the very same deck element across a reconnect', () => {
+    mount();
+    client.deck.load([folder('root')]);
+    client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+    const deck = root.querySelector('.wc-deck');
+
+    // A drop keeps the deck on screen, so nothing should be rebuilt.
+    client.app.set({ connected: false });
+
+    expect(root.querySelector('.wc-deck')).toBe(deck);
+  });
+
+  describe('the reconnecting notice', () => {
+    beforeEach(() => jasmine.clock().install());
+    afterEach(() => jasmine.clock().uninstall());
+
+    it('covers the deck with a reconnecting notice while the connection is down', () => {
+      mount();
+      client.deck.load([folder('root')]);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      const deck = root.querySelector('.wc-deck');
+
+      client.app.set({ connected: false });
+      // An ordinary retry reconnects well inside this delay, so nothing should show yet.
+      expect(root.querySelector('.wc-reconnecting')).toBeNull();
+
+      jasmine.clock().tick(4000);
+
+      const notice = root.querySelector('.wc-reconnecting');
+      expect(notice).withContext('the reconnecting panel').not.toBeNull();
+      // The deck is still there, and it is the very same node - not rebuilt under the notice.
+      expect(root.querySelector('.wc-deck')).toBe(deck);
+      expect((notice as HTMLElement).getAttribute('role')).toBe('status');
+      expect((notice as HTMLElement).getAttribute('aria-live')).toBe('polite');
+      expect((notice as HTMLElement).querySelector('.wc-panel-title')!.textContent)
+        .toBe(text(ClientAppStrings.WebClient.Reconnecting.Title));
+      expect((notice as HTMLElement).querySelector('.wc-panel-detail')!.textContent)
+        .toBe(text(ClientAppStrings.WebClient.Reconnecting.Body));
+
+      client.app.set({ connected: true });
+
+      expect(root.querySelector('.wc-reconnecting')).toBeNull();
+      expect(root.querySelector('.wc-deck')).toBe(deck);
+    });
+
+    it('never covers the sign-in form of a client that signed out', () => {
+      mount();
+      client.deck.load([folder('root')]);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      // A sign-out drops the socket too, so `connected` falls exactly as it does on a network loss.
+      client.app.set({ authenticated: false, deckRendered: false });
+      client.app.set({ connected: false });
+      jasmine.clock().tick(4000);
+
+      expect(client.app.screen.get()).toBe('signedOut');
+      expect(root.querySelector('.wc-reconnecting')).toBeNull();
+    });
+
+    it('never uncovers the deck of a locked host while reconnecting', () => {
+      mount();
+      client.deck.load([folder('root')]);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      client.hostLock.apply({ locked: true, lockScreenEnabled: true, supported: true });
+
+      client.app.set({ connected: false });
+      jasmine.clock().tick(4000);
+
+      const panels = root.querySelectorAll('.wc-lock-screen, .wc-reconnecting');
+      expect(panels.length).withContext('at least one explanatory panel').toBeGreaterThan(0);
+      // Exactly one: the lock outranks the reconnecting notice rather than stacking with it.
+      expect(root.querySelectorAll('.wc-panel').length).toBe(1);
+    });
+  });
+
+  it('keeps the grid surface when the deck contents change', () => {
+    mount();
+    client.deck.load([folder('root')]);
+    client.app.set({ probed: true, authenticated: true, connected: true });
+    const surface = root.querySelector('.deck-grid');
+
+    client.deck.widgetsUpserted('root', [
+      { id: 'w1', folderId: 'root', x: 0, y: 0, w: 1, h: 1, type: 'action-button', data: {} } as never,
+    ]);
+
+    // The tiles are redrawn; the surface they sit on is not, so the deck does not flicker.
+    expect(root.querySelector('.deck-grid')).toBe(surface);
+    expect(root.querySelectorAll('.deck-grid-tile').length).toBe(1);
+  });
+
+  describe('the folder background', () => {
+    const coloured = (id: string, background: string, viewId = 'macrodeck.widget-grid') =>
+      ({ ...(folder(id) as unknown as Record<string, unknown>), background, viewId }) as never;
+
+    const showDeck = () => client.app.set({ probed: true, authenticated: true, connected: true });
+
+    it('fills the whole screen, not only the letterboxed grid', () => {
+      mount();
+      client.deck.load([coloured('root', 'rgba(16, 24, 32, 0.5)')]);
+      showDeck();
+
+      expect(root.style.background).toBe('rgba(16, 24, 32, 0.5)');
+      expect((root.querySelector('.deck-grid') as HTMLElement).style.background).toBe('');
+    });
+
+    it('leaves the screen to the theme when the folder has none', () => {
+      mount();
+      client.deck.load([folder('root')]);
+      showDeck();
+
+      expect(root.style.background).toBe('');
+    });
+
+    it('follows the folder the deck walks into', () => {
+      mount();
+      client.deck.load([coloured('root', '#101820'), coloured('other', '#203040')]);
+      showDeck();
+
+      client.deck.openFolder('other');
+
+      expect(root.style.background).toBe('rgb(32, 48, 64)');
+    });
+
+    it('is not left behind when the deck leaves the screen', () => {
+      mount();
+      client.deck.load([coloured('root', '#101820')]);
+      showDeck();
+
+      client.app.set({ authenticated: false, deckRendered: false });
+
+      expect(root.style.background).toBe('');
+    });
+
+    it('is not carried into a folder a provider draws', () => {
+      mount();
+      client.deck.load([coloured('root', '#101820'), coloured('other', '', 'acme.now-playing')]);
+      showDeck();
+
+      client.deck.openFolder('other');
+
+      expect(root.style.background).toBe('');
+    });
+  });
+
+  describe('empty cells', () => {
+    const styled = (id: string, emptyCellStyle: string | null) =>
+      ({ ...(folder(id) as unknown as Record<string, unknown>), emptyCellStyle }) as never;
+
+    const showDeck = () => client.app.set({ probed: true, authenticated: true, connected: true });
+    const hidden = () =>
+      (root.querySelector('.deck-grid') as HTMLElement).classList.contains('deck-grid-empty-transparent');
+
+    it('follows the style of each folder the deck walks into', () => {
+      mount();
+      client.deck.load([styled('root', 'transparent'), styled('other', 'visible')]);
+      showDeck();
+      const onRoot = hidden();
+
+      client.deck.openFolder('other');
+      const onOther = hidden();
+      client.deck.openFolder('root');
+
+      expect(onRoot).toBeTrue();
+      expect(onOther).toBeFalse();
+      expect(hidden()).toBeTrue();
+    });
+
+    it('does not carry a transparent style into a folder that states none', () => {
+      mount();
+      client.deck.load([styled('root', 'transparent'), styled('other', null)]);
+      showDeck();
+
+      client.deck.openFolder('other');
+
+      expect(hidden()).toBeFalse();
+    });
+  });
+
+  it('puts the settings entry on screen, which is the only way to sign out', () => {
+    mount();
+
+    // Without this the client is a dead end: there is no other route to sign-out, the theme, the
+    // rendering mode or the update control.
+    expect(root.querySelector('.wc-client-settings-trigger')).not.toBeNull();
+  });
+
+  describe('a refused press', () => {
+    const refuse = (message: string) =>
+      (client as unknown as { onNotification(type: string, payload: unknown): void })
+        .onNotification('ActionExecutionStatusEvent', {
+          executionId: 'e1', status: 'Failed', durationMs: 0, widgetId: 'w1',
+          triggerType: 'onShortPress', error: { code: 'HOST_LOCKED', message }, actions: [],
+        });
+
+    // After, not before: the toast host is one module-level stack shared with every other suite, and
+    // a toast left standing here turns up in theirs.
+    afterEach(() => dismissAllToasts());
+
+    it('is put in front of the person who pressed', () => {
+      mount();
+      client.deck.load([folder('root')]);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      refuse('The host is locked');
+
+      const toast = root.querySelector('.wc-toast');
+      expect(toast).withContext('a toast for the refusal').not.toBeNull();
+      expect((toast as HTMLElement).classList).toContain('wc-toast-error');
+      expect((root.querySelector('.wc-toast-message') as HTMLElement).textContent)
+        .toBe('The host is locked');
+    });
+
+    it('does not outlive the session it happened in', () => {
+      mount();
+      client.deck.load([folder('root')]);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      refuse('The host is locked');
+      expect(root.querySelectorAll('.wc-toast').length).toBe(1);
+
+      client.app.set({ authenticated: false, deckRendered: false });
+
+      // Otherwise the last session's failure hangs over the next person's sign-in card.
+      expect(root.querySelectorAll('.wc-toast').length).toBe(0);
+      expect(root.querySelector('.wc-login')).not.toBeNull();
+    });
+  });
+
+  describe('screensaver', () => {
+    let pending: Array<{ callback: () => void; delayMs: number }>;
+    let opens: number;
+    let lock: WakeLock;
+    let idleClock: { set(callback: () => void, delayMs: number): unknown; clear(handle: unknown): void };
+
+    const fire = () => { const entry = pending.shift(); if (entry) entry.callback(); };
+
+    const settings = (enabled: boolean, idleSeconds = 60) =>
+      (client as unknown as { onNotification(type: string, payload: unknown): void })
+        .onNotification('DeviceScreenSaverChangedEvent', { enabled, idleSeconds });
+
+    const showDeck = () => {
+      client.deck.load([folderWithWidgets('root', ['w1'])]);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+    };
+
+    // One clock per spec: a shell from an earlier spec keeps its timer on the document, and a shared
+    // clock would let it push into this spec's queue.
+    beforeEach(() => {
+      const queue: Array<{ callback: () => void; delayMs: number }> = [];
+      pending = queue;
+      idleClock = {
+        set: (callback, delayMs) => { const entry = { callback, delayMs }; queue.push(entry); return entry; },
+        clear: handle => { const at = queue.indexOf(handle as never); if (at >= 0) queue.splice(at, 1); },
+      };
+      opens = 0;
+      lock = new WakeLock('web-client', null);
+      (client as unknown as { connection: unknown }).connection = {
+        request: (type: string) => {
+          if (type === 'OpenScreenSaverUiSession') {
+            opens++;
+            return Promise.resolve({ accepted: true, sessionId: `ss${opens}`, screenSaverId: 'x::clock', interactive: false });
+          }
+          return Promise.resolve(undefined);
+        },
+        state: { subscribe: () => () => undefined, get: () => 'connected' },
+      };
+    });
+
+    const mountWithIdle = () => new Shell(root, client, host, { ...services(), wakeLock: lock, idleClock });
+
+    // A showing screensaver holds a capture-phase key listener on the document, and only a real settings
+    // change hides it: toggled so a spec that never turned it on still tears its screensaver down.
+    afterEach(() => { settings(true); settings(false); });
+
+    it('shows nothing for a device that never turned it on', () => {
+      mountWithIdle();
+      showDeck();
+
+      expect(pending.length).toBe(0);
+      expect(root.querySelector('.wc-screensaver')).toBeNull();
+    });
+
+    it('covers the deck after the idle time and holds the screen awake', async () => {
+      mountWithIdle();
+      showDeck();
+      settings(true, 60);
+
+      expect(pending[0].delayMs).toBe(60000);
+      fire();
+      await settle();
+
+      const overlay = root.querySelector('.wc-screensaver') as HTMLElement;
+      expect(overlay).not.toBeNull();
+      expect(overlay.hidden).toBeFalse();
+      expect(opens).toBe(1);
+    });
+
+    it('gives the deck back on the first touch without pressing the tile underneath', async () => {
+      const executed: string[] = [];
+      spyOn(client, 'executeTrigger').and.callFake((widgetId: string) => {
+        executed.push(widgetId);
+        return Promise.resolve() as never;
+      });
+      mountWithIdle();
+      showDeck();
+      settings(true, 60);
+      fire();
+      await settle();
+      const overlay = root.querySelector('.wc-screensaver') as HTMLElement;
+
+      overlay.dispatchEvent(pointerEvent('pointerdown'));
+      overlay.dispatchEvent(pointerEvent('pointerup'));
+
+      expect(overlay.classList).toContain('wc-screensaver-deaf');
+      expect(executed).toEqual([]);
+      expect(pending.length).withContext('the timer is armed again').toBe(1);
+    });
+
+    it('lets a mouse release land on the deck after the dismiss without pressing the tile', async () => {
+      const executed: string[] = [];
+      spyOn(client, 'executeTrigger').and.callFake((widgetId: string) => {
+        executed.push(widgetId);
+        return Promise.resolve() as never;
+      });
+      mountWithIdle();
+      showDeck();
+      settings(true, 60);
+      fire();
+      await settle();
+      const overlay = root.querySelector('.wc-screensaver') as HTMLElement;
+      const tile = root.querySelector('.wc-deck [class*=tile]') as HTMLElement;
+
+      overlay.dispatchEvent(pointerEvent('pointerdown'));
+      tile.dispatchEvent(pointerEvent('pointerup'));
+      tile.dispatchEvent(new Event('click', { bubbles: true }));
+
+      expect(overlay.classList).toContain('wc-screensaver-deaf');
+      expect(executed).toEqual([]);
+    });
+
+    it('is dismissed by a key that then activates no tile', async () => {
+      const executed: string[] = [];
+      spyOn(client, 'executeTrigger').and.callFake((widgetId: string) => {
+        executed.push(widgetId);
+        return Promise.resolve() as never;
+      });
+      const target = { ...DEFAULT_WEB_CLIENT_TARGET, hardwareInput: { keys: [{ key: 'Enter', event: { kind: 'activate' as const } }] } };
+      new Shell(root, client, host, { ...services(), wakeLock: lock, idleClock, target });
+      showDeck();
+      settings(true, 60);
+      fire();
+      await settle();
+
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement).classList).toContain('wc-screensaver-deaf');
+      expect(executed).toEqual([]);
+    });
+
+    it('goes away when the setting is turned off while it shows', async () => {
+      mountWithIdle();
+      showDeck();
+      settings(true, 60);
+      fire();
+      await settle();
+
+      settings(false);
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement).hidden).toBeTrue();
+      expect(pending.length).toBe(0);
+    });
+
+    it('starts over on a settings change, so the next showing uses the new selection', async () => {
+      mountWithIdle();
+      showDeck();
+      settings(true, 60);
+      fire();
+      await settle();
+      expect(opens).toBe(1);
+
+      settings(true, 30);
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement).hidden).toBeTrue();
+      expect(pending[0].delayMs).toBe(30000);
+    });
+
+    it('shows the screensaver at once when the host asks for it, schedule or not', async () => {
+      mountWithIdle();
+      showDeck();
+
+      (client as unknown as { onNotification(type: string, payload: unknown): void })
+        .onNotification('ShowDeviceScreenSaverEvent', {});
+      await settle();
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement).hidden).toBeFalse();
+      expect(opens).toBe(1);
+    });
+
+    it('starts a showing screensaver over when the host asks for it again', async () => {
+      mountWithIdle();
+      showDeck();
+      const show = () => (client as unknown as { onNotification(type: string, payload: unknown): void })
+        .onNotification('ShowDeviceScreenSaverEvent', {});
+
+      show();
+      await settle();
+      show();
+      await settle();
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement).hidden).toBeFalse();
+      expect(opens).toBe(2);
+    });
+
+    it('keeps a screensaver the host started on a device with the setting off through a reconnect', async () => {
+      mountWithIdle();
+      showDeck();
+
+      (client as unknown as { onNotification(type: string, payload: unknown): void })
+        .onNotification('ShowDeviceScreenSaverEvent', {});
+      await settle();
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      await settle();
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement).hidden).toBeFalse();
+      expect(pending.length).toBe(0);
+    });
+
+    it('ignores a request to show it while the host lock screen is up', async () => {
+      mountWithIdle();
+      showDeck();
+      client.hostLock.apply({ locked: true, lockScreenEnabled: true, supported: true });
+
+      (client as unknown as { onNotification(type: string, payload: unknown): void })
+        .onNotification('ShowDeviceScreenSaverEvent', {});
+      await settle();
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement | null)?.hidden ?? true).toBeTrue();
+      expect(opens).toBe(0);
+    });
+
+    it('yields to the host lock screen', async () => {
+      mountWithIdle();
+      showDeck();
+      settings(true, 60);
+      fire();
+      await settle();
+
+      client.hostLock.apply({ locked: true, lockScreenEnabled: true, supported: true });
+
+      expect((root.querySelector('.wc-screensaver') as HTMLElement).hidden).toBeTrue();
+      expect(root.querySelector('.wc-lock-screen')).not.toBeNull();
+    });
+
+    describe('with video streams', () => {
+      let videoStreams: VideoStreamClient;
+
+      const mountWithVideo = () => {
+        videoStreams = new VideoStreamClient({
+          request: () => new Promise(() => undefined),
+          onNotification: () => () => undefined,
+          onConnectionChanged: () => () => undefined,
+          connected: () => true,
+        });
+        const videoHost: UiRenderHost = { ...host, videoStreams: () => videoStreams.surface('deck') };
+        return new Shell(root, client, videoHost, { ...services(), wakeLock: lock, idleClock });
+      };
+
+      it('covers the deck and any dialog while it shows, but not its own streams', async () => {
+        mountWithVideo();
+        showDeck();
+        settings(true, 60);
+        fire();
+        await settle();
+
+        expect(videoStreams.surface('deck').hidden()).toBeTrue();
+        expect(videoStreams.surface('modal').hidden()).toBeTrue();
+        expect(videoStreams.surface('screensaver').hidden()).toBeFalse();
+
+        settings(false);
+
+        expect(videoStreams.surface('deck').hidden()).toBeFalse();
+        expect(videoStreams.surface('modal').hidden()).toBeFalse();
+      });
+
+      it('covers the deck and any dialog behind the host lock screen', () => {
+        mountWithVideo();
+        showDeck();
+
+        client.hostLock.apply({ locked: true, lockScreenEnabled: true, supported: true });
+        expect(videoStreams.surface('deck').hidden()).toBeTrue();
+        expect(videoStreams.surface('modal').hidden()).toBeTrue();
+
+        client.hostLock.apply({ locked: false, lockScreenEnabled: true, supported: true });
+        expect(videoStreams.surface('deck').hidden()).toBeFalse();
+      });
+    });
+  });
+
+  it('shows the Macro Deck mark above every waiting screen', () => {
+    mount();
+    client.app.set({ probed: true, setupRequired: true });
+
+    const logo = root.querySelector('.wc-panel-logo') as HTMLImageElement;
+    expect(logo).not.toBeNull();
+    expect(logo.getAttribute('alt')).toBe('');
+  });
+
+  it('leaves the mark out of the deck, which has its own content', () => {
+    mount();
+    client.deck.load([folder('root')]);
+    client.app.set({ probed: true, authenticated: true, connected: true });
+
+    expect(root.querySelector('.wc-panel-logo')).toBeNull();
+  });
+
+  describe('keyboard activation', () => {
+    const disabledOnly: UiNode = {
+      id: 'root', type: 'ui.stack', properties: {},
+      children: [{ id: 'region', type: 'ui.stack', properties: { modifiers: { disabled: true } }, children: [
+        { id: 'button', type: 'ui.button', properties: { events: ['press'] } },
+      ] }],
+    } as UiNode;
+
+    it('runs no tile flow for a tile whose only claimant sits in a disabled region', async () => {
+      const widgetSessions = new WidgetSessions(new FakeConnection(), client.sessions);
+      (client as unknown as { widgetSessions: WidgetSessions }).widgetSessions = widgetSessions;
+      const executed: string[] = [];
+      spyOn(client, 'executeTrigger').and.callFake((widgetId: string) => {
+        executed.push(widgetId);
+        return Promise.resolve() as never;
+      });
+      const target = { ...DEFAULT_WEB_CLIENT_TARGET, hardwareInput: { keys: [{ key: 'Enter', event: { kind: 'activate' as const } }] } };
+      client.deck.load([folderWithWidgets('root', ['w1'])]);
+      new Shell(root, client, host, { ...services(), target });
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      widgetSessions.sync([gridWidget('w1', 0, 0)]);
+      await settle();
+
+      client.sessions.treeUpdated('s1', 1, disabledOnly);
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+      expect(executed).toEqual([]);
+
+      client.sessions.treeUpdated('s1', 2, tree('clock'));
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+      expect(executed).toEqual(['w1']);
+    });
+  });
+
+  describe('keyboard activation of a responsive tile', () => {
+    const wideOnlyDisabled: UiNode = {
+      id: 'root', type: 'ui.responsive', properties: { variants: [{ minWidth: 1.5 }] },
+      children: [
+        { id: 'root.compact', type: 'ui.text', properties: { text: '21' } },
+        { id: 'root.wide', type: 'ui.stack', properties: { modifiers: { disabled: true } }, children: [] },
+      ],
+    } as UiNode;
+
+    async function activateOn(width: number): Promise<string[]> {
+      const widgetSessions = new WidgetSessions(new FakeConnection(), client.sessions);
+      (client as unknown as { widgetSessions: WidgetSessions }).widgetSessions = widgetSessions;
+      const executed: string[] = [];
+      spyOn(client, 'executeTrigger').and.callFake((widgetId: string) => {
+        executed.push(widgetId);
+        return Promise.resolve() as never;
+      });
+      const target = { ...DEFAULT_WEB_CLIENT_TARGET, hardwareInput: { keys: [{ key: 'Enter', event: { kind: 'activate' as const } }] } };
+      const widget = { ...gridWidget('w1', 0, 0), w: width } as GridWidget;
+      client.deck.load([{ ...(folder('root') as unknown as Record<string, unknown>), widgets: [widget] } as never]);
+      new Shell(root, client, host, { ...services(), target });
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      widgetSessions.sync([widget]);
+      await settle();
+
+      client.sessions.treeUpdated('s1', 1, wideOnlyDisabled);
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+      return executed;
+    }
+
+    let width: PropertyDescriptor | undefined;
+    let height: PropertyDescriptor | undefined;
+
+    beforeEach(() => {
+      width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+      height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
+      Object.defineProperty(HTMLElement.prototype, 'clientWidth', { value: 1024, configurable: true });
+      Object.defineProperty(HTMLElement.prototype, 'clientHeight', { value: 600, configurable: true });
+    });
+
+    afterEach(() => {
+      if (width) Object.defineProperty(HTMLElement.prototype, 'clientWidth', width);
+      if (height) Object.defineProperty(HTMLElement.prototype, 'clientHeight', height);
+    });
+
+    it('runs the tile flow on one cell, where the drawn layout holds nothing', async () => {
+      expect(await activateOn(1)).toEqual(['w1']);
+    });
+
+    it('is absorbed on two cells, where the drawn layout is a disabled region', async () => {
+      expect(await activateOn(2)).toEqual([]);
+    });
+  });
+
+  describe('per-widget session repaints', () => {
+    let scheduler: SyncScheduler;
+    let widgetSessions: WidgetSessions;
+
+    beforeEach(() => {
+      scheduler = new SyncScheduler();
+      widgetSessions = new WidgetSessions(new FakeConnection(), client.sessions);
+      (client as unknown as { widgetSessions: WidgetSessions }).widgetSessions = widgetSessions;
+    });
+
+    const tileText = (widgetId: string): string | null => {
+      const tile = root.querySelector(`[data-widget-id="${widgetId}"]`);
+      return tile ? tile.querySelector('.widget-text')!.textContent : null;
+    };
+
+    it('repaints only the widget whose session changed', async () => {
+      client.deck.load([folderWithWidgets('root', ['w1', 'w2'])]);
+      mount(scheduler.schedule);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      widgetSessions.sync([gridWidget('w1', 0, 0), gridWidget('w2', 1, 0)]);
+      await settle();
+      client.sessions.treeUpdated('s1', 1, tree('A1'));
+      client.sessions.treeUpdated('s2', 1, tree('B1'));
+      scheduler.flush();
+
+      const w2Tile = root.querySelector('[data-widget-id="w2"]');
+
+      // s2's tree changes in the store without ever being announced, so the only thing that can
+      // make w2 show it is a full deck repaint - which announcing s1 alone must not trigger.
+      (client.sessions as unknown as { entries: { [id: string]: { tree: UiNode; revision: number } } })
+        .entries['s2'] = { tree: tree('B2'), revision: 2 };
+      client.sessions.treeUpdated('s1', 2, tree('A2'));
+      scheduler.flush();
+
+      expect(tileText('w1')).toBe('A2');
+      expect(tileText('w2')).toBe('B1');
+      expect(root.querySelector('[data-widget-id="w2"]')).toBe(w2Tile);
+    });
+
+    it('clears a tile that shows what its widget drew once the host says that is outdated', async () => {
+      client.deck.load([folderWithWidgets('root', ['w1'])]);
+      mount(scheduler.schedule);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      widgetSessions.sync([gridWidget('w1', 0, 0)]);
+      await settle();
+      client.sessions.treeUpdated('s1', 1, tree('Old'));
+      scheduler.flush();
+      client.sessions.invalidated('s1');
+      widgetSessions.sessionClosed('s1');
+      scheduler.flush();
+      expect(tileText('w1')).toBe('Old');
+
+      widgetSessions.invalidate('w1');
+      scheduler.flush();
+
+      expect(root.querySelector('[data-widget-id="w1"] .widget-text')).toBeNull();
+    });
+
+    it('repaints the deck when a session change cannot be mapped to any widget', async () => {
+      client.deck.load([folderWithWidgets('root', ['w1', 'w2'])]);
+      mount(scheduler.schedule);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      widgetSessions.sync([gridWidget('w1', 0, 0), gridWidget('w2', 1, 0)]);
+      await settle();
+      client.sessions.treeUpdated('s1', 1, tree('A1'));
+      client.sessions.treeUpdated('s2', 1, tree('B1'));
+      scheduler.flush();
+      expect(tileText('w1')).toBe('A1');
+
+      // w1's tree changes in the store without being announced, so only a full deck repaint - the
+      // fallback for a session id no widget owns, a modal's or a provider folder view's - picks it up.
+      (client.sessions as unknown as { entries: { [id: string]: { tree: UiNode; revision: number } } })
+        .entries['s1'] = { tree: tree('A2'), revision: 2 };
+      client.sessions.treeUpdated('modal-session', 1, tree('X'));
+      scheduler.flush();
+
+      expect(tileText('w1')).toBe('A2');
+    });
+
+    it('never drops a tree that arrived for a widget with no tile yet', async () => {
+      client.deck.load([folderWithWidgets('root', ['w1'])]);
+      mount(scheduler.schedule);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      // A session is open for w2 before it is on this deck at all - the client only needs the
+      // mapping to exist for the race this covers, not the exact sequence that produces it.
+      widgetSessions.sync([gridWidget('w1', 0, 0), gridWidget('w2', 1, 0)]);
+      await settle();
+
+      client.sessions.treeUpdated('s2', 1, tree('B1'));
+      scheduler.flush();
+      expect(root.querySelector('[data-widget-id="w2"]')).toBeNull();
+
+      client.deck.widgetsUpserted('root', [gridWidget('w2', 1, 0)]);
+      scheduler.flush();
+
+      expect(tileText('w2')).toBe('B1');
+    });
+
+    it('does not blank the deck when the socket drops', async () => {
+      client.deck.load([folderWithWidgets('root', ['w1', 'w2'])]);
+      mount(scheduler.schedule);
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      widgetSessions.sync([gridWidget('w1', 0, 0), gridWidget('w2', 1, 0)]);
+      await settle();
+      client.sessions.treeUpdated('s1', 1, tree('A1'));
+      client.sessions.treeUpdated('s2', 1, tree('B1'));
+      scheduler.flush();
+      const deckHost = root.querySelector('.wc-deck');
+
+      client.sessions.clear();
+      widgetSessions.reset();
+      scheduler.flush();
+
+      expect(tileText('w1')).toBe('A1');
+      expect(tileText('w2')).toBe('B1');
+      expect(root.querySelector('.wc-deck')).toBe(deckHost);
+    });
+
+    it('asks again for an icon whose request the outage refused', async () => {
+      const iconHost: UiRenderHost = {
+        ...host,
+        resourceUrl: resource => (resource ? `/api/ui/resources/${resource.resourceId}` : null),
+      };
+      client.deck.load([folderWithWidgets('root', ['w1'])]);
+      new Shell(root, client, iconHost, { ...services(), schedule: scheduler.schedule });
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      widgetSessions.sync([gridWidget('w1', 0, 0)]);
+      await settle();
+      client.sessions.treeUpdated('s1', 1, iconTree('icon-1'));
+      scheduler.flush();
+
+      const image = root.querySelector('img') as HTMLImageElement;
+      expect(image).withContext('the widget icon').not.toBeNull();
+      // An icon requested while the host was unreachable keeps the URL it failed on, so the deck that
+      // comes back would otherwise stay blank until the whole client is loaded again.
+      image.dispatchEvent(new Event('error'));
+      client.app.set({ connected: false });
+      const assigned = spyOn(image, 'setAttribute').and.callThrough();
+
+      client.app.set({ connected: true });
+
+      expect(assigned.calls.all().filter(call => call.args[0] === 'src').map(call => call.args[1]))
+        .toEqual(['/api/ui/resources/icon-1']);
+    });
+
+    it('keeps interaction feedback synchronous, with no scheduler flush', () => {
+      client.deck.load([folderWithWidgets('root', ['w1', 'w2']), folder('other')]);
+      new Shell(root, client, host, {
+        ...services(), target: { ...DEFAULT_WEB_CLIENT_TARGET, hardwareInput: { keys: [] } },
+        schedule: scheduler.schedule,
+      });
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+
+      const w1Tile = () => root.querySelector('[data-widget-id="w1"]') as HTMLElement;
+      const surface = w1Tile().querySelector('.deck-grid-tile-surface') as HTMLElement;
+      surface.dispatchEvent(pointerEvent('pointerdown'));
+
+      expect(w1Tile().classList.contains('deck-grid-tile-pressed')).toBeTrue();
+      surface.dispatchEvent(pointerEvent('pointerup'));
+
+      // A folder switch and back moves the input cursor, which paints the focus ring directly on
+      // the grid - nothing here ever touches `scheduler`.
+      client.deck.openFolder('other');
+      client.deck.openFolder('root');
+
+      expect(root.querySelectorAll('.deck-grid-tile-focused').length).toBe(1);
+      expect(w1Tile().classList.contains('deck-grid-tile-focused')).toBeTrue();
+    });
+  });
+
+  describe('a device whose settings button is hidden', () => {
+    const SETTINGS_KEY = 'md.device.web-client.settings-button-hidden';
+    let clients: Client[];
+    let sent: string[];
+    let triggers: string[];
+
+    const notify = (target: Client, type: string, body: unknown) =>
+      (target as unknown as { onNotification(type: string, payload: unknown): void }).onNotification(type, body);
+    const setHidden = (hidden: boolean, target: Client = client) =>
+      notify(target, 'DeviceClientSettingsChangedEvent', { settingsButtonHidden: hidden });
+
+    const connectionFor = () => ({
+      request: (type: string, args?: unknown) => {
+        if (type === 'SendUiEvent') sent.push(JSON.stringify(args));
+        if (type === 'OpenWidgetUiSession') return Promise.resolve({ accepted: true, sessionId: 's1' });
+        if (type === 'OpenModalUiSession') return Promise.resolve({ accepted: true, sessionId: 'modal-1' });
+        if (type === 'OpenScreenSaverUiSession') {
+          return Promise.resolve({ accepted: true, sessionId: 'ss1', screenSaverId: 'x::clock', interactive: false });
+        }
+        if (type === 'AttachUiSession') return Promise.resolve({ accepted: true });
+        return Promise.resolve(undefined);
+      },
+      state: { subscribe: () => () => undefined, get: () => 'connected' },
+    });
+
+    const useFakeConnection = (target: Client) => {
+      const connection = connectionFor();
+      (target as unknown as { connection: unknown }).connection = connection;
+      (target as unknown as { widgetSessions: WidgetSessions }).widgetSessions =
+        new WidgetSessions(connection as never, target.sessions);
+    };
+
+    const pressableTile = (id: string, x: number): GridWidget => ({
+      ...gridWidget(id, x, 0),
+      data: { flows: [{ triggerType: 'onShortPress', children: [{ id: 'a1', disabled: false }] }] },
+    }) as GridWidget;
+
+    const showDeck = (target: Client = client) => {
+      target.deck.load([{
+        ...(folder('root') as unknown as Record<string, unknown>),
+        widgets: [pressableTile('w1', 0), pressableTile('w2', 2)],
+      } as never]);
+      target.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+    };
+
+    const mountWith = (target: WebClientTarget = DEFAULT_WEB_CLIENT_TARGET, into: HTMLElement = root) =>
+      new Shell(into, client, host, { ...services(), target });
+
+    const gear = (within: HTMLElement = root) =>
+      within.querySelector('.wc-client-settings-trigger') as HTMLElement;
+    const gearHidden = (within: HTMLElement = root) => gear(within).hasAttribute('hidden');
+    const sidebar = (within: HTMLElement = root) => within.querySelector('.wc-edge-sidebar');
+    const tileSurface = (widgetId = 'w1') =>
+      root.querySelector(`[data-widget-id="${widgetId}"] .deck-grid-tile-surface`) as HTMLElement;
+
+    const touchEvent = (type: string, target: EventTarget, x: number, y: number): Event => {
+      const event = document.createEvent('Event');
+      event.initEvent(type, true, true);
+      const point = { identifier: 0, target, clientX: x, clientY: y, screenX: x, screenY: y };
+      const ended = type === 'touchend' || type === 'touchcancel';
+      Object.defineProperty(event, 'changedTouches', { value: [point] });
+      Object.defineProperty(event, 'touches', { value: ended ? [] : [point] });
+      return event;
+    };
+
+    const pointer = (type: string, x: number, y: number, pointerType: string, pointerId: number): Event =>
+      new PointerEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId, pointerType, button: 0 });
+
+    const touchDrag = (target: EventTarget, from: { x: number; y: number }, to: { x: number; y: number }) => {
+      target.dispatchEvent(pointer('pointerdown', from.x, from.y, 'touch', 7));
+      target.dispatchEvent(touchEvent('touchstart', target, from.x, from.y));
+      const middle = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+      for (const point of [middle, to]) {
+        target.dispatchEvent(pointer('pointermove', point.x, point.y, 'touch', 7));
+        target.dispatchEvent(touchEvent('touchmove', target, point.x, point.y));
+      }
+      target.dispatchEvent(touchEvent('touchend', target, to.x, to.y));
+      target.dispatchEvent(pointer('pointerup', to.x, to.y, 'touch', 7));
+    };
+
+    const swipe = (target: EventTarget = tileSurface(), fromX = 10, travel = 80, dy = 0) =>
+      touchDrag(target, { x: fromX, y: 100 }, { x: fromX + travel, y: 100 + dy });
+
+    beforeEach(() => {
+      clients = [client];
+      sent = [];
+      triggers = [];
+      useFakeConnection(client);
+      spyOn(Client.prototype, 'executeTrigger').and.callFake((_widgetId: string, triggerType: string) => {
+        triggers.push(triggerType);
+        return Promise.resolve() as never;
+      });
+    });
+
+    // Every shell outlives its spec, so each one is told to show its gear again, which removes its
+    // document listeners.
+    afterEach(() => {
+      for (const each of clients) {
+        notify(each, 'DeviceScreenSaverChangedEvent', { enabled: true, idleSeconds: 60 });
+        notify(each, 'DeviceScreenSaverChangedEvent', { enabled: false, idleSeconds: 0 });
+        setHidden(false, each);
+      }
+      localStorage.removeItem(SETTINGS_KEY);
+    });
+
+    it('keeps the gear and answers no swipe while the setting is off', () => {
+      mountWith();
+      showDeck();
+
+      swipe();
+
+      expect(gearHidden()).toBeFalse();
+      expect(sidebar()).toBeNull();
+    });
+
+    it('hides the gear on the deck when the host says so and shows it again when told otherwise', () => {
+      mountWith();
+      showDeck();
+
+      setHidden(true);
+      expect(gearHidden()).toBeTrue();
+
+      setHidden(false);
+      expect(gearHidden()).toBeFalse();
+      swipe();
+      expect(sidebar()).toBeNull();
+    });
+
+    it('starts hidden from the last known value after a reload, before the host has answered', () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+
+      const reloadedRoot = document.createElement('div');
+      document.body.appendChild(reloadedRoot);
+      try {
+        client = new Client(() => 'http://host', 'client-1');
+        clients.push(client);
+        useFakeConnection(client);
+        mountWith(DEFAULT_WEB_CLIENT_TARGET, reloadedRoot);
+
+        client.app.set({ probed: true, authenticated: true });
+        expect(client.app.screen.get()).toBe('connecting');
+        expect(gearHidden(reloadedRoot)).toBeTrue();
+
+        client.app.set({ connected: true });
+        expect(gearHidden(reloadedRoot)).toBeTrue();
+      } finally {
+        reloadedRoot.remove();
+      }
+    });
+
+    it('shows the gear on the sign-in and setup screens even when the device hides it', () => {
+      localStorage.setItem(SETTINGS_KEY, 'true');
+      client = new Client(() => 'http://host', 'client-1');
+      clients.push(client);
+      mountWith();
+
+      client.app.set({ probed: true, setupRequired: true });
+      expect(gearHidden()).toBeFalse();
+
+      client.app.set({ setupRequired: false });
+      expect(client.app.screen.get()).toBe('signedOut');
+      expect(gearHidden()).toBeFalse();
+
+      client.app.set({ authenticated: true });
+      expect(gearHidden()).toBeTrue();
+    });
+
+    it('opens a sidebar on a swipe in from the left edge, whose one button opens the settings', () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+
+      swipe(tileSurface(), 10, 48);
+
+      const panel = sidebar() as HTMLElement;
+      expect(panel).withContext('the sidebar').not.toBeNull();
+      expect(panel.getAttribute('aria-label')).toBe(text(ClientAppStrings.WebClient.Settings.Sidebar));
+      const buttons = panel.querySelectorAll('button');
+      expect(buttons.length).toBe(1);
+      expect(buttons[0].getAttribute('aria-label')).toBe(text(ClientAppStrings.WebClient.Settings.OpenSettings));
+
+      (buttons[0] as HTMLElement).click();
+
+      expect(document.querySelector('.wc-client-settings-backdrop')).withContext('the settings dialog').not.toBeNull();
+      expect(sidebar()).toBeNull();
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    });
+
+    it('opens the sidebar on a mouse drag from the left edge as well', () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+      const surface = tileSurface();
+
+      surface.dispatchEvent(pointer('pointerdown', 5, 100, 'mouse', 1));
+      surface.dispatchEvent(pointer('pointermove', 60, 110, 'mouse', 1));
+      surface.dispatchEvent(pointer('pointerup', 60, 110, 'mouse', 1));
+
+      expect(sidebar()).not.toBeNull();
+      expect(triggers).not.toContain('onShortPress');
+    });
+
+    it('does not press the tile the swipe started on', () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+
+      swipe();
+
+      expect(sidebar()).not.toBeNull();
+      expect(triggers).not.toContain('onShortPress');
+      expect(triggers).not.toContain('onLongPress');
+    });
+
+    it('still presses a tile near the edge that is tapped rather than swiped', () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+
+      touchDrag(tileSurface(), { x: 10, y: 100 }, { x: 10, y: 100 });
+
+      expect(sidebar()).toBeNull();
+      expect(triggers).toContain('onShortPress');
+    });
+
+    it('does nothing for a swipe that starts too far in, runs up the screen, or stops short', () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+
+      swipe(tileSurface('w2'), 57, 120);
+      swipe(tileSurface(), 10, 60, 40);
+      swipe(tileSurface(), 10, 47);
+
+      expect(sidebar()).toBeNull();
+    });
+
+    it('does nothing for a swipe slower than half a second', () => {
+      jasmine.clock().install();
+      jasmine.clock().mockDate(new Date(0));
+      try {
+        mountWith();
+        showDeck();
+        setHidden(true);
+        const surface = tileSurface();
+
+        surface.dispatchEvent(touchEvent('touchstart', surface, 10, 100));
+        jasmine.clock().tick(501);
+        surface.dispatchEvent(touchEvent('touchmove', surface, 90, 100));
+        surface.dispatchEvent(touchEvent('touchend', surface, 90, 100));
+
+        expect(sidebar()).toBeNull();
+      } finally {
+        jasmine.clock().uninstall();
+      }
+    });
+
+    it('leaves a drag that starts on a slider at the left edge to the slider', async () => {
+      client.deck.load([{
+        ...(folder('root') as unknown as Record<string, unknown>),
+        widgets: [gridWidget('w1', 0, 0)],
+      } as never]);
+      const scheduler = new SyncScheduler();
+      new Shell(root, client, host, { ...services(), schedule: scheduler.schedule });
+      client.app.set({ probed: true, authenticated: true, connected: true, deckRendered: true });
+      client.widgetSessions.sync([gridWidget('w1', 0, 0)]);
+      await settle();
+      client.sessions.treeUpdated('s1', 1,
+        { id: 'root', type: 'ui.slider', properties: { events: ['adjust', 'change'], level: 0.5 } } as UiNode);
+      scheduler.flush();
+      setHidden(true);
+      const slider = root.querySelector('[data-widget-id="w1"] .widget-slider') as HTMLElement;
+      expect(slider).withContext('the slider').not.toBeNull();
+      slider.getBoundingClientRect = () => ({ left: 0, top: 90, right: 200, bottom: 110, width: 200, height: 20 }) as DOMRect;
+
+      touchDrag(slider, { x: 10, y: 100 }, { x: 150, y: 100 });
+
+      expect(sidebar()).toBeNull();
+      expect(sent.length).withContext('what the slider sent the host').toBeGreaterThan(0);
+    });
+
+    it('closes the sidebar on Escape without taking the deck back', () => {
+      const back = spyOn(client.deck, 'back');
+      mountWith({ ...DEFAULT_WEB_CLIENT_TARGET, hardwareInput: { keys: [{ key: 'Escape', event: { kind: 'back' as const } }] } });
+      showDeck();
+      setHidden(true);
+      swipe();
+      expect(sidebar()).not.toBeNull();
+
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+
+      expect(sidebar()).toBeNull();
+      expect(back).not.toHaveBeenCalled();
+    });
+
+    it('closes the sidebar when the screen changes', () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+      swipe();
+      expect(sidebar()).not.toBeNull();
+
+      client.app.set({ authenticated: false, deckRendered: false });
+
+      expect(sidebar()).toBeNull();
+      expect(gearHidden()).toBeFalse();
+    });
+
+    it('ignores a swipe while a dialog from the host is open', async () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+      notify(client, 'UiModalOpenedEvent', { modalId: 'm1' });
+      await settle();
+
+      swipe();
+
+      expect(sidebar()).toBeNull();
+      client.completeModal('m1', true);
+    });
+
+    it('only wakes the deck when the swipe lands on the screensaver', async () => {
+      mountWith();
+      showDeck();
+      setHidden(true);
+      notify(client, 'ShowDeviceScreenSaverEvent', {});
+      await settle();
+      const overlay = root.querySelector('.wc-screensaver') as HTMLElement;
+      expect(overlay.hidden).toBeFalse();
+
+      swipe(overlay);
+
+      expect(overlay.classList).toContain('wc-screensaver-deaf');
+      expect(sidebar()).toBeNull();
+    });
+
+    it('ignores a swipe while the reconnecting notice covers the deck', () => {
+      jasmine.clock().install();
+      try {
+        mountWith();
+        showDeck();
+        setHidden(true);
+        client.app.set({ connected: false });
+        jasmine.clock().tick(4000);
+        expect(root.querySelector('.wc-reconnecting')).not.toBeNull();
+
+        swipe();
+
+        expect(sidebar()).toBeNull();
+      } finally {
+        client.app.set({ connected: true });
+        jasmine.clock().uninstall();
+      }
+    });
+
+    describe('on a browser without Pointer Events', () => {
+      const shim = require('../legacy/pointer-events.legacy.js') as { installPointerEvents(doc: Document): () => void };
+      let uninstall: () => void;
+      let original: unknown;
+
+      beforeEach(() => {
+        original = (globalThis as { PointerEvent?: unknown }).PointerEvent;
+        delete (globalThis as { PointerEvent?: unknown }).PointerEvent;
+        uninstall = shim.installPointerEvents(document);
+      });
+
+      afterEach(() => {
+        uninstall();
+        (globalThis as { PointerEvent?: unknown }).PointerEvent = original;
+      });
+
+      it('opens the sidebar from a tile without pressing it', () => {
+        mountWith();
+        showDeck();
+        setHidden(true);
+        const surface = tileSurface();
+
+        surface.dispatchEvent(touchEvent('touchstart', surface, 10, 100));
+        surface.dispatchEvent(touchEvent('touchmove', surface, 40, 102));
+        surface.dispatchEvent(touchEvent('touchmove', surface, 80, 104));
+        surface.dispatchEvent(touchEvent('touchend', surface, 80, 104));
+
+        expect(sidebar()).not.toBeNull();
+        expect(triggers).toContain('onTouchStart');
+        expect(triggers).not.toContain('onShortPress');
+      });
+
+      it('still presses the tile on a tap', () => {
+        mountWith();
+        showDeck();
+        setHidden(true);
+        const surface = tileSurface();
+
+        surface.dispatchEvent(touchEvent('touchstart', surface, 10, 100));
+        surface.dispatchEvent(touchEvent('touchend', surface, 10, 100));
+
+        expect(sidebar()).toBeNull();
+        expect(triggers).toContain('onShortPress');
+      });
+    });
+  });
+
+  describe('host notifications', () => {
+    const deliver = (type: string, payload: unknown) =>
+      (client as unknown as { onNotification(type: string, payload: unknown): void }).onNotification(type, payload);
+
+    afterEach(() => client.notifications.clear());
+
+    it('puts a pushed toast and a pushed dialog on screen and takes them off with the snapshot', () => {
+      mount();
+      deliver('NotificationShownEvent', { notification: notification({ id: 't', popup: 'toast', title: 'Toast' }) });
+      deliver('NotificationShownEvent', { notification: notification({ id: 'd', popup: 'dialog', title: 'Dialog' }) });
+
+      expect(root.querySelector('.wc-toast-message')!.textContent).toBe('Toast');
+      expect(root.querySelector('.wc-notification-title')!.textContent).toBe('Dialog');
+      expect(root.querySelector('.wc-notification-backdrop')!.hasAttribute('hidden')).toBeFalse();
+
+      deliver('ActiveNotificationsEvent', { notifications: [] });
+
+      expect(root.querySelector('.wc-toast-message')).toBeNull();
+      expect(root.querySelector('.wc-notification-backdrop')!.hasAttribute('hidden')).toBeTrue();
+    });
+
+    it('stays out of the way of a host that never sends one', () => {
+      mount();
+
+      expect(root.querySelector('.wc-toast')).toBeNull();
+      expect(root.querySelector('.wc-notification-backdrop')!.hasAttribute('hidden')).toBeTrue();
+    });
+  });
+});

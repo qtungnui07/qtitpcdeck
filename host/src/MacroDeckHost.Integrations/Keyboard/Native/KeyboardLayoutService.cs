@@ -1,0 +1,74 @@
+namespace MacroDeckHost.Integrations.Keyboard.Native;
+
+public sealed class KeyboardLayoutService : IKeyboardLayoutService
+{
+	public bool TryResolveKey(string name, out KeyCode key)
+	{
+		return KeyNames.TryParse(name, out key);
+	}
+
+	public bool TryResolveModifier(string name, out KeyModifier modifier)
+	{
+		return KeyNames.TryParseModifier(name, out modifier);
+	}
+
+	public KeyModifier ResolveModifiers(IEnumerable<string> names)
+	{
+		var result = KeyModifier.None;
+		foreach (var name in names)
+		{
+			if (KeyNames.TryParseModifier(name, out var modifier))
+			{
+				result |= modifier;
+			}
+		}
+
+		return result;
+	}
+
+	public IReadOnlyList<KeyCode> ExpandModifiers(KeyModifier modifiers)
+	{
+		var result = new List<KeyCode>(8);
+		if (modifiers.HasFlag(KeyModifier.Control))
+		{
+			result.Add(KeyCode.LeftControl);
+		}
+
+		if (modifiers.HasFlag(KeyModifier.RightControl))
+		{
+			result.Add(KeyCode.RightControl);
+		}
+
+		if (modifiers.HasFlag(KeyModifier.Shift))
+		{
+			result.Add(KeyCode.LeftShift);
+		}
+
+		if (modifiers.HasFlag(KeyModifier.RightShift))
+		{
+			result.Add(KeyCode.RightShift);
+		}
+
+		if (modifiers.HasFlag(KeyModifier.Alt))
+		{
+			result.Add(KeyCode.LeftAlt);
+		}
+
+		if (modifiers.HasFlag(KeyModifier.RightAlt))
+		{
+			result.Add(KeyCode.RightAlt);
+		}
+
+		if (modifiers.HasFlag(KeyModifier.Meta))
+		{
+			result.Add(KeyCode.LeftMeta);
+		}
+
+		if (modifiers.HasFlag(KeyModifier.RightMeta))
+		{
+			result.Add(KeyCode.RightMeta);
+		}
+
+		return result;
+	}
+}

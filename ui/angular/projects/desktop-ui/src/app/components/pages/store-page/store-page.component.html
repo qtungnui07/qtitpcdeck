@@ -1,0 +1,223 @@
+<div class="store-page" (scroll)="onScroll($event)">
+  <div class="store-page-content">
+    <app-store-page-header #header active="discover" (refreshed)="onRefreshed()" />
+
+    <app-store-community-notice />
+
+    @if (catalog.registry()?.stale) {
+      <shared-error-banner
+        [message]="catalog.registry()?.lastErrorMessage || ('macrodeck.app:Store.Page.StaleCatalogMessage' | translate)"
+        [dismissible]="false" />
+    }
+
+    @if (catalog.loadError()) {
+      <shared-error-banner [message]="catalog.loadError()!" (dismiss)="catalog.loadError.set(null)" />
+    }
+
+    <section class="store-hero" [attr.aria-label]="'macrodeck.app:Store.Page.HeroHeading' | translate">
+      <div class="hero-copy">
+        <h2 class="hero-heading">{{ 'macrodeck.app:Store.Page.HeroHeading' | translate }}</h2>
+        <p class="hero-subheading">{{ 'macrodeck.app:Store.Page.HeroSubheading' | translate }}</p>
+      </div>
+      <div class="hero-search">
+        <span class="icon icon-search icon-sm hero-search-icon" aria-hidden="true"></span>
+        <shared-input
+          type="search"
+          [placeholder]="'macrodeck.app:Store.Page.SearchPlaceholder' | translate"
+          [ariaLabel]="'macrodeck.app:Store.Page.SearchAriaLabel' | translate"
+          [ngModel]="search()"
+          (ngModelChange)="onSearchChange($event)" />
+      </div>
+      <div class="hero-categories" role="group" [attr.aria-label]="'macrodeck.app:Store.Page.KindFilterAriaLabel' | translate">
+        @for (option of kindOptions(); track option.value) {
+          <button
+            type="button"
+            class="category-chip"
+            [attr.data-kind]="option.value"
+            [class.active]="kind() === option.value"
+            [attr.aria-pressed]="kind() === option.value"
+            (click)="onKindChange(option.value)">
+            <span class="icon icon-{{ option.icon }} icon-sm" aria-hidden="true"></span>
+            <span>{{ option.label }}</span>
+            @if (option.count !== null) {
+              <span class="category-count">{{ option.count }}</span>
+            }
+          </button>
+        }
+      </div>
+      @if (categoryOptions().length > 0) {
+        <div class="hero-categories" role="group" [attr.aria-label]="'macrodeck.app:Store.Page.CategoriesHeading' | translate">
+          @for (option of categoryOptions(); track option.id) {
+            <button
+              type="button"
+              class="category-chip"
+              [attr.data-category]="option.id"
+              [class.active]="option.active"
+              [attr.aria-pressed]="option.active"
+              (click)="onCategoryClick(option.id)">
+              <span class="icon icon-tag icon-sm" aria-hidden="true"></span>
+              <span>{{ option.label }}</span>
+            </button>
+          }
+        </div>
+      }
+    </section>
+
+    <div class="store-sections">
+      @if (showUnavailable()) {
+        <shared-empty-state
+          icon="alert-triangle"
+          [heading]="'macrodeck.app:Store.Page.UnavailableHeading' | translate"
+          [message]="'macrodeck.app:Store.Page.UnavailableMessage' | translate">
+          <shared-button variant="primary" (click)="header.refresh()">{{ 'macrodeck:Common.Retry' | translate }}</shared-button>
+        </shared-empty-state>
+      } @else if (showEmptyCatalog()) {
+        <shared-empty-state
+          icon="store"
+          [heading]="'macrodeck.app:Store.Page.EmptyCatalogHeading' | translate"
+          [message]="'macrodeck.app:Store.Page.EmptyCatalogMessage' | translate" />
+      } @else {
+        @if (showRows()) {
+          <shared-store-section
+            layout="row"
+            icon="star"
+            [heading]="'macrodeck.app:Store.Page.FeaturedSectionHeading' | translate"
+            [subheading]="'macrodeck.app:Store.Page.FeaturedSectionSubheading' | translate"
+            [items]="featuredRow()"
+            [featuredKeys]="featuredKeys()"
+            [updatesAvailable]="updatesAvailable"
+            (install)="onInstall($event)"
+            (installUnsigned)="onInstallUnsigned($event)"
+            (retry)="onRetry($event)"
+            (uninstall)="onUninstallRequested($event)"
+            (checkForUpdates)="onCheckForUpdates()" />
+
+          <shared-store-section
+            layout="row"
+            icon="download"
+            [heading]="'macrodeck.app:Store.Page.PopularSectionHeading' | translate"
+            [subheading]="'macrodeck.app:Store.Page.PopularSectionSubheading' | translate"
+            [items]="popularRow()"
+            [featuredKeys]="featuredKeys()"
+            [updatesAvailable]="updatesAvailable"
+            (install)="onInstall($event)"
+            (installUnsigned)="onInstallUnsigned($event)"
+            (retry)="onRetry($event)"
+            (uninstall)="onUninstallRequested($event)"
+            (checkForUpdates)="onCheckForUpdates()" />
+
+          <shared-store-section
+            layout="row"
+            icon="zap"
+            [heading]="'macrodeck.app:Store.Page.NewAndUpdatedSectionHeading' | translate"
+            [subheading]="'macrodeck.app:Store.Page.NewAndUpdatedSectionSubheading' | translate"
+            [items]="freshRow()"
+            [featuredKeys]="featuredKeys()"
+            [updatesAvailable]="updatesAvailable"
+            (install)="onInstall($event)"
+            (installUnsigned)="onInstallUnsigned($event)"
+            (retry)="onRetry($event)"
+            (uninstall)="onUninstallRequested($event)"
+            (checkForUpdates)="onCheckForUpdates()" />
+        }
+
+        <section class="store-browse">
+          <div class="browse-bar">
+            <div class="browse-title">
+              <h2 class="browse-heading">{{ browseHeading() }}</h2>
+              @if (!catalog.isLoading()) {
+                <span class="browse-count">{{ resultCount() }}</span>
+              }
+            </div>
+            <div class="browse-controls">
+              <label class="supported-toggle">
+                <input
+                  type="checkbox"
+                  [checked]="supportedOnly()"
+                  (change)="onSupportedOnlyChange($any($event.target).checked)">
+                <span>{{ 'macrodeck.app:Store.Page.SupportedOnlyLabel' | translate }}</span>
+              </label>
+              <label class="store-sort">
+                <span class="store-sort-label">{{ 'macrodeck.app:Store.Page.SortLabel' | translate }}</span>
+                <shared-select
+                  [options]="sortOptions()"
+                  [ngModel]="sort()"
+                  (ngModelChange)="onSortChange($event)" />
+              </label>
+            </div>
+          </div>
+
+          @if (tag()) {
+            <p class="hidden-note">
+              <span class="icon icon-tag icon-xs" aria-hidden="true"></span>
+              <span>{{ 'macrodeck.app:Store.Page.TagFilterNote' | translate:{ tag: tagLabel() } }}</span>
+              <button type="button" class="link-button" (click)="clearTag()">
+                {{ 'macrodeck.app:Store.Page.ShowAllAction' | translate }}
+              </button>
+            </p>
+          }
+
+          @if (publisher()) {
+            <p class="hidden-note">
+              <span class="icon icon-user icon-xs" aria-hidden="true"></span>
+              <span>{{ 'macrodeck.app:Store.Page.PublisherFilterNote' | translate:{ publisher: publisher() } }}</span>
+              <button type="button" class="link-button" (click)="clearPublisher()">
+                {{ 'macrodeck.app:Store.Page.ShowAllAction' | translate }}
+              </button>
+            </p>
+          }
+
+          @if (hiddenCount() > 0) {
+            <p class="hidden-note">
+              <span class="icon icon-info icon-xs" aria-hidden="true"></span>
+              <span>{{ hiddenMessage() }}</span>
+              <button type="button" class="link-button" (click)="onSupportedOnlyChange(false)">
+                {{ 'macrodeck.app:Store.Page.ShowAllAction' | translate }}
+              </button>
+            </p>
+          }
+
+          @if (showEmptyResults()) {
+            <shared-empty-state
+              [heading]="'macrodeck.app:Store.Page.NoResultsHeading' | translate"
+              [message]="'macrodeck.app:Store.Page.NoResultsMessage' | translate" />
+          } @else {
+            <shared-store-section
+              cards="tile"
+              [items]="catalog.items()"
+              [featuredKeys]="featuredKeys()"
+              [updatesAvailable]="updatesAvailable"
+              (install)="onInstall($event)"
+              (installUnsigned)="onInstallUnsigned($event)"
+              (retry)="onRetry($event)"
+              (uninstall)="onUninstallRequested($event)"
+              (checkForUpdates)="onCheckForUpdates()" />
+
+            @if (catalog.hasMore() && !catalog.loadError()) {
+              <div class="store-load-more">
+                <shared-button
+                  variant="secondary"
+                  [loading]="catalog.isLoadingMore()"
+                  (click)="onLoadMore()">
+                  {{ 'macrodeck.app:Store.Page.LoadMoreAction' | translate }}
+                </shared-button>
+              </div>
+            }
+          }
+        </section>
+      }
+    </div>
+
+    <app-store-footer />
+  </div>
+</div>
+
+@if (pendingUninstall()) {
+  <shared-confirmation-modal
+    [heading]="uninstallHeading()"
+    [message]="uninstallMessage()"
+    [confirmText]="'macrodeck.app:Store.Uninstall' | translate"
+    [danger]="true"
+    (confirm)="confirmUninstall()"
+    (cancel)="cancelUninstall()" />
+}

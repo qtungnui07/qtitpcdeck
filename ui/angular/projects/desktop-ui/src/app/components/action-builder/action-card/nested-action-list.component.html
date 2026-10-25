@@ -1,0 +1,50 @@
+<div
+  class="action-list"
+  [class.nested]="variant === 'nested'"
+  [class.root]="variant === 'root'"
+  [class.is-empty]="!items || items.length === 0"
+  [class.drop-target]="isDropTarget()"
+  [attr.data-list-id]="listId"
+  (contextmenu)="onContextMenu($event)">
+
+  @for (block of items; track block.id; let i = $index) {
+    @if (slotAt(i)) {
+      <div class="drop-indicator" aria-hidden="true"></div>
+    }
+    <div
+      class="action-card-wrapper"
+      [class.drag-source]="drag.isSource(block.id)"
+      [class.just-dropped]="drag.justDropped() === block.id">
+      <button
+        class="drag-handle"
+        #handle
+        (pointerdown)="onHandlePress($event, block, handle)"
+        [attr.aria-label]="dragHandleAriaLabel()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/></svg>
+      </button>
+      <shared-action-card [block]="block" />
+    </div>
+  }
+
+  @if (slotAt(items.length || 0)) {
+    <div class="drop-indicator" aria-hidden="true"></div>
+  }
+</div>
+
+@if (variant === 'nested') {
+  <button
+    type="button"
+    class="block-section-add"
+    (click)="store.requestAdd(listId)">
+    {{ addActionLabel() }}
+  </button>
+}
+
+<shared-context-menu
+  [isOpen]="menu().isOpen"
+  [x]="menu().x"
+  [y]="menu().y"
+  [items]="menuItems()"
+  (itemClick)="onMenuAction($event)"
+  (closed)="closeMenu()">
+</shared-context-menu>

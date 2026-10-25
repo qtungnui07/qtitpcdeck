@@ -1,0 +1,353 @@
+@if (available()) {
+  <div class="reviews-header">
+    <h2 class="reviews-heading">{{ 'macrodeck.app:Store.Reviews.Heading' | translate }}</h2>
+    @if (hasRatings() || filter() !== 'all') {
+      <div class="reviews-controls">
+        <shared-select
+          class="reviews-sort"
+          [attr.aria-label]="'macrodeck.app:Store.Reviews.SortLabel' | translate"
+          [options]="sortOptions()"
+          [ngModel]="sort()"
+          (ngModelChange)="onSortChange($event)" />
+        <shared-select
+          class="reviews-filter"
+          [attr.aria-label]="'macrodeck.app:Store.Reviews.FilterLabel' | translate"
+          [options]="filterOptions()"
+          [ngModel]="filter()"
+          (ngModelChange)="onFilterChange($event)" />
+      </div>
+    }
+  </div>
+
+  @if (hasRatings()) {
+    <div class="reviews-summary">
+      <div class="reviews-aggregate">
+        @if (ratingText(); as text) {
+          <span class="reviews-aggregate-value" aria-hidden="true">{{ text }}</span>
+        }
+        <div class="reviews-aggregate-detail">
+          @if (aggregate()?.rating; as rating) {
+            <shared-store-rating-stars [rating]="rating" size="sm" />
+          }
+          <span class="reviews-aggregate-count">{{ ratingCountText() }}</span>
+        </div>
+      </div>
+
+      <ul class="reviews-distribution" [attr.aria-label]="'macrodeck.app:Store.Reviews.DistributionLabel' | translate">
+        @for (bucket of distribution(); track bucket.stars) {
+          <li class="reviews-distribution-row">
+            <span class="reviews-distribution-stars" aria-hidden="true">{{ bucket.stars }}</span>
+            <span
+              class="reviews-distribution-bar"
+              role="progressbar"
+              aria-valuemin="0"
+              [attr.aria-valuemax]="bucket.total"
+              [attr.aria-valuenow]="bucket.count"
+              [attr.aria-valuetext]="bucket.valueText"
+              [attr.aria-label]="bucket.label">
+              <span class="reviews-distribution-fill" [style.width.%]="bucket.percent"></span>
+            </span>
+            <span class="reviews-distribution-count" aria-hidden="true">{{ bucket.count }}</span>
+          </li>
+        }
+      </ul>
+    </div>
+  }
+
+  <div class="reviews-compose">
+    @switch (mode()) {
+      @case ('signIn') {
+        <div class="reviews-compose-row">
+          <p class="reviews-compose-text">
+            @if (!hasRatings()) {
+              <span class="reviews-first">{{ 'macrodeck.app:Store.Reviews.NoRatingsYet' | translate }}</span>
+            }
+            {{ 'macrodeck.app:Store.Reviews.SignInPrompt' | translate }}
+          </p>
+          <shared-button class="reviews-sign-in" variant="secondary" size="compact" (click)="openSignIn()">
+            {{ 'macrodeck.app:Settings.Account.SignIn' | translate }}
+          </shared-button>
+        </div>
+      }
+      @case ('suspended') {
+        <p class="reviews-compose-text reviews-suspended">{{ 'macrodeck.app:Store.Reviews.Suspended' | translate }}</p>
+        <ng-container *ngTemplateOutlet="ownSummary" />
+      }
+      @case ('notEntitled') {
+        <p class="reviews-compose-text reviews-not-entitled">{{ 'macrodeck.app:Store.Reviews.NotEntitled' | translate }}</p>
+        <ng-container *ngTemplateOutlet="ownSummary" />
+      }
+      @case ('unavailable') {
+        <p class="reviews-compose-text reviews-unavailable">{{ 'macrodeck.app:Store.Reviews.Unavailable' | translate }}</p>
+      }
+      @case ('form') {
+        @if (ownReview()) {
+          <ng-container *ngTemplateOutlet="ownSummary" />
+        } @else {
+          <div class="reviews-compose-row">
+            <p class="reviews-compose-text">
+              @if (!hasRatings()) {
+                <span class="reviews-first">{{ 'macrodeck.app:Store.Reviews.NoRatingsYet' | translate }}</span>
+              }
+              {{ 'macrodeck.app:Store.Reviews.WritePrompt' | translate }}
+            </p>
+            <shared-button class="reviews-write" variant="primary" size="compact" (click)="openEditor()">
+              <span class="icon icon-pencil icon-xs" aria-hidden="true"></span>
+              {{ 'macrodeck.app:Store.Reviews.WriteAction' | translate }}
+            </shared-button>
+          </div>
+        }
+      }
+    }
+
+    @if (!editorOpen()) {
+      @if (writeError(); as error) {
+        <p class="reviews-write-error" role="alert">{{ error }}</p>
+      }
+      @if (writeStatus(); as status) {
+        <p class="reviews-write-status" role="status">{{ status }}</p>
+      }
+    }
+  </div>
+
+  @if (reviewsFailed()) {
+    <p class="reviews-empty">{{ 'macrodeck.app:Store.Reviews.LoadFailed' | translate }}</p>
+  } @else if (!reviewsLoading() && reviews().length === 0 && (hasRatings() || filter() !== 'all')) {
+    <p class="reviews-empty">
+      @if (filter() === 'all') {
+        {{ 'macrodeck.app:Store.Reviews.OnlyRatings' | translate }}
+      } @else {
+        {{ 'macrodeck.app:Store.Reviews.EmptyFiltered' | translate }}
+      }
+    </p>
+  }
+
+  <ul class="reviews-list">
+    @for (review of reviews(); track review.id) {
+      <li class="review" [class.review--mine]="review.id === ownReviewId()">
+        <div class="review-header">
+          <shared-avatar [src]="reviewAvatarUrl(review)" [name]="review.authorDisplayName" size="sm" />
+          <div class="review-identity">
+            <span class="review-author">
+              {{ review.authorDisplayName }}
+              @if (review.id === ownReviewId()) {
+                <span class="review-you">{{ 'macrodeck.app:Store.Reviews.YouBadge' | translate }}</span>
+              }
+            </span>
+            <span class="review-meta">
+              <shared-store-rating-stars [rating]="review.rating" size="xs" />
+              <span>{{ review.createdAt | date: 'mediumDate' }}</span>
+              @if (review.isEdited) {
+                <span class="review-edited">{{ 'macrodeck.app:Store.Reviews.Edited' | translate }}</span>
+              }
+            </span>
+          </div>
+          @if (review.id !== ownReviewId()) {
+            @if (reportedReviewIds().has(review.id)) {
+              <span class="review-reported" tabindex="-1" [attr.data-reported-review]="review.id">
+                {{ 'macrodeck.app:Store.Report.Reported' | translate }}
+              </span>
+            } @else {
+              <shared-button
+                class="review-report"
+                variant="ghost"
+                size="compact"
+                [ariaLabel]="reviewReportLabel(review)"
+                (click)="requestReport(review)">
+                {{ 'macrodeck.app:Store.Report.Action' | translate }}
+              </shared-button>
+            }
+          }
+        </div>
+        @if (review.title || review.body) {
+          <div class="review-content">
+            @if (review.title) {
+              <p class="review-title">{{ review.title }}</p>
+            }
+            @if (review.body) {
+              <p class="review-body" [class.clamped]="isLongReview(review) && !isExpanded(review)">{{ review.body }}</p>
+              @if (isLongReview(review)) {
+                <button type="button" class="review-more" (click)="toggleExpanded(review)" [attr.aria-expanded]="isExpanded(review)">
+                  {{ (isExpanded(review) ? 'macrodeck.app:Store.Reviews.ShowLessAction' : 'macrodeck.app:Store.Reviews.ShowMoreAction') | translate }}
+                </button>
+              }
+            }
+          </div>
+        }
+        @if (review.reply; as reply) {
+          <div class="review-reply">
+            <div class="review-reply-header">
+              <span class="review-reply-label">{{ 'macrodeck.app:Store.Reviews.DeveloperResponse' | translate }}</span>
+              @if (publisher(); as name) {
+                <span class="review-reply-publisher">{{ name }}</span>
+              }
+              <span class="review-meta">
+                <span>{{ reply.createdAt | date: 'mediumDate' }}</span>
+                @if (reply.isEdited) {
+                  <span class="review-edited">{{ 'macrodeck.app:Store.Reviews.ReplyEdited' | translate }}</span>
+                }
+              </span>
+            </div>
+            <p class="review-reply-body">{{ reply.body }}</p>
+          </div>
+        }
+      </li>
+    }
+  </ul>
+
+  @if (hasMoreReviews() && !reviewsFailed()) {
+    <div class="reviews-load-more">
+      <shared-button variant="secondary" [loading]="reviewsLoading()" (click)="loadMore()">
+        {{ 'macrodeck.app:Store.Reviews.LoadMoreAction' | translate }}
+      </shared-button>
+    </div>
+  }
+}
+
+<ng-template #ownSummary>
+  @if (ownReview(); as review) {
+    <div class="review review--own">
+      @if (moderated()) {
+        <div class="reviews-moderated" role="note">
+          <p class="reviews-compose-text">{{ 'macrodeck.app:Store.Reviews.ModeratedNotice' | translate }}</p>
+          @if (review.moderationReason; as reason) {
+            <p class="reviews-moderation-reason-heading">{{ 'macrodeck.app:Store.Reviews.ModerationReasonHeading' | translate }}</p>
+            <p class="reviews-moderation-reason">{{ reason }}</p>
+          }
+        </div>
+      }
+      <div class="review-own-row">
+        <div class="review-own-content">
+          <span class="review-own-label">{{ 'macrodeck.app:Store.Reviews.ComposeHeading' | translate }}</span>
+          <shared-store-rating-stars [rating]="review.rating" size="xs" />
+          @if (review.title) {
+            <span class="review-own-title">{{ review.title }}</span>
+          }
+          @if (review.body) {
+            <span class="review-own-body">{{ review.body }}</span>
+          }
+        </div>
+        @if (mode() === 'form') {
+          <shared-button class="reviews-edit" variant="ghost" size="compact" [disabled]="moderated() || busy()" (click)="openEditor()">
+            <span class="icon icon-pencil icon-xs" aria-hidden="true"></span>
+            {{ 'macrodeck.app:Store.Reviews.EditAction' | translate }}
+          </shared-button>
+        }
+      </div>
+    </div>
+  }
+</ng-template>
+
+@if (editorOpen()) {
+  <shared-modal
+    class="reviews-editor"
+    size="medium"
+    [heading]="(ownReview() ? 'macrodeck.app:Store.Reviews.EditHeading' : 'macrodeck.app:Store.Reviews.WriteHeading') | translate"
+    [closeOnOverlay]="false"
+    (close)="closeEditor()">
+    <form class="reviews-form" (ngSubmit)="save()">
+      <div class="reviews-field">
+        <span class="reviews-label" id="store-review-rating-label">{{ 'macrodeck.app:Store.Reviews.RatingFieldLabel' | translate }}</span>
+        <app-store-star-picker
+          labelledBy="store-review-rating-label"
+          [value]="formRating()"
+          [disabled]="busy()"
+          [invalid]="!!visibleErrors().rating"
+          (valueChange)="selectRating($event)" />
+        @if (visibleErrors().rating; as error) {
+          <p class="reviews-field-error">{{ error }}</p>
+        }
+        @if (suggestIssue()) {
+          <div class="reviews-issue-hint" role="note">
+            <p class="reviews-compose-text">{{ 'macrodeck.app:Store.Reviews.IssueHint' | translate }}</p>
+            <a class="reviews-issue-link" [href]="issueUrl()" target="_blank" rel="noopener noreferrer">
+              {{ 'macrodeck.app:Store.Reviews.IssueAction' | translate }}
+            </a>
+          </div>
+        }
+      </div>
+
+      <label class="reviews-field">
+        <span class="reviews-label">{{ 'macrodeck.app:Store.Reviews.TitleFieldLabel' | translate }}</span>
+        <shared-input
+          class="reviews-title-input"
+          name="title"
+          [disabled]="busy()"
+          [invalid]="!!visibleErrors().title"
+          [ngModel]="formTitle()"
+          (ngModelChange)="formTitle.set($event)" />
+        @if (visibleErrors().title; as error) {
+          <span class="reviews-field-error">{{ error }}</span>
+        }
+      </label>
+
+      <label class="reviews-field">
+        <span class="reviews-label">{{ 'macrodeck.app:Store.Reviews.BodyFieldLabel' | translate }}</span>
+        <shared-input
+          class="reviews-body-input"
+          name="body"
+          [multiline]="true"
+          [rows]="6"
+          [disabled]="busy()"
+          [invalid]="!!visibleErrors().body"
+          [ngModel]="formBody()"
+          (ngModelChange)="formBody.set($event)" />
+        <span class="reviews-counter" aria-live="polite">{{ bodyCounter() }}</span>
+        @if (visibleErrors().body; as error) {
+          <span class="reviews-field-error">{{ error }}</span>
+        }
+      </label>
+
+      @if (writeError(); as error) {
+        <p class="reviews-write-error" role="alert">{{ error }}</p>
+      }
+    </form>
+
+    <div modal-footer class="reviews-editor-actions">
+      @if (ownReview()) {
+        <shared-button
+          class="reviews-delete"
+          variant="ghost"
+          [disabled]="!canDelete()"
+          (click)="requestDelete()">
+          {{ 'macrodeck.app:Store.Reviews.DeleteAction' | translate }}
+        </shared-button>
+      }
+      <span class="reviews-editor-spacer"></span>
+      <shared-button class="reviews-cancel" variant="ghost" [disabled]="busy()" (click)="closeEditor()">
+        {{ 'macrodeck:Common.Cancel' | translate }}
+      </shared-button>
+      <shared-button
+        class="reviews-save"
+        variant="primary"
+        [loading]="busy()"
+        [disabled]="busy()"
+        (click)="save()">
+        @if (ownReview()) {
+          {{ 'macrodeck.app:Store.Reviews.UpdateAction' | translate }}
+        } @else {
+          {{ 'macrodeck:Common.Save' | translate }}
+        }
+      </shared-button>
+    </div>
+  </shared-modal>
+}
+
+@if (reportTarget(); as target) {
+  <app-store-report-dialog
+    [extensionKind]="kind()"
+    [extensionId]="id()"
+    [target]="target"
+    (closed)="closeReport()"
+    (reported)="onReported()" />
+}
+
+@if (deleteConfirmOpen()) {
+  <shared-confirmation-modal
+    [heading]="'macrodeck.app:Store.Reviews.DeleteHeading' | translate"
+    [message]="'macrodeck.app:Store.Reviews.DeleteMessage' | translate"
+    [confirmText]="'macrodeck.app:Store.Reviews.DeleteAction' | translate"
+    [danger]="true"
+    (confirm)="confirmDelete()"
+    (cancel)="cancelDelete()" />
+}

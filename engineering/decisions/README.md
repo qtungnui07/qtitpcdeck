@@ -1,0 +1,84 @@
+# Architecture Decisions
+
+ADRs record project-wide choices that are difficult to reverse or that intentionally constrain future
+work. Routine implementation details, provider-specific behaviour and bug fixes do not need one.
+
+Use [0000-template.md](0000-template.md). Keep an ADR to the context that explains why the choice
+exists, one clear decision, and the consequences that matter later. Do not transcribe implementation
+code, protocol schemas, issue discussions or exhaustive option lists.
+
+## Host and platform
+
+- [0001 - Profiles are JSON files, written durably and recovered on read](0001-json-profiles-and-durable-writes.md)
+- [0002 - Data roots and build channels](0002-platform-data-directories-and-build-channels.md) (partially superseded by 0111)
+- [0006 - A Tauri bootstrapper is the installed entry point](0006-tauri-bootstrapper-is-the-installed-entry-point.md)
+- [0015 - Installation and update delivery are bounded by each platform's ownership model](0015-installation-and-update-delivery.md)
+- [0024 - The log files are the log viewer's source of truth, and their format is a contract](0024-log-files-are-the-source-of-truth.md)
+- [0078 - The macOS host pumps a CoreFoundation run loop on the main thread](0078-macos-host-pumps-a-core-foundation-run-loop-on-the-main-thread.md)
+- [0100 - Store entries are shared as https links, and `macrodeck://` carries only a package id](0100-store-entries-are-shared-as-https-links-and-opened-through-a-macrodeck-url.md)
+- [0111 - The host database is migrated by EF Core](0111-the-host-database-is-migrated-by-ef-core.md)
+
+## Networking, trust and secrets
+
+- [0003 - Loopback trust, token scopes, and device identity](0003-loopback-trust-token-scopes-and-device-identity.md)
+- [0098 - Loopback trust requires a per-launch secret](0098-loopback-trust-requires-a-per-launch-secret.md)
+- [0030 - Android USB connections terminate on the public listener](0030-android-usb-connections-over-adb.md)
+- [0040 - Public listeners are a resolved endpoint set, secured by a per-installation local CA](0040-public-listeners-and-tls.md)
+- [0047 - Secrets at rest, encrypted backups, and a staged boot-time restore](0047-secrets-backups-and-restore.md)
+- [0054 - The Macro Deck Connect session is a host-owned refresh credential](0054-connect-session-is-a-host-owned-refresh-credential.md)
+- [0062 - UI realtime is a ticketed JSON WebSocket, and it never blocks on a provider](0062-ui-realtime-transport.md)
+- [0085 - The connect link is a binary record written as decimal digits](0085-compact-connect-link.md)
+- [0086 - The host proves its identity to the companion app](0086-host-identity-key.md)
+- [0087 - The Companion license is a signed bearer token the host keeps and hands out](0087-companion-license-token.md)
+
+## Decks, flows and content
+
+- [0004 - Capabilities are optional interfaces, discovered by registry](0004-capability-registries-and-declared-capabilities.md)
+- [0009 - Portable archives, and migration from other applications](0009-portable-archives-and-migration.md)
+- [0010 - One flow engine behind widget triggers, events and automations](0010-one-flow-engine-for-triggers-events-and-automations.md)
+- [0012 - Scripts are reusable flows with declared inputs and an owning widget](0012-scripts-are-reusable-flows.md)
+- [0022 - Icon identity is a locally computed hash, and a widget icon is a typed provider reference](0022-icon-identity-and-widget-icons.md)
+- [0056 - Widget state is addressed by stable state id](0056-widget-state-is-addressed-by-stable-state-id.md)
+- [0081 - Variables come from one provider catalog and carry attributes and a write capability](0081-variables-carry-attributes-and-a-write-capability.md)
+- [0103 - Icon appearances are trait-tagged assets of one icon](0103-icon-appearances-are-trait-tagged-assets-of-one-icon.md)
+- [0104 - Keyboard key names mean labels for letters and positions for punctuation](0104-keyboard-key-names-mean-labels-for-letters-and-positions-for-punctuation.md)
+
+## Plugins
+
+- [0026 - The plugin boundary is a versioned JSON protocol with a DI-first .NET SDK over it](0026-plugin-protocol-and-sdk-boundary.md)
+- [0028 - Plugin credentials are launch tokens, and development plugins pair interactively](0028-plugin-credentials-and-pairing.md)
+- [0029 - Plugins are ZIP artifacts, installed atomically and supervised by the host](0029-plugin-packaging-installation-and-supervision.md)
+- [0037 - SDK deprecation is declared metadata, confirmed by a build-time usage manifest](0037-sdk-deprecation-is-declared-metadata.md)
+- [0042 - Signing is one shared library anchored to a pinned root, and the Portal signs Store artifacts](0042-plugin-signing-and-trusted-publishing.md)
+- [0044 - The host enforces trust as a verdict, and the Store adds the signed registry chain](0044-plugin-and-store-trust-enforcement.md)
+- [0088 - Plugins run on the .NET runtime bundled with the host](0088-plugins-run-on-the-host-bundled-dotnet-runtime.md)
+- [0089 - A development build can temporarily take over an installed plugin](0089-a-development-build-can-temporarily-take-over-an-installed-plugin.md)
+- [0090 - Invited testers install unreviewed test builds](0090-invited-testers-install-unreviewed-test-builds.md)
+- [0091 - Enforced device revocation and long client access tokens](0091-enforced-device-revocation-and-long-client-access-tokens.md)
+- [0092 - Plugins reach ADB through a permission-gated host API](0092-plugins-reach-adb-through-a-permission-gated-host-api.md)
+- [0093 - Plugins and integrations talk over a host-brokered message channel](0093-plugins-and-integrations-talk-over-a-host-brokered-message-channel.md)
+- [0095 - USB connections without debugging](0095-usb-connections-without-debugging.md)
+- [0096 - The root stays offline and signs one issuer, and revocation stops new installs](0096-offline-root-with-an-online-issuer.md)
+- [0097 - Plugin-bundled icon packs are owned by declaration and named by key and icon name](0097-plugin-bundled-icon-packs.md)
+- [0099 - Video streams are host-brokered sessions with transport-neutral descriptions](0099-video-streams-are-host-brokered-sessions-with-transport-neutral-descriptions.md) (partially superseded by 0101)
+- [0101 - The host relays video stream media, and clients play only HLS and MJPEG](0101-the-host-relays-video-stream-media-and-clients-play-hls-and-mjpeg.md)
+- [0102 - The plugin CLI renders previews with an embedded runtime and a local browser](0102-the-plugin-cli-renders-previews-with-an-embedded-runtime-and-a-local-browser.md)
+- [0105 - The SDK translates native key codes with guarded platform interop](0105-the-sdk-translates-native-key-codes-with-guarded-platform-interop.md)
+- [0106 - The host owns the notification lifecycle and the Inbox is one of its parts](0106-the-host-owns-the-notification-lifecycle-and-the-inbox-is-one-of-its-parts.md)
+- [0107 - Built-in integrations are built as extractable plugins](0107-built-in-integrations-are-built-as-extractable-plugins.md)
+- [0108 - UI events carry their origin, and config entries are a plugin capability](0108-ui-events-carry-their-origin-and-config-entries-are-a-plugin-capability.md)
+- [0109 - Battery devices are a host-brokered catalog every plugin may read](0109-battery-devices-are-a-host-brokered-catalog-every-plugin-may-read.md)
+- [0110 - Plugins reach Companion devices through a permission-gated host API](0110-plugins-reach-companion-devices-through-a-permission-gated-host-api.md)
+
+## Macro Deck UI
+
+- [0038 - The UI model is a surface-agnostic versioned package, authored through a reactive DSL](0038-ui-model-and-declarative-dsl.md)
+- [0041 - The web client's service worker caches the app shell and nothing else](0041-web-client-service-worker-caches-the-app-shell.md)
+- [0050 - UI sessions are host-brokered, and a configuration tree renders a transaction it does not own](0050-ui-sessions-are-host-brokered.md)
+- [0057 - Localized text is a reference resolved by whoever renders it](0057-localization-is-a-deferred-reader-resolved-reference.md)
+- [0064 - Components are a registry over two namespaces](0064-components-are-a-registry-over-two-namespaces.md)
+- [0065 - The component profile's authoring contracts](0065-the-component-profile-authoring-contracts.md)
+- [0068 - Device sessions push full surface snapshots, and layouts are provider-registered descriptors](0068-device-sessions-and-layouts.md)
+- [0075 - Widget types, folder views and modals are provider-registered and served through one provider](0075-provider-registered-surfaces.md)
+- [0094 - Responsive layouts are chosen by the reader](0094-responsive-layouts-are-chosen-by-the-reader.md)
+- [0102 - First-fit layouts are chosen by measured text](0102-first-fit-layouts-are-chosen-by-measured-text.md)

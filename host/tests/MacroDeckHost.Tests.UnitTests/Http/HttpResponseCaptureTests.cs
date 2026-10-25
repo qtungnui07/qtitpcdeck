@@ -1,0 +1,250 @@
+using System.Text.Json;
+using MacroDeckHost.Integrations.Http;
+using MacroDeckHost.Integrations.Http.Actions;
+using MacroDeckHost.Integrations.Http.Protocol;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using Serilog;
+using Serilog.Core;
+using DomainVariableType = MacroDeckHost.Domain.Enums.VariableType;
+
+namespace MacroDeckHost.Tests.UnitTests.Http;
+
+[TestFixture]
+internal sealed class HttpResponseCaptureTests
+{
+	private ActionVariableTargets _targets = null!;
+	private HttpVariableAccessor _accessor = null!;
+
+	[SetUp]
+	public void SetUp()
+	{
+		_targets = new ActionVariableTargets(HttpIntegration.IntegrationId);
+		_accessor = new HttpVariableAccessor
+		{
+			Current = _targets.IntegrationVariables,
+			UserVariables = _targets.UserVariables
+		};
+	}
+
+	[TearDown]
+	public void TearDown()
+	{
+		_targets.Dispose();
+	}
+
+	[Test]
+	public async Task Every_reserved_token_resolves_to_its_documented_type_and_value()
+	{
+		var response = Snapshot(201, body: "{}", durationMs: 123, truncated: true);
+		var captures = new Dictionary<string, string>(StringComparer.Ordinal)
+		{
+			["status"] = "$status",
+			["ok"] = "$ok",
+			["dur"] = "$duration",
+			["body"] = "$body",
+			["trunc"] = "$truncated"
+		};
+
+		await HttpResponseCapture.ApplyAsync(_accessor, captures, response, true, SilentLogger());
+
+		await Assert.MultipleAsync(async () =>
+		{
+			Assert.That(await _targets.ValueOf("status"), Is.EqualTo(201m));
+			Assert.That(await _targets.ValueOf("ok"), Is.EqualTo(true));
+			Assert.That(await _targets.ValueOf("dur"), Is.EqualTo(123m));
+			Assert.That(await _targets.ValueOf("body"), Is.EqualTo("{}"));
+			Assert.That(await _targets.ValueOf("trunc"), Is.EqualTo(true));
+		});
+	}
+
+	[Test]
+	public async Task Headers_token_serializes_every_header()
+	{
+		var response = Snapshot(headers: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+		{
+			["Content-Type"] = "application/json",
+			["X-Rate-Limit"] = "60"
+		});
+
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["h"] = "$headers" },
+			response,
+			true,
+			SilentLogger());
+
+		var expected = JsonSerializer.Serialize(response.Headers);
+		Assert.That(await _targets.ValueOf("h"), Is.EqualTo(expected));
+	}
+
+	[Test]
+	public async Task A_single_header_lookup_is_case_insensitive()
+	{
+		var response = Snapshot(headers: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+		{
+			["Content-Type"] = "application/json"
+		});
+
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["ct"] = "$header:content-type" },
+			response,
+			true,
+			SilentLogger());
+
+		Assert.That(await _targets.ValueOf("ct"), Is.EqualTo("application/json"));
+	}
+
+	[Test]
+	public async Task An_absent_header_is_a_miss_and_does_not_fall_through_to_a_json_path()
+	{
+		var response = Snapshot(headers: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+			body: """{"x-missing":"should-never-be-used"}""");
+
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["v"] = "$header:x-missing" },
+			response,
+			true,
+			SilentLogger());
+
+		Assert.That(await _targets.Find("v"), Is.Null);
+	}
+
+	[TestCase("num", 7d)]
+	[TestCase("flag", true)]
+	[TestCase("str", "hi")]
+	public async Task A_json_path_selector_resolves_every_value_kind_through_to_the_variable(
+		string path,
+		object expectedValue)
+	{
+		var response = Snapshot(body: """{"num":7,"flag":true,"str":"hi"}""");
+
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["v"] = path },
+			response,
+			true,
+			SilentLogger());
+
+		Assert.That(await _targets.ValueOf("v"), Is.EqualTo(expectedValue));
+	}
+
+	[Test]
+	public async Task A_json_path_miss_writes_nothing()
+	{
+		var response = Snapshot(body: "{}");
+
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["v"] = "$.nonexistent" },
+			response,
+			true,
+			SilentLogger());
+
+		Assert.That(await _targets.Find("v"), Is.Null);
+	}
+
+	[Test]
+	public async Task A_non_json_body_still_writes_the_reserved_tokens()
+	{
+		var response = Snapshot(body: "not json at all", statusCode: 200);
+
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["status"] = "$status", ["body"] = "$body" },
+			response,
+			true,
+			SilentLogger());
+
+		await Assert.MultipleAsync(async () =>
+		{
+			Assert.That(await _targets.ValueOf("status"), Is.EqualTo(200m));
+			Assert.That(await _targets.ValueOf("body"), Is.EqualTo("not json at all"));
+		});
+	}
+
+	[TestCase("SWIT\n", "SWIT")]
+	[TestCase("SWIT\r\n", "SWIT")]
+	[TestCase("  SWIT \t", "SWIT")]
+	[TestCase("\uFEFFSWIT", "SWIT")]
+	[TestCase("\uFEFF SWIT\n", "SWIT")]
+	[TestCase(" \r\n ", "")]
+	[TestCase("line one\nline two\n", "line one\nline two")]
+	public async Task The_body_token_is_captured_without_surrounding_whitespace_or_a_byte_order_mark(
+		string body,
+		string expected)
+	{
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["body"] = "$body" },
+			Snapshot(body: body),
+			true,
+			SilentLogger());
+
+		Assert.That(await _targets.ValueOf("body"), Is.EqualTo(expected));
+	}
+
+	[Test]
+	public async Task The_body_token_fills_an_existing_number_variable_from_a_body_with_a_byte_order_mark_and_newline()
+	{
+		await _targets.CreateUserVariable("count", DomainVariableType.Numeric, 0m);
+
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["count"] = "$body" },
+			Snapshot(body: "\uFEFF42\n"),
+			true,
+			SilentLogger());
+
+		Assert.That(await _targets.ValueOf("count"), Is.EqualTo(42m));
+	}
+
+	[Test]
+	public async Task A_json_path_string_value_keeps_its_own_whitespace()
+	{
+		await HttpResponseCapture.ApplyAsync(_accessor,
+			new Dictionary<string, string>(StringComparer.Ordinal) { ["v"] = "name" },
+			Snapshot(body: """{"name":"SWIT\n"}"""),
+			true,
+			SilentLogger());
+
+		Assert.That(await _targets.ValueOf("v"), Is.EqualTo("SWIT\n"));
+	}
+
+	[Test]
+	public async Task A_transport_failure_writes_only_the_four_always_available_tokens_and_skips_json_paths()
+	{
+		var captures = new Dictionary<string, string>(StringComparer.Ordinal)
+		{
+			["status"] = "$status",
+			["ok"] = "$ok",
+			["dur"] = "$duration",
+			["body"] = "$body",
+			["path"] = "$.name"
+		};
+
+		await HttpResponseCapture.ApplyTransportFailureAsync(_accessor, captures, 55, SilentLogger());
+
+		await Assert.MultipleAsync(async () =>
+		{
+			Assert.That(await _targets.ValueOf("status"), Is.EqualTo(0m));
+			Assert.That(await _targets.ValueOf("ok"), Is.EqualTo(false));
+			Assert.That(await _targets.ValueOf("dur"), Is.EqualTo(55m));
+			Assert.That(await _targets.ValueOf("body"), Is.EqualTo(string.Empty));
+			Assert.That(await _targets.Find("path"), Is.Null);
+		});
+	}
+
+	private static Logger SilentLogger()
+	{
+		return new LoggerConfiguration().CreateLogger();
+	}
+
+	private static HttpResponseSnapshot Snapshot(
+		int statusCode = 200,
+		IReadOnlyDictionary<string, string>? headers = null,
+		string body = "{}",
+		bool truncated = false,
+		long durationMs = 10)
+	{
+		return new HttpResponseSnapshot(statusCode,
+			headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+			body,
+			truncated,
+			"application/json",
+			durationMs);
+	}
+}

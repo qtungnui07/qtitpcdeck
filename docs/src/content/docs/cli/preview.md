@@ -1,0 +1,113 @@
+---
+title: macrodeck-plugin preview
+description: Render a plugin's widget previews to PNG files without a running Macro Deck, for store images and release automation.
+---
+
+`macrodeck-plugin preview render` loads a plugin against a disposable stub host, opens every
+[`[UiPreview]`](/ui/views/developer-preview/) scenario, draws it with the same UI runtime the web client uses, and
+writes one PNG per scenario and size. It needs no running Macro Deck and no sign-in, so it also runs in CI.
+
+## Examples
+
+```bash
+macrodeck-plugin preview render --project src/DeviceBatteryInfo \
+  --cells 1x1 --cells 2x1 --cells 2x2 \
+  --scale 2 --theme dark --background transparent \
+  --output artifacts/previews
+```
+
+```text
+Wrote artifacts/previews/battery-tile-120x120.png
+Wrote artifacts/previews/battery-tile-252x120.png
+Wrote artifacts/previews/battery-tile-252x252.png
+Rendered 3 image(s) to artifacts/previews.
+```
+
+Every scenario at three deck sizes, at twice the resolution, with transparent corners.
+
+```bash
+macrodeck-plugin preview render --project src/DeviceBatteryInfo --cells 1x1 --cells 2x1 --preview "Low battery"
+```
+
+One scenario at deck sizes: a cell is 120 px with a 12 px gap, so `2x1` is 252 by 120 px.
+
+## What it draws
+
+Only widget previews, drawn as a tile on the deck is. With `--cells`, the widget is laid out across that many
+120 px cells, so a [`UiResponsive`](/ui/components/responsive/) sees a `2x2` tile as two cells wide and two
+tall, and the corners and the tile border keep the size of one cell. A `--size` is always one tile: its shorter
+side is one cell and the rest is scaled with it, whatever the aspect, so a size that is not a whole number of
+cells still looks like a tile. Use `--cells` for a layout meant for a square tile of more than one cell.
+Configuration views, such as an action editor or a configuration flow, are drawn by the desktop app and are
+skipped with a `preview-unsupported` warning. A skipped preview does not fail the run.
+
+Text from the plugin's own localization catalog is drawn in the `--locale` language. When the catalog cannot be
+read, the run continues with a `preview-localization-unavailable` warning and the plugin's strings show as
+placeholders.
+
+## Video streams
+
+A preview has no running host and so no live video. A video stream component is left empty, which shows only what
+the widget draws behind it. Pass `--video-stream-image <file>` to draw that image in every video stream instead, framed
+by the component's own `fit`: `contain` keeps the whole picture and `cover` fills the component. Space left by `contain`
+stays transparent, so the widget's own background shows. A bad path, an unsupported type, a file whose content is not the
+image its extension claims, or one over 8 MB is a usage error with the code `invalid-video-stream-image`.
+
+```bash
+macrodeck-plugin preview render --project src/PrinterStatus --cells 2x1 --video-stream-image assets/camera.png
+```
+
+The image is the tile: its background and rounded corners are part of the picture. `--background` is what shows
+behind the corners.
+
+## Options
+
+Pick exactly one of `--project`, `--executable` or `--artifact`, as for [`run`](/cli/run/) and
+[`test`](/cli/test/).
+
+| Option | Meaning |
+| --- | --- |
+| `--size <W>x<H>` | A size in pixels, drawn as one tile whose shorter side is one cell. Repeatable. Defaults to one deck cell, `120x120`. |
+| `--cells <C>x<R>` | A size in deck cells. Repeatable, and combinable with `--size`. |
+| `--preview <name>` | Only the scenario with this name or id. Repeatable. Defaults to every scenario. An unknown name is a usage error. |
+| `--scale <n>` | Device pixels per pixel, greater than 0 and at most 8. Defaults to `2`, so `200x200` is a 400 by 400 image. |
+| `--theme dark\|light` | Defaults to `dark`. |
+| `--background <color>` | `transparent` (the default), a color name or a `#hex` color. |
+| `--radius <px>` | The tile's corner radius in the 120 px reference cell, scaled with the cell size as on the deck. Defaults to `22`, the deck's default. |
+| `--locale <culture>` | The culture dates and numbers are formatted in, and the language of the plugin's own text. Plugin text falls back to the plugin's default language when it has no resources for the culture. Defaults to `en-US`. |
+| `--video-stream-image <file>` | A PNG, JPEG or WebP of up to 8 MB, drawn in place of every video stream. See [Video streams](#video-streams). |
+| `--output <dir>` | Where the files go. Defaults to `./previews`. |
+| `--browser <path>` | The browser to use, see below. |
+
+A scenario is a static method with no access to the tile, so `--radius` only shapes the tile's corners. A
+widget's own safe area comes from its own padding.
+
+Files are named `<scenario>-<width>x<height>.png`, in lower case. When two views declare a scenario with the
+same name, both files are prefixed with their view name.
+
+The clock is fixed, so time-based components draw the same on every run.
+
+## The browser
+
+The pixels come from a locally installed Chrome, Chromium or Edge, which the tool starts headless with a
+throwaway profile. Nothing is downloaded. It looks, in order, at `--browser`, the `MACRODECK_BROWSER`
+environment variable, the usual install locations, and your `PATH`. If none is found the command exits with
+`browser-not-found`.
+
+Text is drawn with the fonts installed on the machine, so an image made on a CI runner can differ from one made
+on your computer. Render on the same kind of machine every time when the images need to match.
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Every selected preview was rendered or skipped, or the plugin declares no previews. |
+| 1 | A scenario could not be built or drawn. The other images are still written. |
+| 2 | Usage error: a bad size, scale, radius, background, theme or `--video-stream-image`, no or several subject selectors, or an unknown `--preview`. |
+| 3 | The plugin could not be launched or built, or no browser was found. |
+| 4 | Cancelled (Ctrl-C). |
+
+## See also
+
+- [Developer previews](/ui/views/developer-preview/) - writing the scenarios this command renders
+- [`run`](/cli/run/) - the same stub host, with the plugin's output streamed

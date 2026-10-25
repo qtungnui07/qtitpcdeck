@@ -1,0 +1,71 @@
+using MacroDeck.Sdk.Actions;
+using MacroDeck.Localization;
+using MacroDeckHost.Integrations.Keyboard.Models;
+using MacroDeckHost.Integrations.Keyboard.Native;
+using MacroDeckHost.Localization;
+
+namespace MacroDeckHost.Integrations.Keyboard.Actions;
+
+internal sealed class KeyDownActionDefinition : IActionDefinition
+{
+	private readonly IKeyboardInputService _input;
+	private readonly IKeyboardLayoutService _layout;
+
+	public KeyDownActionDefinition(IKeyboardInputService input, IKeyboardLayoutService layout)
+	{
+		_input = input;
+		_layout = layout;
+	}
+
+	public string Id => "key-down";
+	public LocalizedText Name => AppStrings.Integrations.Keyboard.Actions.KeyDownName();
+	public LocalizedText Description => AppStrings.Integrations.Keyboard.Actions.KeyDownDescription();
+
+	public IReadOnlyList<ActionParameter> Parameters { get; } =
+	[
+		ActionParameter.KeyboardCombo("keys",
+			AppStrings.Integrations.Keyboard.Actions.KeyParameterLabel(),
+			AppStrings.Integrations.Keyboard.Actions.KeyDownParameterDescription(),
+			true),
+		.. KeyboardTargetParameters.Hold
+	];
+
+	public IActionExecutor CreateExecutor()
+	{
+		return new Executor(_input, _layout);
+	}
+
+	private sealed class Executor : IActionExecutor
+	{
+		private readonly IKeyboardInputService _input;
+		private readonly IKeyboardLayoutService _layout;
+
+		public Executor(IKeyboardInputService input, IKeyboardLayoutService layout)
+		{
+			_input = input;
+			_layout = layout;
+		}
+
+		public async Task<ActionResult> ExecuteAsync(ActionExecutionContext context)
+		{
+			var (modifierNames, keyName) = KeyboardActionValues.ReadHotkey(context.Parameters, "keys");
+			var modifiers = _layout.ResolveModifiers(modifierNames);
+			var key = KeyboardActionValues.ResolveKey(_layout, keyName);
+			if (key == KeyCode.None && modifiers == KeyModifier.None)
+			{
+				return ActionResult.Success();
+			}
+
+			var target = KeyboardActionValues.ReadTarget(context.Parameters);
+			if (target.Mode == KeyboardTargetMode.FocusThenSend)
+			{
+				target = target with { Mode = KeyboardTargetMode.WhenFocused };
+			}
+
+			var unavailable = await _input.KeyDownAsync(modifiers, key, target, context.CancellationToken);
+			return unavailable is null
+				? ActionResult.Success()
+				: KeyboardActionValues.SessionUnavailableResult(unavailable);
+		}
+	}
+}

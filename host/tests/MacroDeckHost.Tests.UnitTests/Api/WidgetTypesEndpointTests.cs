@@ -1,0 +1,293 @@
+using MacroDeck.Localization;
+using MacroDeck.Sdk;
+using MacroDeck.Sdk.Actions;
+using MacroDeck.Sdk.Widgets;
+using MacroDeck.Ui.Model.Versioning;
+using MacroDeckHost.Api.Controllers;
+using MacroDeckHost.Application.Events;
+using MacroDeckHost.Application.Events.Handlers;
+using MacroDeckHost.Application.Integrations;
+using MacroDeckHost.Application.Ui.Handlers;
+using MacroDeckHost.Application.Ui.Transport;
+using MacroDeckHost.Application.Ui.Transport.Messages.Widgets;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Domain.Widgets;
+
+namespace MacroDeckHost.Tests.UnitTests.Api;
+
+/// <summary>
+/// <c>GET /api/widgets/types</c> (issue #837): what a client needs to decide whether it can offer a
+/// widget's configuration as a Macro Deck UI tree, or has to fall back to its own editor.
+/// </summary>
+[TestFixture]
+public class WidgetTypesEndpointTests
+{
+	private static WidgetsController CreateController(
+		IUiTransportMessageHandler<GetWidgetTypesRequest, GetWidgetTypesResponse> handler)
+	{
+		return new WidgetsController(null!,
+			null!,
+			null!,
+			null!,
+			null!,
+			null!,
+			null!,
+			null!,
+			null!,
+			handler,
+			null!,
+			null!,
+			null!,
+			null!,
+			null!,
+			null!);
+	}
+
+	[Test]
+	public async Task GetTypes_returns_one_entry_per_registered_type_carrying_its_id_and_isBuiltIn()
+	{
+		var registry = new FakeWidgetTypeRegistry(new WidgetTypeCatalogEntry(WidgetTypeIds.Weather,
+				string.Empty,
+				new WidgetTypeDescriptor(WidgetTypeIds.Weather, LocalizedText.FromLiteral("Weather"))),
+			new WidgetTypeCatalogEntry("com.example::gauge",
+				"com.example",
+				new WidgetTypeDescriptor("gauge", LocalizedText.FromLiteral("Gauge"))));
+		var controller
+			= CreateController(new GetWidgetTypesRequestMessageHandler(registry, new FakeIntegrationRegistry()));
+
+		var response = await controller.GetTypes(CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Success, Is.True);
+			Assert.That(response.Types, Has.Count.EqualTo(2));
+
+			var weather = response.Types.Single(type => type.Id == WidgetTypeIds.Weather);
+			Assert.That(weather.IsBuiltIn, Is.True);
+
+			var gauge = response.Types.Single(type => type.Id == "com.example::gauge");
+			Assert.That(gauge.IsBuiltIn, Is.False);
+		});
+	}
+
+	[Test]
+	public async Task GetTypes_reports_supportsConfigUi_and_the_current_model_version_only_where_it_is_set()
+	{
+		var registry = new FakeWidgetTypeRegistry(new WidgetTypeCatalogEntry(WidgetTypeIds.Weather,
+				string.Empty,
+				new WidgetTypeDescriptor(WidgetTypeIds.Weather,
+					LocalizedText.FromLiteral("Weather"),
+					HasConfiguration: true,
+					DataSchema: "{}")),
+			new WidgetTypeCatalogEntry(WidgetTypeIds.Clock,
+				string.Empty,
+				new WidgetTypeDescriptor(WidgetTypeIds.Clock, LocalizedText.FromLiteral("Clock"))));
+		var controller
+			= CreateController(new GetWidgetTypesRequestMessageHandler(registry, new FakeIntegrationRegistry()));
+
+		var response = await controller.GetTypes(CancellationToken.None);
+
+		var weather = response.Types.Single(type => type.Id == WidgetTypeIds.Weather);
+		var clock = response.Types.Single(type => type.Id == WidgetTypeIds.Clock);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(weather.SupportsConfigUi, Is.True);
+			Assert.That(weather.ConfigUiModelVersion,
+				Is.EqualTo(UiModelVersions.Current),
+				"a type that supports a config tree must report the current UI model major, not a literal");
+			Assert.That(clock.SupportsConfigUi, Is.False);
+			Assert.That(clock.ConfigUiModelVersion,
+				Is.Zero,
+				"the version is only meaningful once supportsConfigUi is set");
+		});
+	}
+
+	[Test]
+	public async Task GetTypes_includes_a_provider_contributed_type_alongside_the_built_ins()
+	{
+		var registry = new FakeWidgetTypeRegistry(new WidgetTypeCatalogEntry(WidgetTypeIds.ActionButton,
+				string.Empty,
+				new WidgetTypeDescriptor(WidgetTypeIds.ActionButton, LocalizedText.FromLiteral("Action Button"))),
+			new WidgetTypeCatalogEntry("com.example.gauges::gauge",
+				"com.example.gauges",
+				new WidgetTypeDescriptor("gauge", LocalizedText.FromLiteral("Gauge"))));
+		var controller
+			= CreateController(new GetWidgetTypesRequestMessageHandler(registry, new FakeIntegrationRegistry()));
+
+		var response = await controller.GetTypes(CancellationToken.None);
+
+		var gauge = response.Types.Single(type => type.Id == "com.example.gauges::gauge");
+		Assert.Multiple(() =>
+		{
+			Assert.That(gauge.ProviderId, Is.EqualTo("com.example.gauges"));
+			Assert.That(gauge.IsBuiltIn, Is.False);
+			Assert.That(response.Types.Any(type => type.Id == WidgetTypeIds.ActionButton), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task GetTypes_names_the_integration_behind_a_provided_type_and_none_for_a_built_in()
+	{
+		var integrations = new FakeIntegrationRegistry();
+		integrations.Add(new FakeIntegration { Id = "com.example.gauges" });
+		var registry = new FakeWidgetTypeRegistry(new WidgetTypeCatalogEntry(WidgetTypeIds.Clock,
+				string.Empty,
+				new WidgetTypeDescriptor(WidgetTypeIds.Clock, LocalizedText.FromLiteral("Clock"))),
+			new WidgetTypeCatalogEntry("com.example.gauges::gauge",
+				"com.example.gauges",
+				new WidgetTypeDescriptor("gauge", LocalizedText.FromLiteral("Gauge"))),
+			new WidgetTypeCatalogEntry("com.example.orphan::dial",
+				"com.example.orphan",
+				new WidgetTypeDescriptor("dial", LocalizedText.FromLiteral("Dial"))));
+		var controller = CreateController(new GetWidgetTypesRequestMessageHandler(registry, integrations));
+
+		var response = await controller.GetTypes(CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Types.Single(type => type.Id == "com.example.gauges::gauge").ProviderName,
+				Is.EqualTo((LocalizedText)"Test Integration"));
+			Assert.That(response.Types.Single(type => type.Id == WidgetTypeIds.Clock).ProviderName.IsEmpty, Is.True);
+			Assert.That(response.Types.Single(type => type.Id == "com.example.orphan::dial").ProviderName,
+				Is.EqualTo((LocalizedText)"com.example.orphan"),
+				"a provider the integration registry does not know still gets a label rather than none");
+		});
+	}
+
+	[Test]
+	public async Task GetTypes_marks_only_a_type_a_plugin_provides_as_plugin_provided()
+	{
+		var integrations = new FakeIntegrationRegistry();
+		await integrations.RegisterAsync(new FakeIntegration { Id = "com.example.gauges" }, IntegrationOrigin.Plugin);
+		await integrations.RegisterAsync(new FakeIntegration { Id = "app.macro-deck.calendar" });
+		var registry = new FakeWidgetTypeRegistry(new WidgetTypeCatalogEntry(WidgetTypeIds.Clock,
+				string.Empty,
+				new WidgetTypeDescriptor(WidgetTypeIds.Clock, LocalizedText.FromLiteral("Clock"))),
+			new WidgetTypeCatalogEntry("com.example.gauges::gauge",
+				"com.example.gauges",
+				new WidgetTypeDescriptor("gauge", LocalizedText.FromLiteral("Gauge"))),
+			new WidgetTypeCatalogEntry("app.macro-deck.calendar::calendar",
+				"app.macro-deck.calendar",
+				new WidgetTypeDescriptor("calendar", LocalizedText.FromLiteral("Calendar"))));
+		var controller = CreateController(new GetWidgetTypesRequestMessageHandler(registry, integrations));
+
+		var response = await controller.GetTypes(CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.Types.Single(type => type.Id == "com.example.gauges::gauge").IsPluginProvided,
+				Is.True);
+			Assert.That(response.Types.Single(type => type.Id == "app.macro-deck.calendar::calendar").IsPluginProvided,
+				Is.False,
+				"a type of one of the host's own integrations is not a plugin's");
+			Assert.That(response.Types.Single(type => type.Id == "app.macro-deck.calendar::calendar").ProviderName,
+				Is.EqualTo((LocalizedText)"Test Integration"),
+				"the provider is still named, so a search can find it");
+			Assert.That(response.Types.Single(type => type.Id == WidgetTypeIds.Clock).IsPluginProvided, Is.False);
+		});
+	}
+
+	[Test]
+	public async Task GetTypes_prefers_the_name_the_widget_type_provider_gives_itself_over_the_integration_name()
+	{
+		var integrations = new FakeIntegrationRegistry();
+		integrations.Add(new NamedWidgetTypeProviderIntegration());
+		var registry = new FakeWidgetTypeRegistry(new WidgetTypeCatalogEntry("com.example.home::sensor",
+			"com.example.home",
+			new WidgetTypeDescriptor("sensor", LocalizedText.FromLiteral("Sensor"))));
+		var controller = CreateController(new GetWidgetTypesRequestMessageHandler(registry, integrations));
+
+		var response = await controller.GetTypes(CancellationToken.None);
+
+		Assert.That(response.Types.Single().ProviderName, Is.EqualTo((LocalizedText)"Home Assistant"));
+	}
+
+	[Test]
+	public async Task The_live_catalog_update_names_the_integration_the_same_way_as_the_endpoint()
+	{
+		var integrations = new FakeIntegrationRegistry();
+		integrations.Add(new FakeIntegration { Id = "com.example.gauges" });
+		var registry = new FakeWidgetTypeRegistry(new WidgetTypeCatalogEntry("com.example.gauges::gauge",
+			"com.example.gauges",
+			new WidgetTypeDescriptor("gauge", LocalizedText.FromLiteral("Gauge"))));
+		var transport = new Auth.RecordingUiTransport();
+
+		await new WidgetTypeCatalogChangedNotificationHandler(registry, transport, integrations)
+			.Handle(new WidgetTypeCatalogChangedNotification(), CancellationToken.None);
+
+		var evt = transport.Sent.OfType<WidgetTypeCatalogChangedEvent>().Single();
+		Assert.That(evt.Types.Single().ProviderName, Is.EqualTo((LocalizedText)"Test Integration"));
+	}
+
+	private sealed class NamedWidgetTypeProviderIntegration : IIntegration, IWidgetTypeProvider
+	{
+		public string Id => "com.example.home";
+		public LocalizedText Name => "Home Integration";
+		public string Version => "1.0.0";
+		public IReadOnlyList<IActionDefinition> Actions => [];
+		public bool IsInitialized => true;
+		public string ProviderName => "Home Assistant";
+
+		public Task InitializeAsync(IIntegrationContext context)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task InitializeAsync(IWidgetTypeProviderContext context, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task ShutdownAsync()
+		{
+			return Task.CompletedTask;
+		}
+	}
+
+	private sealed class FakeWidgetTypeRegistry : IWidgetTypeRegistry
+	{
+		private readonly List<WidgetTypeCatalogEntry> _entries;
+
+		public FakeWidgetTypeRegistry(params WidgetTypeCatalogEntry[] entries)
+		{
+			_entries = [.. entries];
+		}
+
+		public IReadOnlyList<WidgetTypeCatalogEntry> All => _entries;
+
+		public bool IsRegistered(string? id)
+		{
+			return _entries.Any(entry => entry.WidgetTypeId == id);
+		}
+
+		public string? Resolve(string? spelling)
+		{
+			return _entries.FirstOrDefault(entry => entry.WidgetTypeId == spelling)?.WidgetTypeId;
+		}
+
+		public bool TryResolve(string? widgetTypeId, out WidgetTypeCatalogEntry entry)
+		{
+			entry = _entries.FirstOrDefault(candidate => candidate.WidgetTypeId == widgetTypeId)!;
+			return entry is not null;
+		}
+
+		public Task<WidgetTypeRegistration> Register(
+			string ownerId,
+			WidgetTypeDescriptor widgetType,
+			CancellationToken cancellationToken = default)
+		{
+			throw new NotSupportedException("This endpoint only reads the catalog.");
+		}
+
+		public Task Unregister(string ownerId, string localId, CancellationToken cancellationToken = default)
+		{
+			throw new NotSupportedException("This endpoint only reads the catalog.");
+		}
+
+		public Task UnregisterAll(string ownerId, CancellationToken cancellationToken = default)
+		{
+			throw new NotSupportedException("This endpoint only reads the catalog.");
+		}
+	}
+}

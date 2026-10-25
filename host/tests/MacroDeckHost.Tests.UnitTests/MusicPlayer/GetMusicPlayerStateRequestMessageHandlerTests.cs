@@ -1,0 +1,211 @@
+using MacroDeckHost.Application.MusicPlayer;
+using MacroDeckHost.Application.Ui.Handlers;
+using MacroDeckHost.Application.Ui.Transport.Messages.MusicPlayer;
+using MacroDeck.Sdk.MusicPlayer;
+
+namespace MacroDeckHost.Tests.UnitTests.MusicPlayer;
+
+[TestFixture]
+internal sealed class GetMusicPlayerStateRequestMessageHandlerTests
+{
+	private const string InstanceId = "spotify::a";
+
+	[Test]
+	public async Task Handle_WhenTheProviderHangs_AnswersImmediatelyFromTheCache()
+	{
+		var player = new HangingMusicPlayer();
+		var cache = new MusicPlayerStateCache();
+		cache.Record(InstanceId, new MusicPlayerStatePayload { InstanceId = InstanceId, IsConnected = true });
+		var handler = new GetMusicPlayerStateRequestMessageHandler(new StubRegistry(InstanceId, player), cache);
+
+		var handle = handler.Handle(new GetMusicPlayerStateRequest { InstanceId = InstanceId }, CancellationToken.None);
+
+		Assert.That(handle.IsCompleted, Is.True, "the handler must not await the provider");
+
+		var response = await handle;
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.State?.IsConnected, Is.True);
+			Assert.That(response.State?.InstanceId, Is.EqualTo(InstanceId));
+			Assert.That(player.WasRead, Is.False, "the handler must not read through to the provider");
+		});
+	}
+
+	[Test]
+	public async Task Handle_WhenTheInstanceHasNotBeenPolledYet_AnswersUnknownRatherThanDisconnected()
+	{
+		var handler = new GetMusicPlayerStateRequestMessageHandler(
+			new StubRegistry(InstanceId, new HangingMusicPlayer()),
+			new MusicPlayerStateCache());
+
+		var response = await handler.Handle(new GetMusicPlayerStateRequest { InstanceId = InstanceId },
+			CancellationToken.None);
+
+		Assert.That(response.State, Is.Null);
+	}
+
+	[Test]
+	public async Task Handle_WhenTheInstanceIsUnknown_AnswersDisconnected()
+	{
+		var handler = new GetMusicPlayerStateRequestMessageHandler(new StubRegistry(InstanceId, null),
+			new MusicPlayerStateCache());
+
+		var response = await handler.Handle(new GetMusicPlayerStateRequest { InstanceId = "spotify::gone" },
+			CancellationToken.None);
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(response.State, Is.Not.Null);
+			Assert.That(response.State?.IsConnected, Is.False);
+			Assert.That(response.State?.InstanceId, Is.EqualTo("spotify::gone"));
+		});
+	}
+
+	[Test]
+	public async Task Handle_WithoutAnInstanceId_FallsBackToTheFirstInstance()
+	{
+		var cache = new MusicPlayerStateCache();
+		cache.Record(InstanceId, new MusicPlayerStatePayload { InstanceId = InstanceId, IsConnected = true });
+		var handler = new GetMusicPlayerStateRequestMessageHandler(
+			new StubRegistry(InstanceId, new HangingMusicPlayer()),
+			cache);
+
+		var response = await handler.Handle(new GetMusicPlayerStateRequest(), CancellationToken.None);
+
+		Assert.That(response.State?.InstanceId, Is.EqualTo(InstanceId));
+	}
+
+	[Test]
+	public async Task Handle_WithoutAnInstanceId_FollowsThePlayerThatLastStartedPlaying()
+	{
+		const string second = "sinusbot::b";
+		var cache = new MusicPlayerStateCache();
+		cache.Record(InstanceId, new MusicPlayerStatePayload { InstanceId = InstanceId, IsConnected = true });
+		cache.Record(second, new MusicPlayerStatePayload { InstanceId = second, IsConnected = true, IsPlaying = true });
+		var handler = new GetMusicPlayerStateRequestMessageHandler(
+			new StubRegistry(InstanceId, new HangingMusicPlayer(), second),
+			cache);
+
+		var response = await handler.Handle(new GetMusicPlayerStateRequest(), CancellationToken.None);
+
+		Assert.That(response.State?.InstanceId, Is.EqualTo(second));
+	}
+
+	[Test]
+	public void Forget_DropsInstancesThatAreNoLongerRegistered()
+	{
+		var cache = new MusicPlayerStateCache();
+		cache.Record(InstanceId, new MusicPlayerStatePayload { InstanceId = InstanceId });
+		cache.Record("sinusbot::b", new MusicPlayerStatePayload { InstanceId = "sinusbot::b" });
+
+		cache.Forget(new HashSet<string>(StringComparer.Ordinal) { InstanceId });
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(cache.GetState(InstanceId), Is.Not.Null);
+			Assert.That(cache.GetState("sinusbot::b"), Is.Null);
+		});
+	}
+
+	private sealed class StubRegistry : IMusicPlayerRegistry
+	{
+		private readonly string _instanceId;
+		private readonly IMusicPlayer? _player;
+		private readonly string? _secondInstanceId;
+
+		public StubRegistry(string instanceId, IMusicPlayer? player, string? secondInstanceId = null)
+		{
+			_instanceId = instanceId;
+			_player = player;
+			_secondInstanceId = secondInstanceId;
+		}
+
+		public IReadOnlyList<MusicPlayerInstanceDescriptor> GetInstances()
+		{
+			return
+			[
+				new MusicPlayerInstanceDescriptor(_instanceId, "spotify", "Spotify", "Spotify", false),
+				.. _secondInstanceId is null
+					? []
+					: new MusicPlayerInstanceDescriptor[]
+						{ new(_secondInstanceId, "sinusbot", "SinusBot", "SinusBot", false) }
+			];
+		}
+
+		public IMusicPlayer? GetPlayer(string instanceId)
+		{
+			return instanceId == _instanceId || instanceId == _secondInstanceId ? _player : null;
+		}
+
+		public IMusicPlayer? GetPlayerWithOptions(string instanceId, IReadOnlyDictionary<string, object> options)
+		{
+			return GetPlayer(instanceId);
+		}
+
+		public IMusicPlayer? DefaultPlayer => _player;
+	}
+
+	private sealed class HangingMusicPlayer : IMusicPlayer
+	{
+		public bool WasRead { get; private set; }
+
+		public async Task<MusicPlayerState> GetStateAsync(CancellationToken cancellationToken = default)
+		{
+			WasRead = true;
+			await Task.Delay(Timeout.Infinite, cancellationToken);
+			return MusicPlayerState.Disconnected;
+		}
+
+		public Task<MusicPlayerArtwork?> GetArtworkAsync(
+			string artworkId,
+			CancellationToken cancellationToken = default)
+		{
+			return Task.FromResult<MusicPlayerArtwork?>(null);
+		}
+
+		public Task PlayAsync(CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task PauseAsync(CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task TogglePlayPauseAsync(CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task NextAsync(CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task PreviousAsync(CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task SeekAsync(TimeSpan position, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task SetVolumeAsync(int volumePercent, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task SetShuffleAsync(bool enabled, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+
+		public Task SetRepeatModeAsync(RepeatMode mode, CancellationToken cancellationToken = default)
+		{
+			return Task.CompletedTask;
+		}
+	}
+}

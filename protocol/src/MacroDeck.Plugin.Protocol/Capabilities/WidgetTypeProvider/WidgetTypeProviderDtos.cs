@@ -1,0 +1,72 @@
+using MacroDeck.Localization;
+
+namespace MacroDeck.Plugin.Protocol.Capabilities.WidgetTypeProvider;
+
+/// <summary>
+/// Mirrors the SDK's <c>WidgetTypeDescriptor</c>.
+/// </summary>
+public sealed record WidgetTypeDescriptorDto
+{
+	/// <summary>The provider-local widget type id. The host qualifies it with the owning plugin.</summary>
+	public required string Id { get; init; }
+
+	public required LocalizedText Name { get; init; }
+
+	public LocalizedText? Description { get; init; }
+
+	/// <summary>The stored configuration a newly added widget of this type starts with, as JSON object
+	/// text. Absent reads as <c>{}</c>.</summary>
+	public string? DefaultData { get; init; }
+
+	/// <summary>A JSON Schema for the widget's stored data, as JSON text. Required when
+	/// <see cref="HasConfiguration" /> is true.</summary>
+	public string? DataSchema { get; init; }
+
+	/// <summary>Whether the provider serves a <c>widget-config</c> configuration surface for this
+	/// type.</summary>
+	public bool HasConfiguration { get; init; }
+
+	/// <summary>Whether the host runs the widget's stored <c>flows</c> when its tile is pressed. Absent reads
+	/// as false.</summary>
+	public bool SupportsFlows { get; init; }
+
+	/// <summary>The standard appearance properties the type draws besides the border, as
+	/// <c>MacroDeck.Sdk.Widgets.WidgetAppearanceProperty</c> values in plain ints. Absent reads as border
+	/// only.</summary>
+	public IReadOnlyList<int>? AppearanceProperties { get; init; }
+
+	/// <summary>The provider's own action the host runs on an unconfigured short press. Absent reads as
+	/// none.</summary>
+	public WidgetDefaultActionDto? DefaultShortPressAction { get; init; }
+
+	public IReadOnlyDictionary<string, string>? Metadata { get; init; }
+}
+
+/// <summary>
+/// Mirrors the SDK's <c>WidgetDefaultAction</c>.
+/// </summary>
+public sealed record WidgetDefaultActionDto
+{
+	/// <summary>The id of an action the same plugin declares.</summary>
+	public required string ActionId { get; init; }
+
+	/// <summary>Parameter values by parameter name, as text. Absent reads as none.</summary>
+	public IReadOnlyDictionary<string, string>? Parameters { get; init; }
+}
+
+/// <summary>Result of the <c>describe</c> operation.</summary>
+public sealed record WidgetTypeProviderDescribePayload
+{
+	/// <summary>Human-readable provider name. Empty means the plugin's manifest name is used
+	/// instead.</summary>
+	public string ProviderName { get; init; } = string.Empty;
+
+	public IReadOnlyList<WidgetTypeDescriptorDto> WidgetTypes { get; init; } = [];
+}
+
+/// <summary>Result of the <c>widget-types</c> operation: the provider's current catalog, which the host
+/// reads to recover its catalog after a reconnect.</summary>
+public sealed record WidgetTypeProviderWidgetTypesResult
+{
+	public IReadOnlyList<WidgetTypeDescriptorDto> WidgetTypes { get; init; } = [];
+}

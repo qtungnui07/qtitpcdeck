@@ -1,0 +1,141 @@
+@use '../../../../styles/index' as ds;
+
+.ni-row {
+  @include ds.interactive-row;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+
+  &:focus-visible {
+    @include ds.focus-ring;
+  }
+}
+
+.ni-severity {
+  @include ds.badge;
+  flex-shrink: 0;
+  padding: var(--space-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+
+  @include ds.issue-badge-severities;
+}
+
+.ni-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ni-title {
+  @include ds.truncate;
+  font-size: var(--text-md);
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+}
+
+.ni-message {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+  line-height: var(--leading-normal);
+}
+
+.ni-time {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.ni-source::before {
+  content: '\00b7';
+  margin-inline-end: var(--space-2);
+}
+
+.ni-source-name::before {
+  content: '\00b7';
+  margin-inline: var(--space-1);
+}
+
+.ni-unread-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-inline-end: var(--space-2);
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+
+// Same visual language as shared/components/import-progress: 4px bar, accent fill, indeterminate
+// slide. Copied rather than shared because the item stays a plain row, not that component.
+.ni-progress-bar {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-bg-tertiary);
+  overflow: hidden;
+}
+
+.ni-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--color-accent);
+  transition: width var(--transition-fast);
+}
+
+.ni-progress-bar.indeterminate::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  border-radius: inherit;
+  background: var(--color-accent);
+  animation: ni-progress-slide 1.2s ease-in-out infinite;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
+@keyframes ni-progress-slide {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(350%);
+  }
+}
+
+.ni-progress-label {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.ni-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+
+  &:empty {
+    display: none;
+  }
+}
+
+.ni-action {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ni-mark-read,
+.ni-dismiss {
+  flex-shrink: 0;
+  margin-block: calc(-1 * var(--space-2));
+}

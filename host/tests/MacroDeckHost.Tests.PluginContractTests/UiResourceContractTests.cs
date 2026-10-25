@@ -1,0 +1,280 @@
+using MacroDeck.Plugin.Hosting.Capabilities.Actions;
+using MacroDeck.Plugin.Hosting.Integrations.HostApis;
+using MacroDeck.Plugin.Protocol.Assets;
+using MacroDeck.Plugin.Protocol.Handshake;
+using MacroDeck.Plugin.Protocol.Errors;
+using MacroDeck.Plugin.Protocol.Limits;
+using MacroDeck.Plugin.Protocol.Versioning;
+using MacroDeck.Sdk.Ui;
+using MacroDeckHost.Application.FolderViews;
+using MacroDeckHost.Application.Layouts;
+using MacroDeckHost.Application.MusicPlayer;
+using MacroDeckHost.Application.ScreenSavers;
+using MacroDeckHost.Application.Ui.Modals;
+using MacroDeckHost.Application.Ui.Resources;
+using MacroDeckHost.Application.Widgets;
+using MacroDeckHost.Plugins.Capabilities.Callbacks;
+using MacroDeckHost.Tests.PluginContractTests.Harness;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace MacroDeckHost.Tests.PluginContractTests;
+
+/// <summary>
+/// A plugin registering images over the real wire: the SDK's registry uploads through the asset
+/// pipeline and registers through the host's callback router, and the bytes come back out of the same
+/// store the resource endpoint serves.
+/// </summary>
+[TestFixture]
+internal sealed class UiResourceContractTests : CapabilityContractFixture
+{
+	private UiResourceStore _store = null!;
+	private PluginUiResources _resources = null!;
+	private int _uiResourceCommits;
+	private readonly Dictionary<(string InstanceId, string ArtworkId), ArtworkImageResult> _artwork = new();
+
+	[SetUp]
+	public void UiResourceSetUp()
+	{
+		_store = new UiResourceStore();
+		_resources = new PluginUiResources(_store, AssetReceiver, SessionRegistry);
+		AssetReceiver.AssetCommitted += (_, e) =>
+		{
+			if (e.Kind == AssetKinds.UiResource)
+			{
+				Interlocked.Increment(ref _uiResourceCommits);
+			}
+		};
+
+		var services = new ServiceCollection().BuildServiceProvider();
+		var router = new PluginCallbackRouter(SessionRegistry,
+			Invoker,
+			services.GetRequiredService<IServiceScopeFactory>(),
+			Notifications,
+			new CallbackFakeDeckNavigator(),
+			new CallbackFakeScriptApi(),
+			new CallbackFakeWidgetApi(),
+			new CallbackFakeWidgetIconInvalidator(),
+			new CallbackFakeUserVariableApi(),
+			new CallbackFakeActionInteractions(),
+			new RecordingUiSessionSink(),
+			DeviceRegistry,
+			new LayoutRegistry(new RecordingMediator()),
+			new FolderViewRegistry(new RecordingMediator()),
+			new WidgetTypeRegistry(new RecordingMediator()),
+			new ScreenSaverRegistry(new RecordingMediator()),
+			new ModalInteractionCoordinator(TimeProvider.System),
+			new NullUiTransport(),
+			new HostCallbackThrottle(TimeProvider.System, 20, 10),
+			new CallbackFakeHostLockState(),
+			Serilog.Core.Logger.None,
+			uiResources: _resources,
+			musicPlayerArtwork: new StubArtworkService(_artwork));
+
+		HostInvokeHandler = (correlationId, payload, cancellationToken)
+			=> router.RouteAsync(PluginId, SessionId, correlationId, payload, cancellationToken);
+	}
+
+	[TearDown]
+	public void UiResourceTearDown()
+	{
+		_resources.Dispose();
+	}
+
+	[Test]
+	public async Task Fifty_images_registered_at_once_are_all_served_with_their_exact_bytes()
+	{
+		var registry = await ConnectPluginAsync();
+		var images = Enumerable.Range(0, 50).Select(index => Image(index, 4096)).ToArray();
+
+		var handles = await Task.WhenAll(images.Select((bytes, index)
+			=> registry.RegisterAsync($"photo-{index}", bytes, "image/jpeg")));
+
+		Assert.Multiple(() =>
+		{
+			for (var index = 0; index < images.Length; index++)
+			{
+				Assert.That(_store.TryGet(handles[index].ResourceId, out var served), Is.True);
+				Assert.That(served.Content.ToArray(), Is.EqualTo(images[index]), $"photo-{index}");
+				Assert.That(handles[index].ContentHash, Is.EqualTo(served.ContentHash));
+			}
+		});
+	}
+
+	[Test]
+	public async Task Registering_a_name_again_serves_the_new_bytes_and_unchanged_bytes_are_not_resent()
+	{
+		var registry = await ConnectPluginAsync();
+		var first = await registry.RegisterAsync("photo", Image(1, 100), "image/png");
+		var second = await registry.RegisterAsync("photo", Image(2, 100), "image/png");
+		var commitsBeforeRepeat = _uiResourceCommits;
+
+		var repeat = await registry.RegisterAsync("photo", Image(2, 100), "image/png");
+
+		_store.TryGet(second.ResourceId, out var served);
+		Assert.Multiple(() =>
+		{
+			Assert.That(second.ResourceId, Is.EqualTo(first.ResourceId));
+			Assert.That(second.ContentHash, Is.Not.EqualTo(first.ContentHash));
+			Assert.That(served.Content.ToArray(), Is.EqualTo(Image(2, 100)));
+			Assert.That(repeat, Is.EqualTo(second));
+			Assert.That(_uiResourceCommits, Is.EqualTo(commitsBeforeRepeat));
+		});
+	}
+
+	[Test]
+	public async Task A_plugin_over_its_quota_is_told_so()
+	{
+		var registry = await ConnectPluginAsync();
+		var fits = ProtocolLimits.MaxUiResourceBytesPerPlugin / ProtocolLimits.MaxUiResourceBytes;
+		for (var index = 0; index < fits; index++)
+		{
+			await registry.RegisterAsync($"photo-{index}",
+				Image(index, ProtocolLimits.MaxUiResourceBytes),
+				"image/png");
+		}
+
+		var exception
+			= Assert.ThrowsAsync<UiResourceException>(()
+				=> registry.RegisterAsync("one-more", Image(99, 10), "image/png"));
+
+		Assert.That(exception!.ErrorCode, Is.EqualTo(UiResourceErrorCode.QuotaExceeded));
+	}
+
+	[Test]
+	public async Task A_host_without_the_operation_is_reported_unsupported_before_any_bytes_are_sent()
+	{
+		HostInvokeHandler = (_, payload, _) => Task.FromResult(HostCallbackResult.Fail(
+			ProtocolErrorCodes.CapabilityUnsupported,
+			$"The '{payload.Api}' api has no operation '{payload.Operation}'."));
+		var registry = await ConnectPluginAsync();
+
+		var exception
+			= Assert.ThrowsAsync<UiResourceException>(()
+				=> registry.RegisterAsync("photo", Image(1, 100), "image/png"));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(exception!.ErrorCode, Is.EqualTo(UiResourceErrorCode.Unsupported));
+			Assert.That(_uiResourceCommits, Is.Zero);
+		});
+	}
+
+	[Test]
+	public async Task Another_players_artwork_is_registered_over_the_wire_and_served_with_its_exact_bytes()
+	{
+		var bytes = Image(7, 5000);
+		_artwork[("net.example.jukebox::default", "cover-1")] = new ArtworkImageResult(bytes, "image/webp", "\"e\"");
+		var registry = await ConnectPluginAsync();
+		var commitsBefore = _uiResourceCommits;
+
+		var handle = await registry.RegisterMusicPlayerArtworkAsync("cover", "net.example.jukebox::default", "cover-1");
+
+		Assert.That(handle, Is.Not.Null);
+		_store.TryGet(handle!.ResourceId, out var served);
+		Assert.Multiple(() =>
+		{
+			Assert.That(served.Content.ToArray(), Is.EqualTo(bytes));
+			Assert.That(handle.MediaType, Is.EqualTo("image/webp"));
+			Assert.That(handle.ContentHash, Is.EqualTo(served.ContentHash));
+			Assert.That(_uiResourceCommits,
+				Is.EqualTo(commitsBefore),
+				"the host fetched the artwork, nothing was uploaded");
+		});
+	}
+
+	[Test]
+	public async Task Artwork_the_host_does_not_have_is_null_over_the_wire()
+	{
+		var registry = await ConnectPluginAsync();
+
+		var handle = await registry.RegisterMusicPlayerArtworkAsync("cover", "net.example.jukebox::default", "missing");
+
+		Assert.That(handle, Is.Null);
+	}
+
+	[Test]
+	public async Task Artwork_a_ui_resource_cannot_be_is_a_permanent_failure_over_the_wire()
+	{
+		_artwork[("net.example.jukebox::default", "vector")]
+			= new ArtworkImageResult(Image(1, 100), "image/svg+xml", "\"e\"");
+		_artwork[("net.example.jukebox::default", "huge")] =
+			new ArtworkImageResult(Image(2, ProtocolLimits.MaxUiResourceBytes + 1), "image/png", "\"e\"");
+		var registry = await ConnectPluginAsync();
+
+		var svg = Assert.ThrowsAsync<UiResourceException>(()
+			=> registry.RegisterMusicPlayerArtworkAsync("cover", "net.example.jukebox::default", "vector"));
+		var huge = Assert.ThrowsAsync<UiResourceException>(()
+			=> registry.RegisterMusicPlayerArtworkAsync("cover", "net.example.jukebox::default", "huge"));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(svg!.ErrorCode, Is.EqualTo(UiResourceErrorCode.Failed));
+			Assert.That(svg.Message, Does.Contain("image/svg+xml"));
+			Assert.That(huge!.ErrorCode, Is.EqualTo(UiResourceErrorCode.Failed));
+		});
+	}
+
+	[Test]
+	public async Task A_host_without_the_artwork_operation_is_reported_unsupported()
+	{
+		HostInvokeHandler = (_, payload, _) => Task.FromResult(HostCallbackResult.Fail(
+			ProtocolErrorCodes.CapabilityUnsupported,
+			$"The '{payload.Api}' api has no operation '{payload.Operation}'."));
+		var registry = await ConnectPluginAsync();
+
+		var exception = Assert.ThrowsAsync<UiResourceException>(()
+			=> registry.RegisterMusicPlayerArtworkAsync("cover", "net.example.jukebox::default", "cover-1"));
+
+		Assert.That(exception!.ErrorCode, Is.EqualTo(UiResourceErrorCode.Unsupported));
+	}
+
+	private async Task<RemoteUiResourceRegistry> ConnectPluginAsync()
+	{
+		await ConnectAsync([new ActionsCapabilityHandler([new TestIntegration(new TestAction("show"))])],
+			[
+				new DeclaredCapability
+				{
+					Kind = CapabilityKinds.Actions, LocalId = "show",
+					VersionRange = new CapabilityVersionRange { Minimum = 1, Maximum = 1 }
+				}
+			],
+			[CapabilityKinds.Actions]);
+
+		return new RemoteUiResourceRegistry(CreatePluginHostInvoker(), AssetUploader);
+	}
+
+	private static byte[] Image(int seed, int length)
+	{
+		var bytes = new byte[length];
+		new Random(seed).NextBytes(bytes);
+		return bytes;
+	}
+
+	private sealed class StubArtworkService(
+		Dictionary<(string InstanceId, string ArtworkId), ArtworkImageResult> images)
+		: IMusicPlayerArtworkService
+	{
+		public string GetETag(string artworkId, int? size)
+		{
+			return "\"" + artworkId + "\"";
+		}
+
+		public Task<ArtworkImageResult?> GetImage(
+			string instanceId,
+			string artworkId,
+			int? size,
+			CancellationToken cancellationToken)
+		{
+			return Task.FromResult(images.GetValueOrDefault((instanceId, artworkId)));
+		}
+
+		public Task<ArtworkImageResult?> GetImage(
+			MusicPlayerVariant variant,
+			string artworkId,
+			int? size,
+			CancellationToken cancellationToken)
+		{
+			throw new NotSupportedException();
+		}
+	}
+}

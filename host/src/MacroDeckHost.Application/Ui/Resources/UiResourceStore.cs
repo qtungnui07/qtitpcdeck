@@ -1,0 +1,97 @@
+using System.Collections.Concurrent;
+using System.Text;
+using MacroDeck.Plugin.Protocol.Assets;
+using MacroDeck.Ui.Model.Identity;
+using MacroDeck.Ui.Model.Resources;
+using MacroDeckHost.Application.Plugins.IconPacks;
+
+namespace MacroDeckHost.Application.Ui.Resources;
+
+public sealed class UiResourceStore : IUiResourceStore
+{
+	private readonly ConcurrentDictionary<string, UiResourceContent> _resources =
+		new(StringComparer.Ordinal);
+
+	public UiResource Register(UiResourceRegistration registration)
+	{
+		ArgumentNullException.ThrowIfNull(registration);
+
+		var resourceId = $"{registration.OwnerId}.{registration.Name}";
+
+		// Plugin icon handles are served from the icon pack store under this owner; nothing may shadow them.
+		if (resourceId.StartsWith(PluginIconReferences.ResourceOwnerId + ".", StringComparison.Ordinal))
+		{
+			throw new ArgumentException($"'{PluginIconReferences.ResourceOwnerId}' is a reserved resource owner.",
+				nameof(registration));
+		}
+
+		if (!UiIdentifier.TryValidate(resourceId, out var error))
+		{
+			throw new ArgumentException($"'{resourceId}' is not a usable resource id. {error}",
+				nameof(registration));
+		}
+
+		var maxBytes = Math.Min(registration.MaxBytes, HostUiResourceLimits.MaxHostIconResourceBytes);
+		if (registration.Content.Length > maxBytes)
+		{
+			throw new ArgumentException(
+				$"The resource is {registration.Content.Length} bytes, over the " + $"{maxBytes} byte limit.",
+				nameof(registration));
+		}
+
+		var content = new UiResourceContent
+		{
+			Content = registration.Content,
+			MediaType = registration.MediaType,
+			ContentHash = HashOf(registration)
+		};
+
+		_resources[resourceId] = content;
+
+		return new UiResource
+		{
+			ResourceId = resourceId,
+			ContentHash = content.ContentHash,
+			MediaType = content.MediaType,
+			ByteLength = registration.Content.Length
+		};
+	}
+
+	internal static string HashOf(ReadOnlyMemory<byte> content, string? variation)
+	{
+		if (variation is null)
+		{
+			return AssetContentHash.Compute(content.Span);
+		}
+
+		var suffix = Encoding.UTF8.GetBytes("\n" + variation);
+		var combined = new byte[content.Length + suffix.Length];
+		content.Span.CopyTo(combined);
+		suffix.CopyTo(combined.AsSpan(content.Length));
+		return AssetContentHash.Compute(combined);
+	}
+
+	private static string HashOf(UiResourceRegistration registration)
+	{
+		return HashOf(registration.Content, registration.Variation);
+	}
+
+	public bool TryGet(string resourceId, out UiResourceContent content)
+	{
+		if (!string.IsNullOrEmpty(resourceId) && _resources.TryGetValue(resourceId, out var found))
+		{
+			content = found;
+
+			return true;
+		}
+
+		content = null!;
+
+		return false;
+	}
+
+	public bool Remove(string resourceId)
+	{
+		return !string.IsNullOrEmpty(resourceId) && _resources.TryRemove(resourceId, out _);
+	}
+}

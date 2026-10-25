@@ -1,0 +1,185 @@
+---
+title: Resources
+description: The resource handle a tree references instead of carrying bytes, and the limit that bounds what it can promise.
+---
+
+A tree never carries bytes. Register your artwork and reference the handle:
+
+```csharp
+new UiImage { Key = "icon", Source = UiValue.Of(handle), Size = 0.2 }
+```
+
+The handle carries a `resourceId`, and optionally a `contentHash`, `mediaType` and `byteLength`. Macro
+Deck serves the bytes and each client caches them by hash, so an icon shown by a hundred deck widgets is
+transferred once per client rather than embedded a hundred times. A plugin gets a handle for its own bytes
+from [`UiResources`](#registering-your-own-images), for an icon from its own bundled icon packs from
+[`GetPluginIconAsync`](#icons-from-your-bundled-icon-packs), and for any installed icon from
+[`GetIconAsync`](#icons-from-any-installed-icon-pack).
+
+Macro Deck's own icons need no resource at all: name one with [`ui.icon`](/ui/components/icon/) and every
+reader draws it from its own set.
+
+`UiButton.Source` takes the same handle for its backdrop, framed by `Fit`, `Zoom`, `OffsetX`, `OffsetY`
+and `Opacity`. Those are fractions and multipliers, not pixels or percentages: the scale is applied inside
+the translation, so an offset covers the same distance at any zoom.
+
+`Transition` says how a *change* of `Source` is drawn. `UiImageTransitions.Crossfade` holds the outgoing
+artwork until the incoming one has decoded and then reveals it over 220 ms, which is normative rather than
+a suggestion - two readers that chose their own timing would animate visibly differently. Leave it out and
+the new artwork simply replaces the old one, which is also what a reader that does not implement the key
+does.
+
+`Opacity`, `Brightness` and `Saturation` adjust the artwork itself. Reach for `Opacity` to let what is
+behind the artwork show through, and for the other two to change the artwork regardless of its ground -
+"the same picture, darker" is `Brightness`, not a lower opacity, because a half-transparent cover ends up
+looking like whatever sits behind it. Both are multipliers where absent means `1`, applied brightness
+first and then saturation; the saturation result is normative down to its luma coefficients, since two
+readers using different ones desaturate the same image to different greys.
+
+## Animated pictures
+
+A GIF or a WebP can move, and every reader plays it on the timeline the file states:
+
+- **Each frame shows for its own delay.** A delay of 10 ms or less shows for 100 ms, in GIF and WebP alike,
+  which is what every browser does.
+- **The file says how often it plays.** A GIF without a loop extension plays once, a GIF loop count of N plays
+  N + 1 times and 0 plays for ever; a WebP plays its loop count, 0 for ever. A picture that stops holds its
+  last frame.
+- **The timeline holds.** A frame that could not be drawn in time is skipped rather than shown late, so a
+  busy device, its refresh rate or a redraw of something else never slows a picture down or speeds it up.
+- **A picture starts at its first frame** when it starts being shown while no element of the reader shows
+  it: when its node first draws it, when `Source` changes to it, and when the deck comes back to its folder.
+- **The look never restarts it.** `Tint`, `Opacity`, `Brightness`, `Saturation`, `Zoom`, `OffsetX`,
+  `OffsetY` and `Fit` change how the picture is drawn, never where its play stands. A zoom large enough to
+  need a larger rendition of an icon loads another file, which a web reader shows as a new picture from its
+  first frame, and a browser engine that can only mask draws `Tint` on a second image with a play of its own.
+
+Whether a second element joins the play of a picture already on screen or starts its own is the reader's:
+the Companion app starts each one at its first frame, a web reader leaves it to its browser engine. The
+Companion app also plays an animated WebP on Android with the platform's own player, which follows the
+display rather than this timeline: after a stall it carries on rather than catching up, and before Android
+14 it shows frames of 10 ms or less at the display's rate. The files in
+[`ui-model/fixtures/animated-images`](https://github.com/Macro-Deck-App/Macro-Deck/tree/main/ui-model/fixtures/animated-images)
+pin these rules, with every frame composited.
+
+## Registering your own images
+
+```csharp
+public async Task InitializeAsync(IIntegrationContext context)
+{
+    _photo = await context.UiResources.RegisterAsync("photo", await File.ReadAllBytesAsync(path), "image/jpeg");
+}
+
+new UiImage { Key = "photo", Source = UiValue.Of(_photo) }
+```
+
+`IIntegrationContext.UiResources` turns bytes into a handle. Put the handle it returns into the tree, never
+one you build yourself: it carries the `contentHash` that makes clients fetch new bytes.
+
+- **Names** are yours: a letter or digit, then up to 63 letters, digits, hyphens or underscores. All
+  integrations in one plugin share them. Two plugins using the same name never collide.
+- **Registering a name again replaces its bytes.** The `resourceId` stays, the `contentHash` changes, so a
+  photo frame can show every picture under one name. Update the tree with the new handle and clients draw
+  the new picture; a client still holding the old hash is sent the current bytes without caching them.
+  Registering the same bytes under the same name again costs no upload.
+- **Media types** are `image/png`, `image/jpeg`, `image/webp` and `image/gif`. SVG is not accepted from a
+  plugin, the same rule as for icons a plugin supplies. PNG and JPEG are the safe choice for photos.
+- **Size.** One resource is at most `maxUiResourceBytes` (2 MiB). That limit is deliberate and applies per
+  resource: downscale camera photos before registering them. All of a plugin's resources together are at
+  most `maxUiResourceBytesPerPlugin` (48 MiB) and `maxUiResourcesPerPlugin` (1024); Macro Deck holds them in
+  memory, so a plugin at its quota costs up to 48 MiB. Older Macro Deck versions allowed 16 MiB and 256, so
+  read the quota from the protocol descriptor instead of assuming it. Over the quota, registration throws
+  `UiResourceException` with `QuotaExceeded` and the name keeps what it had. Free room with `RemoveAsync`;
+  removing a name that holds nothing is not an error.
+- **Lifetime.** Macro Deck keeps resources in memory, never on disk, for as long as the plugin session
+  lasts: through a reconnect that resumes it and through re-initialisation after a configuration change.
+  They are released when the session ends and are gone after Macro Deck restarts, when your integration is
+  initialised again on the new session. Register in `InitializeAsync`, or before you build the tree that
+  shows the image.
+- **Errors.** Argument problems (name, media type, empty or oversized content) are `ArgumentException`
+  before anything is sent. `UiResourceException.ErrorCode` is `Unsupported` on a Macro Deck that predates
+  resource registration, `QuotaExceeded`, `RateLimited`, or `Failed`, for example when the connection
+  dropped. Registrations run one at a time, so starting many at once is safe.
+
+A music player plugin can register its own player's cover in one call with
+[`GetArtworkAsUiResourceAsync`](/features/music-players/#showing-the-cover-in-your-own-ui), and the cover of
+any other player with
+[`RegisterMusicPlayerArtworkAsync`](/features/music-players/#showing-another-players-cover). Give that call
+the size the cover is shown at (`maxSize`) and Macro Deck registers its 128 or 256 pixel copy instead of the
+full-size cover, which saves quota; a Macro Deck that predates `maxSize` ignores it and registers the
+full-size cover, at most 640 pixels on its longer side.
+
+In tests, `FakeIntegrationContext.UiResources` is a `FakeUiResourceRegistry` that applies the same rules and
+exposes what was registered, and `MacroDeckTestHost` answers registrations over the wire.
+
+## Icons from your bundled icon packs
+
+A plugin that bundles icon packs in its artifact (`bundledIconPacks` in the
+[manifest](/reference/manifest/)) shows one of their icons without uploading anything:
+
+```csharp
+UiResource logo = await context.UiResources.GetPluginIconAsync("logos", "spotify", cancellationToken);
+var image = new UiImage { Key = "logo", Source = UiValue.Of(logo), Size = 0.2 };
+```
+
+The first argument is the pack's key in the manifest, the second the icon's name inside that pack. (A
+built-in integration of Macro Deck answers the same call from the `Icons/<key>/<name>` files in its own
+folder; see [Capability parity](/reference/capability-parity/).)
+
+- **No upload, no quota.** The handle points into Macro Deck's icon store. Nothing is sent from the
+  plugin, nothing is held in memory for the session, and nothing counts against
+  `maxUiResourceBytesPerPlugin` or `maxUiResourcesPerPlugin`.
+- **Stable across restarts.** The handle stays valid after Macro Deck restarts, unlike a registered
+  resource.
+- **A replaced icon gets a new `contentHash`.** When an update or a development sync replaces the icon,
+  the `resourceId` stays and the `contentHash` changes, so clients fetch the new bytes. Ask again when you
+  build a tree rather than holding a handle for the plugin's whole lifetime.
+- **Appearances are chosen by the client.** For an icon with
+  [appearances](/guide/concepts/#icon-appearances), the handle's `resourceId` carries a marker and each
+  client fetches the light, dark, static or animated image that fits it. The `contentHash` changes when any
+  appearance changes. Treat `resourceId` as opaque: it changes when an icon gains or loses its appearances.
+- **Your packs only.** The lookup by key and name is scoped to the calling plugin, so no plugin can name
+  another's icons that way. To show an icon you know by id, use
+  [`GetIconAsync`](#icons-from-any-installed-icon-pack).
+- **Errors.** `UiResourceException.ErrorCode` is `PluginIconNotFound` when your packs hold no such key or
+  name, `Unsupported` on a Macro Deck that predates bundled icon packs, and `Failed` when the icon cannot
+  be served within `maxUiResourceBytes` or the call could not complete.
+
+`UiIcon` stays limited to Macro Deck's own glyphs: a bundled icon is a coloured image and is drawn through
+`UiImage` or a button's `Source`. In tests, `FakeUiResourceRegistry.AddPluginIcon(key, name, bytes,
+mediaType)` makes an icon available to `GetPluginIconAsync`, and `MacroDeckTestHost` answers the lookup
+over the wire as a plugin without bundled packs.
+
+## Icons from any installed icon pack
+
+Any icon installed in Macro Deck, from the user's own packs, imports, the Store or a plugin, can be shown
+by its id, again without uploading anything:
+
+```csharp
+UiResource icon = await context.UiResources.GetIconAsync(iconId, cancellationToken);
+var image = new UiImage { Key = "icon", Source = UiValue.Of(icon), Size = 0.2 };
+```
+
+The id is a `Guid`. Users copy it with **Copy icon id** on the icon packs page, which suits a plugin that
+reads icon ids from text the user writes. When the user picks the icon in your configuration form instead,
+the value holds the same id: a `UiIconInput` stores it as a string, and a `UiIconReferenceInput` as the
+`Reference` of a `UiIconReference` of type `icon-pack`.
+
+- **No upload, no quota, stable across restarts**, and **a replaced icon gets a new `contentHash`**, as for
+  [bundled icons](#icons-from-your-bundled-icon-packs).
+- **Errors.** `UiResourceException.ErrorCode` is `IconNotFound` when no installed pack holds an icon with
+  that id, for example because the user deleted it, `Unsupported` on a Macro Deck that predates the lookup,
+  and `Failed` when the icon cannot be served within `maxUiResourceBytes` or the call could not complete.
+
+In tests, `FakeUiResourceRegistry.AddIcon(iconId, bytes, mediaType)` makes an icon available to
+`GetIconAsync`, and `MacroDeckTestHost` answers the lookup over the wire as a Macro Deck without icons.
+
+## Limits
+
+`maxUiResourceBytes` bounds both a `UiResource`'s **declared** `byteLength` and the bytes the host's
+resource store accepts for one resource, so a declaration can never promise more than the host will
+serve. A `byteLength` of `null` is accepted. `maxUiResourceBytesPerPlugin` and `maxUiResourcesPerPlugin`
+bound what one plugin may have registered at once. They are `maxUi*` limits, listed with every other
+protocol limit in [Plugin WebSocket protocol](/reference/websocket/#limits-and-timeouts); read them from the
+protocol descriptor or the session response rather than hard-coding them - see
+[Serving a view](/ui/views/sessions/#limits) for the rest of the `maxUi*` family.

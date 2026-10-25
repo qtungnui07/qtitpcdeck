@@ -1,0 +1,41 @@
+@use '../../../styles/index' as ds;
+
+:host {
+  display: block;
+}
+
+.settings-content {
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.slider {
+  @include ds.control-slider;
+}
+
+.slider-range {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.lock-note {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.setting-value {
+  color: var(--color-text-secondary);
+}
+
+.setting-value-muted {
+  color: var(--color-text-muted);
+}
+
+.divider {
+  height: 1px;
+  background-color: var(--color-border);
+}

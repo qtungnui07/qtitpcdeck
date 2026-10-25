@@ -1,0 +1,329 @@
+@use '../../../../styles/index' as ds;
+
+:host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.tests-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.test-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  @include ds.card($padding: var(--space-3));
+}
+
+.test-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.test-heading {
+  flex: 1 1 16rem;
+  min-width: 0;
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+.test-card-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+
+  &:hover {
+    .test-card-chevron {
+      color: var(--color-text-primary);
+    }
+
+    .test-name {
+      color: var(--color-accent);
+    }
+
+    .test-icon {
+      background-color: var(--color-bg-hover);
+    }
+  }
+
+  &:focus-visible {
+    @include ds.focus-ring;
+  }
+}
+
+.test-card-chevron {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  transition: transform var(--transition-fast);
+
+  &.open {
+    transform: rotate(90deg);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+  }
+}
+
+.test-card-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-inline-start: auto;
+}
+
+.test-build-count {
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+}
+
+.test-build-chip {
+  @include ds.chip;
+  flex-shrink: 0;
+  color: var(--color-warning);
+  background-color: var(--color-warning-muted);
+
+  .icon {
+    background-color: var(--color-warning);
+  }
+}
+
+.test-icon {
+  @include ds.flex-center;
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-lg);
+  background-color: var(--color-bg-tertiary);
+  overflow: hidden;
+
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .icon {
+    color: var(--color-text-muted);
+  }
+}
+
+.test-identity {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.test-name {
+  font-size: var(--text-base);
+  font-weight: var(--font-semibold);
+  @include ds.truncate;
+}
+
+.test-package-id {
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  @include ds.truncate;
+}
+
+.test-installed {
+  @include ds.chip;
+  flex-shrink: 0;
+  color: var(--color-success);
+  background-color: var(--color-success-muted);
+}
+
+.test-builds {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1fr) minmax(0, 2fr) auto;
+  column-gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  @include ds.breakpoint-down('sm') {
+    grid-template-columns: 1fr auto;
+  }
+}
+
+.test-build {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  row-gap: var(--space-2);
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--color-border);
+
+  &:last-child {
+    padding-bottom: 0;
+  }
+
+  > * {
+    grid-column: 1 / -1;
+  }
+}
+
+.build-main {
+  display: grid;
+  grid-template-columns: subgrid;
+  align-items: center;
+  row-gap: var(--space-3);
+
+  @include ds.breakpoint-down('sm') {
+    .build-meta {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+  }
+}
+
+// macOS 11 ships a WebKit without subgrid: there each row keeps its own grid, unaligned but intact.
+@supports not (grid-template-columns: subgrid) {
+  .test-builds,
+  .test-build {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .build-main {
+    grid-template-columns: minmax(8rem, 1fr) minmax(0, 2fr) auto;
+    column-gap: var(--space-3);
+
+    @include ds.breakpoint-down('sm') {
+      grid-template-columns: 1fr auto;
+    }
+  }
+}
+
+.build-version {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.build-version-label {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+  @include ds.truncate;
+}
+
+.build-number,
+.build-meta {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.build-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.build-action {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.build-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 140px;
+}
+
+.progress-bar {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-bg-tertiary);
+  overflow: hidden;
+
+  .progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--color-accent);
+    transition: width var(--transition-fast);
+  }
+
+  &.indeterminate::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    width: 40%;
+    border-radius: inherit;
+    background: var(--color-accent);
+    animation: store-tests-progress-slide 1.2s ease-in-out infinite;
+
+    @media (prefers-reduced-motion: reduce) {
+      animation: none;
+      width: 100%;
+      opacity: 0.5;
+    }
+  }
+}
+
+@keyframes store-tests-progress-slide {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(350%);
+  }
+}
+
+.progress-readout {
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+}
+
+.build-failure {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-1);
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+
+  .icon {
+    flex: none;
+    margin-top: 1px;
+    background-color: var(--color-danger);
+  }
+}
+
+.build-changelog {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+
+  shared-store-markdown {
+    align-self: stretch;
+  }
+}

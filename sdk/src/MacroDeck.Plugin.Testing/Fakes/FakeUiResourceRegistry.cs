@@ -1,0 +1,304 @@
+using MacroDeck.Plugin.Protocol.Assets;
+using MacroDeck.Plugin.Protocol.Limits;
+using MacroDeck.Sdk.Ui;
+using MacroDeck.Ui.Model.Resources;
+
+namespace MacroDeck.Plugin.Testing.Fakes;
+
+/// <summary>
+/// In-memory <see cref="IUiResourceRegistry" /> that enforces the same rules as Macro Deck: the name
+/// grammar and media types of <see cref="UiResourceRules" />, the per-resource size limit, replacement
+/// by name, and the per-plugin quota, which a test can lower through <see cref="MaxTotalBytes" /> and
+/// <see cref="MaxCount" /> to exercise <see cref="UiResourceErrorCode.QuotaExceeded" />.
+/// </summary>
+public sealed class FakeUiResourceRegistry : IUiResourceRegistry
+{
+	private readonly Lock _gate = new();
+	private readonly Dictionary<string, FakeUiResource> _resources = new(StringComparer.Ordinal);
+
+	private readonly Dictionary<(string Key, string Name), FakeUiResource> _pluginIcons
+		= new(PluginIconComparer.Instance);
+
+	private readonly Dictionary<Guid, FakeUiResource> _icons = new();
+	private readonly Dictionary<(string InstanceId, string ArtworkId), FakeMusicPlayerArtwork> _artworks = new();
+
+	/// <summary>The combined size all resources may have. Defaults to Macro Deck's per-plugin quota.</summary>
+	public int MaxTotalBytes { get; set; } = ProtocolLimits.MaxUiResourceBytesPerPlugin;
+
+	/// <summary>How many resources may be registered at once. Defaults to Macro Deck's per-plugin quota.</summary>
+	public int MaxCount { get; set; } = ProtocolLimits.MaxUiResourcesPerPlugin;
+
+	/// <summary>Everything currently registered, by name.</summary>
+	public IReadOnlyDictionary<string, FakeUiResource> Resources
+	{
+		get
+		{
+			lock (_gate)
+			{
+				return new Dictionary<string, FakeUiResource>(_resources, StringComparer.Ordinal);
+			}
+		}
+	}
+
+	/// <inheritdoc />
+	public Task<UiResource> RegisterAsync(
+		string name,
+		ReadOnlyMemory<byte> content,
+		string mediaType,
+		CancellationToken cancellationToken = default)
+	{
+		if (!UiResourceRules.IsValidName(name))
+		{
+			throw new ArgumentException($"'{name}' is not a valid UI resource name.", nameof(name));
+		}
+
+		if (!UiResourceRules.IsSupportedMediaType(mediaType))
+		{
+			throw new ArgumentException($"'{mediaType}' is not a supported media type.", nameof(mediaType));
+		}
+
+		if (content.IsEmpty || content.Length > ProtocolLimits.MaxUiResourceBytes)
+		{
+			throw new ArgumentException($"The content is {content.Length} bytes.", nameof(content));
+		}
+
+		lock (_gate)
+		{
+			var replaced = _resources.GetValueOrDefault(name);
+			var totalBytes = _resources.Values.Sum(resource => resource.Content.Length)
+				- (replaced?.Content.Length ?? 0)
+				+ content.Length;
+			var count = _resources.Count - (replaced is null ? 0 : 1) + 1;
+
+			if (totalBytes > MaxTotalBytes || count > MaxCount)
+			{
+				return Task.FromException<UiResource>(new UiResourceException(UiResourceErrorCode.QuotaExceeded,
+					"The plugin's UI resource quota is exhausted."));
+			}
+
+			var bytes = content.ToArray();
+			var handle = new UiResource
+			{
+				ResourceId = "plugin-test." + name,
+				ContentHash = AssetContentHash.Compute(bytes),
+				MediaType = mediaType.ToLowerInvariant(),
+				ByteLength = bytes.Length
+			};
+
+			_resources[name] = new FakeUiResource(handle, bytes);
+
+			return Task.FromResult(handle);
+		}
+	}
+
+	/// <summary>
+	/// Makes <paramref name="content" /> the icon <paramref name="name" /> of the bundled pack
+	/// <paramref name="key" />, as if the plugin's manifest bundled it, replacing what that pair held. Like
+	/// Macro Deck, it does not count against the quota and a replaced icon gets a new
+	/// <see cref="UiResource.ContentHash" />.
+	/// </summary>
+	public UiResource AddPluginIcon(string key, string name, byte[] content, string mediaType)
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace(key);
+		ArgumentException.ThrowIfNullOrWhiteSpace(name);
+		ArgumentNullException.ThrowIfNull(content);
+
+		if (!UiResourceRules.IsSupportedMediaType(mediaType))
+		{
+			throw new ArgumentException($"'{mediaType}' is not a supported media type.", nameof(mediaType));
+		}
+
+		var bytes = content.ToArray();
+		var handle = new UiResource
+		{
+			ResourceId = $"app.macro-deck.plugin-icon.test.{key}.{name}",
+			ContentHash = AssetContentHash.Compute(bytes),
+			MediaType = mediaType.ToLowerInvariant(),
+			ByteLength = bytes.Length
+		};
+
+		lock (_gate)
+		{
+			_pluginIcons[(key, name)] = new FakeUiResource(handle, bytes);
+		}
+
+		return handle;
+	}
+
+	/// <inheritdoc />
+	/// <remarks>Answers the icons added through <see cref="AddPluginIcon" />, matching the icon name
+	/// case-insensitively as the host does; any other key or name throws
+	/// <see cref="UiResourceErrorCode.PluginIconNotFound" />.</remarks>
+	public Task<UiResource> GetPluginIconAsync(string key, string name, CancellationToken cancellationToken = default)
+	{
+		lock (_gate)
+		{
+			return _pluginIcons.TryGetValue((key, name), out var icon)
+				? Task.FromResult(icon.Handle)
+				: Task.FromException<UiResource>(new UiResourceException(UiResourceErrorCode.PluginIconNotFound,
+					$"The plugin's bundled icon packs contain no icon '{name}' in '{key}'."));
+		}
+	}
+
+	/// <summary>
+	/// Makes <paramref name="content" /> the icon <paramref name="iconId" /> of an installed icon pack,
+	/// replacing what that id held. Like Macro Deck, it does not count against the quota and a replaced icon
+	/// gets a new <see cref="UiResource.ContentHash" />.
+	/// </summary>
+	public UiResource AddIcon(Guid iconId, byte[] content, string mediaType)
+	{
+		ArgumentNullException.ThrowIfNull(content);
+
+		if (!UiResourceRules.IsSupportedMediaType(mediaType))
+		{
+			throw new ArgumentException($"'{mediaType}' is not a supported media type.", nameof(mediaType));
+		}
+
+		var bytes = content.ToArray();
+		var handle = new UiResource
+		{
+			ResourceId = $"app.macro-deck.plugin-icon.{iconId:D}",
+			ContentHash = AssetContentHash.Compute(bytes),
+			MediaType = mediaType.ToLowerInvariant(),
+			ByteLength = bytes.Length
+		};
+
+		lock (_gate)
+		{
+			_icons[iconId] = new FakeUiResource(handle, bytes);
+		}
+
+		return handle;
+	}
+
+	/// <inheritdoc />
+	/// <remarks>Answers the icons added through <see cref="AddIcon" />; any other id throws
+	/// <see cref="UiResourceErrorCode.IconNotFound" />.</remarks>
+	public Task<UiResource> GetIconAsync(Guid iconId, CancellationToken cancellationToken = default)
+	{
+		lock (_gate)
+		{
+			return _icons.TryGetValue(iconId, out var icon)
+				? Task.FromResult(icon.Handle)
+				: Task.FromException<UiResource>(new UiResourceException(UiResourceErrorCode.IconNotFound,
+					$"No installed icon pack contains an icon with id '{iconId}'."));
+		}
+	}
+
+	/// <summary>
+	/// Makes <paramref name="content" /> the artwork <paramref name="artworkId" /> of the music player
+	/// <paramref name="instanceId" />, as if that player, of any integration, reported it, replacing what the
+	/// pair held. <paramref name="instanceId" /> is the qualified <c>integrationId::instanceId</c> form. Any
+	/// media type and size may be seeded, so a test can exercise what Macro Deck refuses on registration.
+	/// </summary>
+	public void AddMusicPlayerArtwork(string instanceId, string artworkId, byte[] content, string mediaType)
+	{
+		ArgumentException.ThrowIfNullOrEmpty(instanceId);
+		ArgumentException.ThrowIfNullOrEmpty(artworkId);
+		ArgumentNullException.ThrowIfNull(content);
+		ArgumentException.ThrowIfNullOrEmpty(mediaType);
+
+		lock (_gate)
+		{
+			_artworks[(instanceId, artworkId)] = new FakeMusicPlayerArtwork(content.ToArray(), mediaType);
+		}
+	}
+
+	/// <inheritdoc />
+	/// <remarks>Answers the artwork added through <see cref="AddMusicPlayerArtwork" /> and returns <c>null</c>
+	/// for any other pair. Artwork of a media type Macro Deck does not accept, or larger than one resource may
+	/// be, throws <see cref="UiResourceErrorCode.Failed" />, and the registration counts against the quota like
+	/// <see cref="RegisterAsync" />.</remarks>
+	public async Task<UiResource?> RegisterMusicPlayerArtworkAsync(
+		string name,
+		string instanceId,
+		string artworkId,
+		CancellationToken cancellationToken = default)
+	{
+		if (!UiResourceRules.IsValidName(name))
+		{
+			throw new ArgumentException($"'{name}' is not a valid UI resource name.", nameof(name));
+		}
+
+		var artwork = FindMusicPlayerArtwork(instanceId, artworkId);
+		if (artwork is null)
+		{
+			return null;
+		}
+
+		if (!UiResourceRules.IsSupportedMediaType(artwork.MediaType))
+		{
+			throw new UiResourceException(UiResourceErrorCode.Failed,
+				$"The artwork is of media type '{artwork.MediaType}', which Macro Deck does not accept.");
+		}
+
+		if (artwork.Content.Length > ProtocolLimits.MaxUiResourceBytes)
+		{
+			throw new UiResourceException(UiResourceErrorCode.Failed,
+				$"The artwork is {artwork.Content.Length} bytes; a UI resource is at most {ProtocolLimits.MaxUiResourceBytes}.");
+		}
+
+		return await RegisterAsync(name, artwork.Content, artwork.MediaType, cancellationToken).ConfigureAwait(false);
+	}
+
+	/// <inheritdoc />
+	/// <remarks>Registers the seeded bytes whatever <paramref name="maxSize" /> asks for, as Macro Deck does
+	/// for a cover too small to have smaller copies.</remarks>
+	public Task<UiResource?> RegisterMusicPlayerArtworkAsync(
+		string name,
+		string instanceId,
+		string artworkId,
+		int maxSize,
+		CancellationToken cancellationToken = default)
+	{
+		ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSize);
+		return RegisterMusicPlayerArtworkAsync(name, instanceId, artworkId, cancellationToken);
+	}
+
+	internal FakeMusicPlayerArtwork? FindMusicPlayerArtwork(string instanceId, string artworkId)
+	{
+		lock (_gate)
+		{
+			return _artworks.GetValueOrDefault((instanceId, artworkId));
+		}
+	}
+
+	/// <inheritdoc />
+	public Task RemoveAsync(string name, CancellationToken cancellationToken = default)
+	{
+		if (!UiResourceRules.IsValidName(name))
+		{
+			throw new ArgumentException($"'{name}' is not a valid UI resource name.", nameof(name));
+		}
+
+		lock (_gate)
+		{
+			_resources.Remove(name);
+		}
+
+		return Task.CompletedTask;
+	}
+
+	private sealed class PluginIconComparer : IEqualityComparer<(string Key, string Name)>
+	{
+		public static readonly PluginIconComparer Instance = new();
+
+		public bool Equals((string Key, string Name) x, (string Key, string Name) y)
+		{
+			return string.Equals(x.Key, y.Key, StringComparison.Ordinal)
+				&& string.Equals(x.Name, y.Name, StringComparison.OrdinalIgnoreCase);
+		}
+
+		public int GetHashCode((string Key, string Name) obj)
+		{
+			return HashCode.Combine(StringComparer.Ordinal.GetHashCode(obj.Key),
+				StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Name));
+		}
+	}
+}
+
+/// <summary>One resource held by <see cref="FakeUiResourceRegistry" />: the handle it answered and the
+/// bytes behind it.</summary>
+public sealed record FakeUiResource(UiResource Handle, byte[] Content);
+
+internal sealed record FakeMusicPlayerArtwork(byte[] Content, string MediaType);

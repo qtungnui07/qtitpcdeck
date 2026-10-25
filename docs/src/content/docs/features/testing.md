@@ -1,0 +1,395 @@
+---
+title: Testing plugins
+description: Test actions, variables, events, configuration and devices in process with PluginTestHarness and the MacroDeck.Plugin.Testing fakes, then run the conformance suite.
+---
+
+`MacroDeck.Plugin.Testing` runs your plugin's own code against a fake host, with no Macro Deck
+installation and no socket. The project template's test project already references it and uses NUnit;
+the package works with any test framework.
+
+## Quick start
+
+```csharp
+using MacroDeck.Plugin.Testing;
+using NUnit.Framework;
+
+public sealed class PluginIntegrationTests
+{
+	private static PluginTestHarness CreateHarness() =>
+		PluginTestHarness.Create(builder => builder
+			.UseLocalization(Strings.LocalizationCatalog)
+			.RegisterIntegration<PluginIntegration>());
+
+	[Test]
+	public async Task The_example_action_writes_the_message_to_the_log()
+	{
+		await using var harness = CreateHarness();
+		await harness.InitializeIntegrationsAsync();
+
+		var outcome = await harness.Actions.ExecuteAsync(
+			"log-message",
+			new Dictionary<string, object?> { ["message"] = "Hello from a test" });
+
+		Assert.That(outcome.Succeeded, Is.True);
+		Assert.That(harness.Logs.Events.Any(e => e.Message.Contains("Hello from a test")), Is.True);
+	}
+}
+```
+
+`dotnet test` builds the plugin, runs the `log-message` action the way the host would and checks both
+the result and the log line.
+
+- **`Create` builds but does not start.** Call `InitializeIntegrationsAsync()` before invoking anything;
+  an exception from an integration's `InitializeAsync` propagates to the test.
+- **`harness.Context` is the fake host.** It replaces `IIntegrationContext`, and `harness.Clock` replaces
+  `TimeProvider`. Neither substitution can be turned off.
+- **Identity is generated.** Without a `PluginTestManifest` the harness writes one with a fresh, unique
+  reverse-domain id, the name `Test Plugin` and version `1.0.0`. Pass your own only when the id, name,
+  version, description or icon is what you test.
+- **Logs are collected, not forwarded.** The harness replaces the Serilog pipeline, `UseMacroDeckLogging`
+  included, with `harness.Logs`.
+
+## Testing actions
+
+```csharp
+var outcome = await harness.Actions.ExecuteAsync("log-message",
+	new Dictionary<string, object?> { ["message"] = "   " });
+
+Assert.That(outcome.Succeeded, Is.False);
+Assert.That(outcome.Error, Is.Not.Null);
+```
+
+Every client call returns a `CapabilityInvocationOutcome`: `Succeeded`, `Error`, `Data` (read it with
+`DataAs<T>()`), `CorrelationId` and `Elapsed`. The harness enforces the invocation deadline but skips
+concurrency limiting and idempotency replay. `harness.Actions` also has `GetOptionsAsync`,
+`GetActionStateAsync` and `GetActionIconAsync`.
+
+## Testing variables
+
+```csharp
+await harness.Actions.ExecuteAsync("ring", new Dictionary<string, object?>());
+
+var reading = (await harness.Variables.GetAsync("rings")).DataAs<VariableReadingDto>();
+Assert.That(reading!.Value.Number, Is.EqualTo(1));
+```
+
+`GetAsync` and `SetAsync` take the local id, not the variable name. `DiscoverAsync`, `ResolveAsync` and
+`SubscribeAsync` cover [the catalog](/features/variables/#the-variable-catalog); a push-capable catalog
+is attached to `harness.Context.VariableValues` during `InitializeIntegrationsAsync`.
+
+## Testing events
+
+```csharp
+await harness.Actions.ExecuteAsync("ring", new Dictionary<string, object?>());
+
+var published = harness.Context.Events.Published.Single();
+Assert.That(published.EventId, Is.EqualTo("rang"));
+Assert.That(published.Parameters!.Value.GetProperty("count").GetInt32(), Is.EqualTo(1));
+```
+
+`FakeEventPublisher` records every `Publish` in order and never throws, matching the real publisher's
+fire-and-forget contract. Parameters are serialized with the protocol's own JSON options, so `Parameters`
+is what the host would receive.
+
+## Testing messaging
+
+```csharp
+harness.Context.Messages.RespondTo("obs.scene.current", _ => JsonSerializer.SerializeToElement("Live"));
+await harness.InitializeIntegrationsAsync();
+
+var reply = await harness.Context.Messages.DeliverRequestAsync("lights.state", sender: "com.example.deck");
+Assert.That(harness.Context.Messages.Published.Select(message => message.Topic), Does.Contain("lights.changed"));
+```
+
+`harness.Context.Messages` is a `FakeMessageChannel`, and an injected `IMessageChannel` resolves to the same
+instance. It routes the plugin's own messages the way Macro Deck does, answers everything else from
+`RespondTo` stubs or with `NoHandler`, and records what the plugin publishes, sends and requests.
+Deliver messages from other participants with its `Deliver*Async` methods rather than raw capability
+invocations. Over the wire, `MacroDeckTestHost.Messaging` records and answers the hosted plugin's
+messages, and `session.Messaging` delivers to it. On a host that offers the channel a plugin declares
+the `messaging` capability too, so an assertion on its exact `Declared` list includes it. See
+[Messaging between plugins](/features/messaging/#testing).
+
+## Testing configuration
+
+```csharp
+await using var harness = CreateHarness();
+var entry = harness.Context.Config.AddEntry("Front door");
+harness.Context.Config.SeedString(entry, "room", "Hallway");
+
+await harness.InitializeIntegrationsAsync();
+```
+
+Seed entries before `InitializeIntegrationsAsync` to test what the integration does with an existing
+configuration; `SeedSecret` does the same for secrets. To drive the [setup flow](/features/setup-flows/)
+itself, use `harness.ConfigFlow.StartAsync`, `SubmitAsync` and `AbandonAsync`.
+
+## Testing log output
+
+```csharp
+Assert.That(harness.Logs.WithProperty("Room", "Hallway"), Has.Count.EqualTo(1));
+Assert.That(harness.Logs.AtLeast(LogLevels.Warning), Is.Empty);
+```
+
+Property values are rendered as strings. `WaitForAsync` waits for a line logged from background work.
+
+## Testing devices
+
+```csharp
+var devices = new FakeDeviceProviderContext();
+var provider = new LightpadProvider();
+
+await provider.InitializeAsync(devices);
+var first = devices.AssignedIdOf("pad-1");
+await provider.InitializeAsync(devices);
+
+Assert.That(devices.AssignedIdOf("pad-1"), Is.EqualTo(first));
+```
+
+`FakeDeviceProviderContext` keeps the host's identity rules: registering again under a known
+provider-local id is the same device, and unregistering keeps the device and only takes it offline.
+`OpenSession` hands your provider a `FakeDeviceSession` to push surfaces to and read interactions from.
+`InitializeIntegrationsAsync` does not initialize device providers, so call `InitializeAsync` yourself.
+
+## Testing screensavers
+
+```csharp
+var screenSavers = new FakeScreenSaverProviderContext();
+var provider = new PhotoIntegration();
+
+await provider.InitializeAsync(screenSavers);
+
+Assert.That(screenSavers.ScreenSavers.ContainsKey("photos"), Is.True);
+Assert.That(screenSavers.Calls.Last().Kind, Is.EqualTo(ScreenSaverProviderCallKind.Register));
+```
+
+`FakeScreenSaverProviderContext` keeps the host's identity rules: registering again under a known
+provider-local id replaces the screensaver, and unregistering an unknown id is a silent no-op. `Calls`
+records every `ScreenSaverProviderCall` in order. `harness.Context.ScreenSavers` is the same fake behind a
+whole harness, and `harness.ScreenSaverProvider`, a `ScreenSaverProviderTestClient`, drives the `screensaver-provider`
+capability with `GetScreenSaversAsync`, the way the host reads your catalog after a reconnect. See [Screensavers](/ui/views/screensavers/).
+
+## Testing video streams
+
+```csharp
+var videoStreams = new FakeVideoStreamProviderContext();
+await new DoorCameraIntegration(server).InitializeAsync(videoStreams);
+
+Assert.That(videoStreams.Providers.ContainsKey("door-cameras"), Is.True);
+Assert.That(videoStreams.Calls.Last().Kind, Is.EqualTo(VideoStreamProviderCallKind.Register));
+```
+
+`FakeVideoStreamProviderContext` applies the SDK's and the host's rules: an invalid or duplicate provider
+id, a seventeenth provider, and a stream or metadata value past a
+[documented bound](/features/video-streams/#limits) throw `ArgumentException`, and unregistering an unknown
+id is a silent no-op. `Calls` records every `VideoStreamProviderCall` in order, including the session
+updates and closes your provider reports. The fake opens no sessions: in a harness,
+`harness.VideoStreamProvider`, a `VideoStreamProviderTestClient`, drives the `video-stream-provider`
+capability the way the host does, with `DescribeAsync`, `GetStreamsAsync`, `OpenSessionAsync`,
+`SuspendSessionAsync`, `ResumeSessionAsync` and `CloseSessionAsync`, while
+`harness.Context.VideoStreams` records what the plugin sends back. Neither fetches the URL your provider
+returns: Macro Deck's relay does that, and the harness has none. Use a fresh session id per open; a
+refusal is a failed outcome whose `details.reason` is a `video_stream_` reason. See
+[Video streams](/features/video-streams/#testing).
+
+## Testing batteries
+
+```csharp
+var batteries = new FakeBatteryProviderContext();
+await new HeadsetIntegration(watcher).InitializeAsync(batteries);
+
+Assert.That(batteries.Devices["pad-1"].LevelPercent, Is.EqualTo(80));
+```
+
+`FakeBatteryProviderContext` keeps the host's rules: publishing a known id replaces the device, a list is
+applied all or nothing, and a provider holds at most 64 devices. `Devices`, `Publishes` and `RemovedIds`
+record what your provider did. `FakeBatteryApi` is the reading side: `Set` replaces the catalog and raises
+`Changed`, and `SubscriberCount` shows whether your code still listens. In a harness,
+`harness.Context.Batteries` serves `IIntegrationContext.Batteries` and `harness.Context.BatteryProvider` is
+what `InitializeIntegrationsAsync` starts your battery provider against. See
+[Batteries](/features/batteries/#testing).
+
+## Testing weather notices
+
+```csharp
+await harness.InitializeIntegrationsAsync();
+
+Assert.That(harness.Context.WeatherProvider.SnapshotNotices, Is.EqualTo(1));
+```
+
+`FakeWeatherProviderApi` counts what a weather provider reports through
+`IIntegrationContext.WeatherProvider`; in a harness it is `harness.Context.WeatherProvider`. Over the wire,
+`MacroDeckTestHost` answers `weather`/`snapshots-changed` the way Macro Deck does, refusing it with
+`CAPABILITY_UNAVAILABLE` when the plugin's `weather` capability was not negotiated. See
+[Weather](/features/weather/#telling-macro-deck-the-weather-changed).
+
+## Testing Companion devices
+
+```csharp
+var companion = new FakeCompanionDeviceApi();
+var tablet = Guid.NewGuid();
+companion.Connect(tablet, new CompanionDeviceState { ConfirmsCommands = true });
+companion.OnRequest = (_, _) => CompanionDeviceCommandResult.Failed(CompanionDeviceFailure.ConsentDenied);
+
+await new TabletDimmer(companion).DimAsync(tablet);
+
+Assert.That(companion.Calls.Single().Kind, Is.EqualTo(FakeCompanionDeviceCallKind.Request));
+```
+
+`FakeCompanionDeviceApi` starts with access `Available` and no devices. `Connect`, `Report` and `Disconnect`
+script the devices and raise the matching events, each connection with a new `ReadySequence`; `SetAccess`
+changes access, and while it is `NotAllowed` requests and screenshots fail with `NotAllowed`. `OnRequest` and
+`OnScreenshot` decide how requests and screenshots end, and `Calls` records every send, request and
+screenshot. In a harness, `harness.Context.CompanionDevices` serves both `IIntegrationContext.CompanionDevices`
+and an injected `ICompanionDeviceApi`, starting at `Unsupported` until the test calls `SetAccess`. See
+[Companion devices](/features/companion-devices/#testing).
+
+## Testing music player readers
+
+`harness.Context.MusicPlayers` is a `FakeMusicPlayerApi` serving both `IIntegrationContext.MusicPlayers` and an
+injected `IMusicPlayerApi`. `Set(players)` replaces the players and raises `InstancesChanged`,
+`SetAlbumColor(instanceId, color)` sets what `GetAlbumColorAsync` answers, and `SubscriberCount` shows whether
+your code still listens. See
+[Reading every provider's players](/features/music-players/#reading-every-providers-players).
+
+## Storage, time format and User-Agent
+
+`harness.Context.Storage` is a `FakeIntegrationStorage` with Macro Deck's key rules and read outcomes:
+`Set` seeds a document, `SetUnreadable` makes a key hold damaged copies, and `Get` reads what your
+integration wrote - see [Integration storage](/features/integration-storage/#testing).
+`harness.Context.Locale.TimeOfDayFormat` sets the time format `IIntegrationContext.Locale` answers, by default
+the invariant culture with a 24-hour clock, and `harness.Context.Http.UserAgent` the User-Agent
+`IIntegrationContext.Http` and an injected `IHostHttp` report.
+
+## Testing calendars
+
+```csharp
+var outcome = await harness.Calendar.GetEventAsync(new CalendarEventArguments
+{
+	AccountId = accountId, CalendarId = "team", EventId = "standup"
+});
+
+Assert.That(outcome.DataAs<CalendarEventResult>()!.Event!.Participants, Has.Count.EqualTo(3));
+```
+
+`harness.Calendar`, a `CalendarTestClient`, drives the `calendar` capability the way the host does, with
+`DescribeAsync`, `GetAccountsAsync`, `GetCalendarsAsync`, `GetEventsAsync` and `GetEventAsync`. The account
+being read is in each call's arguments, a record from `MacroDeck.Plugin.Protocol.Capabilities.Calendar`.
+Results are what the host receives: `events` returns summaries without description and participants, with
+the reply limits applied, and an account id the plugin does not know is a failed outcome. See
+[Calendars](/features/calendars/#testing).
+
+## Testing email inboxes
+
+```csharp
+var outcome = await harness.EmailInbox.GetSnapshotAsync(new EmailInboxSnapshotArguments
+{
+	InboxId = inboxId, MaxMessages = 5, UnreadOnly = true
+});
+
+Assert.That(outcome.DataAs<EmailInboxSnapshotResult>()!.UnreadCount, Is.EqualTo(2));
+```
+
+`harness.EmailInbox`, an `EmailInboxTestClient`, drives the `email-inbox` capability the way the host does,
+with `DescribeAsync`, `GetInboxesAsync` and `GetSnapshotAsync`. The inbox being read is in the arguments, a
+record from `MacroDeck.Plugin.Protocol.Capabilities.EmailInbox`. Results are what the host receives: the
+status as a name, at most the requested number of messages, newest first, with the reply limits applied, and
+an inbox id the plugin does not know is a failed outcome. Raising `Changed` sends a `state.update` 250 ms
+later, on `harness.Clock` in the harness and in `host.Messages` over the wire. See
+[Email inboxes](/features/email-inboxes/#testing).
+
+## Testing configuration entries
+
+```csharp
+var outcome = await harness.ConfigEntries.PrepareAsync(new ConfigEntryPrepareArguments
+{
+	EntryId = Guid.NewGuid(), Title = "Home", Values = new Dictionary<string, JsonElement>()
+});
+
+Assert.That(outcome.DataAs<ConfigEntryPrepareResult>()!.Success, Is.True);
+```
+
+`harness.ConfigEntries`, a `ConfigEntriesTestClient`, drives the `config-entries` capability the way the host
+does while it stores an entry, with `PrepareAsync`, `GetStatusAsync`, `IsUsableAsync`, `ReloadAsync`,
+`SynchronizeAsync` and `ReleaseAsync`. Set `RejectedVariableNames` on the arguments to test a repeated
+`prepare`, and read `RetryOnConflict` from the result. `SynchronizeAsync` calls the `SynchronizeEntriesAsync`
+overload that takes a variable api, backed by `harness.Context.Variables`, also when the integration was never
+initialized. See
+[Taking part in storing an entry](/features/setup-flows/#taking-part-in-storing-an-entry).
+
+## Testing what a session shows on the pressing client
+
+Pass a `FakeUiEventOrigin` to your session's `Dispatch(UiEvent, IUiEventOrigin)` and read `ReportedFailures`,
+`OpenedModals` and `OpenedUrls`. Set `IsAttached = false` to test what happens once the client left, and
+`ModalAnswer` to answer a dialog. `OpenUrlAsync` refuses a URL that is not `http` or `https` with
+`ArgumentException`, as Macro Deck does, and answers `true` and records the link while the client is attached;
+to test your fallback for a client that cannot open links, set `IsAttached = false`. Unlike Macro Deck, the
+fake does not limit a press to one link: it records every call, so assert on `OpenedUrls` that your session
+opens one. `MacroDeckTestHost` has no clients, so over the wire it answers an origin's calls as Macro Deck
+answers them for a client that is no longer attached.
+
+## Testing previews
+
+`session.Ui`, a `UiTestClient` on the session `MacroDeckTestHost` returns, lists the plugin's
+[`[UiPreview]`](/ui/views/developer-preview/) scenarios and opens them the way Developer Tools does:
+
+```csharp
+var previews = await session.Ui.GetPreviewsAsync();
+var outcome = await session.Ui.OpenPreviewAsync(previews[0].Id, previews[0].Profile);
+
+Assert.That(outcome.Accepted, Is.True, outcome.FailureReason);
+Assert.That(outcome.Tree!.Value.GetProperty("root").GetProperty("id").GetString(), Is.EqualTo("station"));
+
+await session.Ui.CloseAsync(outcome.SessionId!);
+```
+
+`OpenPreviewAsync` waits for the first full tree. A scenario that throws, or an id the plugin does not
+declare, comes back with `Accepted` false and the plugin's reason in `FailureReason`. Later patches are not
+applied. `FindResource` returns the bytes of a resource the plugin registered, by the `resourceId` a tree
+references. The host side of the tree exists only for sessions this client opens: a plugin that pushes a tree
+on its own is still refused, as before. `macrodeck-plugin preview render` is built on this.
+
+## Time and waiting
+
+```csharp
+harness.Clock.Advance(TimeSpan.FromSeconds(30));
+await Wait.UntilAsync(() => harness.Context.Events.Published.Count > 0, because: "the poll should fire");
+```
+
+Advance the manual clock instead of sleeping. `Wait.UntilAsync` throws `PluginTestTimeoutException` at
+its deadline instead of hanging.
+
+## Protocol and process tests
+
+| Tool | Use it for |
+| --- | --- |
+| `PluginTestHarness` | Everything above: fast, in process, no socket. Start here. |
+| `MacroDeckTestHost.HostAsync` | The real protocol over loopback, plugin in process: serialization, reconnection, cancellation, timeouts, host callback round trips. |
+| `MacroDeckTestHost.LaunchAsync` | A built executable or packed `.macroDeckPlugin`: startup, graceful shutdown, environment handoff, manifest loading. Keep these few. |
+
+`PluginTestHarness.ProblemsOf(configure)` returns every configuration problem without throwing.
+
+## The conformance run
+
+```bash
+macrodeck-plugin test --project src/Demo
+```
+
+```text
+Macro Deck plugin conformance report (suite 1.3.0)
+Plugin: com.example.demo 1.0.0
+Passed: 25, Failed: 0, Skipped: 24
+Conformant: yes
+```
+
+The [conformance suite](/reference/conformance/) checks the generic plugin contract, so do not repeat it
+in your own tests. Test what is specific to your plugin, with fakes only at real external boundaries
+(provider APIs, the file system). Options, filters and exit codes are in
+[`macrodeck-plugin test`](/cli/test/).
+
+## See also
+
+- [Conformance suite](/reference/conformance/) - every check and the report format.
+- [Logging and health](/features/logging/) - what the lines you assert on look like in production.
+- [Sample plugins](/introduction/samples-and-template/) - complete test projects.
+- [Debugging](/guides/debugging/) - run the plugin under an IDE against the stub or a real host.

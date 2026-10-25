@@ -1,0 +1,593 @@
+using System.Text.Json;
+using MacroDeck.Plugin.Protocol.Limits;
+using MacroDeck.Sdk.Ui;
+using MacroDeck.Ui.Components;
+using MacroDeck.Ui.Model.Nodes;
+using MacroDeck.Ui.Model.Serialization;
+using MacroDeck.Ui.Model.Surfaces;
+using MacroDeckHost.Integrations.Streaming;
+using MacroDeckHost.Application.Ui.Resources;
+using MacroDeckHost.Integrations.Streaming.Widgets;
+using MacroDeckHost.Integrations.Twitch.Widgets;
+using MacroDeckHost.Tests.UnitTests.Delegation;
+using MacroDeckHost.Tests.UnitTests.Streaming;
+using MacroDeckHost.Tests.UnitTests.TestSupport;
+using Serilog.Core;
+using MacroDeckHost.Integrations.Twitch;
+
+namespace MacroDeckHost.Tests.UnitTests.Twitch.Chat;
+
+[TestFixture]
+internal sealed class TwitchChatWidgetViewTests
+{
+	private const string Streamer = "111";
+
+	private UiResourceStore _store = null!;
+	private FakeTwitchChatImages _images = null!;
+	private StreamChatHub _hub = null!;
+	private StreamWidgetsUiProvider _provider = null!;
+
+	[SetUp]
+	public void SetUp()
+	{
+		_store = new UiResourceStore();
+		_images = new FakeTwitchChatImages(_store);
+		_hub = new StreamChatHub(new FakeTimeProvider(), Logger.None);
+		_provider = StreamPlatformTestSupport.Provider(TwitchStreamPlatform.Platform,
+			_hub,
+			_images,
+			context: new FakeStreamingContext(TwitchIntegration.IntegrationId, typeof(TwitchIntegration), _store));
+	}
+
+	[TearDown]
+	public void TearDown()
+	{
+		_hub.Dispose();
+	}
+
+	[Test]
+	public async Task Without_a_connection_the_widget_says_it_is_not_connected()
+	{
+		_hub.SetAccounts([new ChatAccount(Streamer, "Streamer")]);
+		_hub.Tick();
+
+		await using var session = await OpenAsync();
+
+		Assert.That(Texts(session.BuildTree().Root), Has.Some.Contains("Integrations.Twitch.ChatWidget.Offline"));
+	}
+
+	[Test]
+	public async Task A_configured_background_is_painted_behind_the_chat()
+	{
+		Connect();
+
+		await using var colored = await OpenAsync(new { account = "", backgroundColor = "#9146FF" });
+		await using var transparent = await OpenAsync(new { account = "", backgroundColor = "transparent" });
+		await using var plain = await OpenAsync();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(colored.BuildTree().Root.Properties[UiComponentProperties.Background].GetString(),
+				Is.EqualTo("#9146ff"));
+			Assert.That(transparent.BuildTree().Root.Properties[UiComponentProperties.Background].GetString(),
+				Is.EqualTo("transparent"));
+			Assert.That(plain.BuildTree().Root.Properties.ContainsKey(UiComponentProperties.Background), Is.False);
+		});
+	}
+
+	[Test]
+	public async Task The_font_size_scales_the_chat_text_and_leaves_an_unset_widget_as_it_was()
+	{
+		Connect();
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m1")));
+		_hub.Tick();
+
+		await using var unset = await OpenAsync();
+		await using var hundred = await OpenAsync(new { account = "", textSize = 100 });
+		await using var doubled = await OpenAsync(new { account = "", textSize = 200 });
+		await using var invalid = await OpenAsync(new { account = "", textSize = "big" });
+		await using var cleared = await OpenAsync(new { account = "", textSize = (double?)null });
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(TextSize(hundred), Is.EqualTo(TextSize(unset)));
+			Assert.That(TextSize(invalid), Is.EqualTo(TextSize(unset)));
+			Assert.That(TextSize(cleared), Is.EqualTo(TextSize(unset)));
+			Assert.That(TextSize(doubled), Is.EqualTo(TextSize(unset) * 2).Within(1e-9));
+		});
+	}
+
+	[Test]
+	public async Task The_font_size_is_limited_to_25_and_300_percent()
+	{
+		Connect();
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m1")));
+		_hub.Tick();
+
+		await using var unset = await OpenAsync();
+		await using var tiny = await OpenAsync(new { account = "", textSize = 1 });
+		await using var huge = await OpenAsync(new { account = "", textSize = 5000 });
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(TextSize(tiny), Is.EqualTo(TextSize(unset) / 4).Within(1e-9));
+			Assert.That(TextSize(huge), Is.EqualTo(TextSize(unset) * 3).Within(1e-9));
+		});
+	}
+
+	[Test]
+	public async Task A_larger_font_size_keeps_the_chat_within_its_size_budget()
+	{
+		Connect();
+
+		for (var index = 0; index < StreamChatLines.MaxMessages; index++)
+		{
+			_hub.Post(new ChatMessageReceived(Streamer,
+				TwitchChatHubTests.Message("m" + index) with
+				{
+					Fragments = [new ChatFragment(ChatFragmentKind.Text, new string('x', 400))]
+				}));
+		}
+
+		_hub.Tick();
+
+		await using var session = await OpenAsync(new { account = "", textSize = 300 });
+
+		var size = UiCanonicalJson.SerializeToUtf8Bytes(session.BuildTree().Root).Length;
+
+		Assert.That(size, Is.LessThan(ProtocolLimits.MaxUiTreeBytes));
+	}
+
+	[Test]
+	public async Task A_message_colour_paints_the_chat_text_and_a_name_colour_replaces_every_chatters_own()
+	{
+		Connect();
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m1")));
+		_hub.Tick();
+
+		await using var session
+			= await OpenAsync(new { account = "", messageColor = "#FFCC00", nameColor = "#00ff00" });
+
+		var root = session.BuildTree().Root;
+		var line = MessageNodes(root).Single();
+		var spans = line.Properties[UiComponentProperties.Spans].EnumerateArray().ToList();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(line.Properties[UiComponentProperties.Color].GetString(), Is.EqualTo("#ffcc00"));
+			Assert.That(FallbackNodes(root).Select(node => node.Properties[UiComponentProperties.Color].GetString()),
+				Is.Not.Empty.And.All.EqualTo("#ffcc00"));
+			Assert.That(spans[0].GetProperty("text").GetString(), Is.EqualTo("Viewer"));
+			Assert.That(spans[0].GetProperty("color").GetString(), Is.EqualTo("#00ff00"));
+			Assert.That(spans.Skip(1).Any(span => span.TryGetProperty("color", out _)), Is.False);
+		});
+	}
+
+	[Test]
+	public async Task Without_valid_colours_the_chat_keeps_the_theme_text_and_each_chatters_own_colour()
+	{
+		Connect();
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m1")));
+		_hub.Tick();
+
+		await using var unset = await OpenAsync();
+		await using var cleared = await OpenAsync(new { account = "", messageColor = "", nameColor = "" });
+		await using var invalid = await OpenAsync(new { account = "", messageColor = "var(--x)", nameColor = "#12" });
+
+		foreach (var session in new[] { unset, cleared, invalid })
+		{
+			var root = session.BuildTree().Root;
+			var line = MessageNodes(root).Single();
+			var name = line.Properties[UiComponentProperties.Spans].EnumerateArray().First();
+
+			Assert.Multiple(() =>
+			{
+				Assert.That(line.Properties.ContainsKey(UiComponentProperties.Color), Is.False);
+				Assert.That(FallbackNodes(root).Any(node => node.Properties.ContainsKey(UiComponentProperties.Color)),
+					Is.False);
+				Assert.That(name.GetProperty("color").GetString(), Is.EqualTo("#1e90ff"));
+			});
+		}
+	}
+
+	[Test]
+	public async Task The_sample_preview_follows_the_chat_colours()
+	{
+		await using var sample = await _provider.CreateSessionAsync(new UiSessionRequest
+			{
+				Surface = Surface(UiSurfaceKinds.Preview,
+					true,
+					new { account = "", messageColor = "#ffcc00", nameColor = "#00ff00" }),
+				UiModelVersion = 1
+			},
+			CancellationToken.None);
+
+		var lines = MessageNodes(sample!.BuildTree().Root).ToList();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(lines, Has.Count.EqualTo(3));
+			Assert.That(lines.Select(line => line.Properties[UiComponentProperties.Color].GetString()),
+				Is.All.EqualTo("#ffcc00"));
+			Assert.That(lines.Select(line => line.Properties[UiComponentProperties.Spans][0]
+					.GetProperty("color")
+					.GetString()),
+				Is.All.EqualTo("#00ff00"));
+		});
+	}
+
+	[Test]
+	public async Task The_sample_preview_follows_the_font_size()
+	{
+		await using var plain = await _provider.CreateSessionAsync(
+			new UiSessionRequest { Surface = Surface(UiSurfaceKinds.Preview, true), UiModelVersion = 1 },
+			CancellationToken.None);
+		await using var large = await _provider.CreateSessionAsync(new UiSessionRequest
+			{
+				Surface = Surface(UiSurfaceKinds.Preview, true, new { account = "", textSize = 200 }),
+				UiModelVersion = 1
+			},
+			CancellationToken.None);
+
+		Assert.That(TextSize(large!), Is.EqualTo(TextSize(plain!) * 2).Within(1e-9));
+	}
+
+	[Test]
+	public async Task A_connected_chat_without_messages_says_it_is_waiting()
+	{
+		Connect();
+
+		await using var session = await OpenAsync();
+
+		Assert.That(Texts(session.BuildTree().Root), Has.Some.Contains("Integrations.StreamChat.Widget.Empty"));
+	}
+
+	[Test]
+	public async Task A_message_shows_the_name_in_its_colour_and_the_emote_as_its_image()
+	{
+		Connect();
+		var emote = _images.Resolve(StreamChatImage.Emote("25"));
+		await using var session = await OpenAsync();
+
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m1", emoteId: "25")));
+		_hub.Tick();
+
+		var line = MessageNodes(session.BuildTree().Root).Single();
+		var spans = line.Properties[UiComponentProperties.Spans].EnumerateArray().ToList();
+		var image = spans.Single(span => span.TryGetProperty("image", out _));
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(line.Properties[UiComponentProperties.Text].GetRawText(), Does.Contain("Viewer: hello Kappa"));
+			Assert.That(spans[0].GetProperty("text").GetString(), Is.EqualTo("Viewer"));
+			Assert.That(spans[0].GetProperty("color").GetString(), Is.EqualTo("#1e90ff"));
+			Assert.That(spans[1].GetProperty("text").GetString(), Is.EqualTo(": "));
+			Assert.That(image.GetProperty("image").GetProperty("resourceId").GetString(), Is.EqualTo(emote.ResourceId));
+			Assert.That(image.GetProperty("alt").GetString(), Is.EqualTo("Kappa"));
+			Assert.That(_store.TryGet(emote.ResourceId, out _), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task An_emote_whose_image_is_not_there_yet_reads_as_its_code()
+	{
+		Connect();
+		await using var session = await OpenAsync();
+
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m1", emoteId: "25")));
+		_hub.Tick();
+
+		var spans = MessageNodes(session.BuildTree().Root).Single().Properties[UiComponentProperties.Spans];
+		Assert.Multiple(() =>
+		{
+			Assert.That(spans.EnumerateArray().Any(span => span.TryGetProperty("image", out _)), Is.False);
+			Assert.That(spans.EnumerateArray().Last().GetProperty("text").GetString(), Is.EqualTo("hello Kappa"));
+		});
+	}
+
+	[Test]
+	public async Task The_log_clips_old_lines_and_gives_older_readers_a_short_excerpt_under_other_ids()
+	{
+		Connect();
+		await using var session = await OpenAsync();
+
+		for (var index = 0; index < 5; index++)
+		{
+			_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m" + index)));
+		}
+
+		_hub.Tick();
+
+		var log = Flatten(session.BuildTree().Root).Single(node => node.Fallback is not null);
+		var primaryIds = MessageNodes(log).Select(node => node.Id).ToHashSet(StringComparer.Ordinal);
+		var fallbackLines = log.Fallback!.Children;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(log.RequiredComponentVersion, Is.EqualTo(2));
+			Assert.That(log.Properties[UiComponentProperties.Overflow].GetString(),
+				Is.EqualTo(UiComponentOverflows.ClipStart));
+			Assert.That(primaryIds, Has.Count.EqualTo(5));
+			Assert.That(fallbackLines, Has.Count.EqualTo(3));
+			Assert.That(fallbackLines.Select(node => node.Id), Has.None.Matches<string>(primaryIds.Contains));
+			Assert.That(fallbackLines.Select(node => node.Properties[UiComponentProperties.MaxLines].GetInt32()),
+				Is.All.EqualTo(2));
+		});
+	}
+
+	[Test]
+	public async Task A_deleted_message_disappears_from_the_tile()
+	{
+		Connect();
+		await using var session = await OpenAsync();
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("gone")));
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("stays")));
+		_hub.Tick();
+
+		_hub.Post(new ChatMessageDeleted(Streamer, "gone"));
+		_hub.Tick();
+
+		var ids = MessageNodes(session.BuildTree().Root).Select(node => node.Id).ToList();
+		Assert.Multiple(() =>
+		{
+			Assert.That(ids, Has.Count.EqualTo(1));
+			Assert.That(ids[0], Does.EndWith(ChatStyle.MessageKey("stays")));
+		});
+	}
+
+	[Test]
+	public async Task A_busy_chat_stays_inside_the_tree_and_patch_limits_even_when_every_line_is_replaced()
+	{
+		Connect();
+		await using var session = await OpenAsync();
+		session.DrainPatches();
+
+		var patchSizes = new List<int>();
+
+		for (var burst = 0; burst < 2; burst++)
+		{
+			for (var index = 0; index < 100; index++)
+			{
+				_hub.Post(new ChatMessageReceived(Streamer, HeavyMessage($"b{burst}-{index}")));
+			}
+
+			_hub.Tick();
+			patchSizes.AddRange(session.DrainPatches()
+				.Select(patch => UiCanonicalJson.SerializeToUtf8Bytes(patch).Length));
+		}
+
+		var tree = session.BuildTree();
+		var lines = MessageNodes(tree.Root).ToList();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(patchSizes, Is.Not.Empty);
+			Assert.That(patchSizes, Is.All.LessThan(ProtocolLimits.MaxUiPatchBytes));
+			Assert.That(UiCanonicalJson.SerializeToUtf8Bytes(tree).Length, Is.LessThan(ProtocolLimits.MaxUiTreeBytes));
+			Assert.That(lines, Is.Not.Empty.And.Count.LessThanOrEqualTo(StreamChatLines.MaxMessages));
+			Assert.That(lines[^1].Id, Does.EndWith(ChatStyle.MessageKey("b1-99")), "the newest line is shown");
+		});
+	}
+
+	[Test]
+	public async Task A_widget_drawn_in_french_separates_name_and_message_the_french_way()
+	{
+		Connect();
+		await using var session = (await _provider.CreateSessionAsync(
+			new UiSessionRequest { Surface = Surface(UiSurfaceKinds.Widget, culture: "fr"), UiModelVersion = 1 },
+			CancellationToken.None))!;
+		_hub.Post(new ChatMessageReceived(Streamer, TwitchChatHubTests.Message("m1")));
+		_hub.Tick();
+
+		var spans = MessageNodes(session.BuildTree().Root).Single().Properties[UiComponentProperties.Spans];
+		Assert.That(spans[1].GetProperty("text").GetString(), Is.EqualTo(" : "));
+	}
+
+	[Test]
+	public async Task The_picker_sample_is_written_in_the_language_the_surface_names()
+	{
+		await using var english = (await _provider.CreateSessionAsync(
+			new UiSessionRequest { Surface = Surface(UiSurfaceKinds.Preview, true), UiModelVersion = 1 },
+			CancellationToken.None))!;
+		await using var german = (await _provider.CreateSessionAsync(new UiSessionRequest
+			{
+				Surface = Surface(UiSurfaceKinds.Preview, true, culture: "de"), UiModelVersion = 1
+			},
+			CancellationToken.None))!;
+
+		var englishText = MessageNodes(english.BuildTree().Root)
+			.First()
+			.Properties[UiComponentProperties.Text]
+			.GetString();
+		var germanText = MessageNodes(german.BuildTree().Root)
+			.First()
+			.Properties[UiComponentProperties.Text]
+			.GetString();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(englishText,
+				Does.Contain(TestLocalization.Resolve(
+					Localization.AppStrings.Integrations.StreamChat.Widget.SampleMessage1(),
+					"en")));
+			Assert.That(germanText,
+				Does.Contain(TestLocalization.Resolve(
+					Localization.AppStrings.Integrations.StreamChat.Widget.SampleMessage1(),
+					"de")));
+			Assert.That(germanText, Is.Not.EqualTo(englishText));
+		});
+	}
+
+	[Test]
+	public async Task The_picker_sample_shows_example_lines_without_reading_chat()
+	{
+		var surface = Surface(UiSurfaceKinds.Preview, true);
+
+		var request = new UiSessionRequest { Surface = surface, UiModelVersion = 1 };
+		await using var session = (await _provider.CreateSessionAsync(request, CancellationToken.None))!;
+
+		Assert.That(MessageNodes(session.BuildTree().Root).Count(), Is.EqualTo(3));
+	}
+
+	private ChatMessage HeavyMessage(string id)
+	{
+		var fragments = new List<ChatFragment>();
+
+		for (var index = 0; index < 20; index++)
+		{
+			var emoteId = ("emotesv2_" + id.Replace('-', '_') + "_" + index).PadRight(64, 'x');
+			_images.Resolve(StreamChatImage.Emote(emoteId));
+			fragments.Add(new ChatFragment(ChatFragmentKind.Text, "😀漢字テスト "));
+			fragments.Add(new ChatFragment(ChatFragmentKind.Emote, "PogChamp", emoteId));
+		}
+
+		return new ChatMessage(id,
+			"42",
+			"viewer",
+			"Viewer",
+			"#ff4500",
+			[new ChatBadge("subscriber", "12", null)],
+			fragments);
+	}
+
+	[Test]
+	public async Task The_tile_is_titled_with_the_twitch_mark_and_the_accounts_name()
+	{
+		Connect();
+
+		await using var session = await OpenAsync();
+
+		var root = session.BuildTree().Root;
+		var icon = Flatten(root).Single(node => node.Type == UiComponents.Image);
+		var resourceId = icon.Properties[UiComponentProperties.Source].GetProperty("resourceId").GetString()!;
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(Texts(root),
+				Has.Some.Contains("Integrations.StreamChat.Widget.Title").And.Contains("Streamer"));
+			Assert.That(_store.TryGet(resourceId, out _), Is.True);
+		});
+	}
+
+	[Test]
+	public async Task Badges_are_spaced_apart_and_from_the_name()
+	{
+		Connect();
+		_images.Resolve(StreamChatImage.Badge("broadcaster", "1", "https://static-cdn.jtvnw.net/badges/v1/b/2"));
+		_images.Resolve(StreamChatImage.Badge("subscriber", "12", "https://static-cdn.jtvnw.net/badges/v1/s/2"));
+		await using var session = await OpenAsync();
+
+		_hub.Post(new ChatMessageReceived(Streamer,
+			TwitchChatHubTests.Message("m1") with
+			{
+				Badges =
+				[
+					new ChatBadge("broadcaster", "1", "https://static-cdn.jtvnw.net/badges/v1/b/2"),
+					new ChatBadge("subscriber", "12", "https://static-cdn.jtvnw.net/badges/v1/s/2")
+				]
+			}));
+		_hub.Tick();
+
+		var spans = MessageNodes(session.BuildTree().Root)
+			.Single()
+			.Properties[UiComponentProperties.Spans]
+			.EnumerateArray()
+			.ToList();
+
+		Assert.Multiple(() =>
+		{
+			Assert.That(spans[0].TryGetProperty("image", out _), Is.True);
+			Assert.That(spans[1].GetProperty("text").GetString(), Is.Not.Empty.And.Matches(@"^\s+$"));
+			Assert.That(spans[2].TryGetProperty("image", out _), Is.True);
+			Assert.That(spans[3].GetProperty("text").GetString(), Is.Not.Empty.And.Matches(@"^\s+$"));
+			Assert.That(spans[4].GetProperty("text").GetString(), Is.EqualTo("Viewer"));
+		});
+	}
+
+	private void Connect()
+	{
+		_hub.SetAccounts([new ChatAccount(Streamer, "Streamer")]);
+		_hub.Post(new ChatConnectionChanged(Streamer, true));
+		_hub.Tick();
+	}
+
+	private async Task<IUiSession> OpenAsync(object? data = null)
+	{
+		return (await _provider.CreateSessionAsync(new UiSessionRequest
+				{ Surface = Surface(UiSurfaceKinds.Widget, data: data), UiModelVersion = 1 },
+			CancellationToken.None))!;
+	}
+
+	private static UiSurface Surface(string kind, bool sample = false, object? data = null, string? culture = null)
+	{
+		var attributes = new Dictionary<string, JsonElement>(StringComparer.Ordinal)
+		{
+			[UiWidgetSurfaceAttributes.WidgetType]
+				= JsonSerializer.SerializeToElement(TwitchStreamPlatform.Platform.ChatWidgetTypeId),
+			[UiWidgetSurfaceAttributes.Data] = JsonSerializer.SerializeToElement(data ?? new { account = "" })
+		};
+
+		if (sample)
+		{
+			attributes[UiWidgetSurfaceAttributes.Sample] = JsonSerializer.SerializeToElement(true);
+		}
+
+		if (culture is not null)
+		{
+			attributes[UiWidgetSurfaceAttributes.Culture] = JsonSerializer.SerializeToElement(culture);
+		}
+
+		return new UiSurface { Kind = kind, SessionMode = UiSessionModes.Shared, Attributes = attributes };
+	}
+
+	private static IEnumerable<UiNode> MessageNodes(UiNode root)
+	{
+		return Flatten(root, false)
+			.Where(node => node.Type == UiComponents.Text && node.Properties.ContainsKey(UiComponentProperties.Spans));
+	}
+
+	private static IEnumerable<UiNode> FallbackNodes(UiNode root)
+	{
+		return Flatten(root, false)
+			.Where(node => node.Fallback is not null)
+			.SelectMany(node => Flatten(node.Fallback!))
+			.Where(node => node.Type == UiComponents.Text);
+	}
+
+	private static IEnumerable<UiNode> Flatten(UiNode node, bool includeFallback = true)
+	{
+		yield return node;
+
+		foreach (var child in node.Children.SelectMany(child => Flatten(child, includeFallback)))
+		{
+			yield return child;
+		}
+
+		if (includeFallback && node.Fallback is { } fallback)
+		{
+			foreach (var child in Flatten(fallback, includeFallback))
+			{
+				yield return child;
+			}
+		}
+	}
+
+	private static double TextSize(IUiSession session)
+	{
+		return Flatten(session.BuildTree().Root)
+			.First(node => node.Type == UiComponents.Text && node.Properties.ContainsKey(UiComponentProperties.Size))
+			.Properties[UiComponentProperties.Size]
+			.GetProperty("basis")
+			.GetDouble();
+	}
+
+	private static List<string> Texts(UiNode root)
+	{
+		return
+		[
+			.. Flatten(root)
+				.Where(node => node.Properties.ContainsKey(UiComponentProperties.Text))
+				.Select(node => node.Properties[UiComponentProperties.Text].GetRawText())
+		];
+	}
+}

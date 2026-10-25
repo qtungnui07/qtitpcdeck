@@ -1,0 +1,31 @@
+using MacroDeck.Plugin.Protocol.Capabilities.WidgetTypeProvider;
+using MacroDeck.Sdk.Widgets;
+
+namespace MacroDeckHost.Application.Plugins.Capabilities.Mapping;
+
+/// <summary>Turns the wire shape of a widget type registration into the SDK descriptor the host works
+/// with.</summary>
+public static class WidgetTypeDescriptorMapper
+{
+	public static WidgetTypeDescriptor ToDescriptor(WidgetTypeDescriptorDto dto)
+	{
+		ArgumentNullException.ThrowIfNull(dto);
+
+		return new WidgetTypeDescriptor(dto.Id,
+			dto.Name,
+			dto.Description,
+			dto.DefaultData,
+			dto.DataSchema,
+			dto.HasConfiguration,
+			dto.Metadata)
+		{
+			SupportsFlows = dto.SupportsFlows,
+			AppearanceProperties = dto.AppearanceProperties is { } properties
+				? [.. properties.Select(property => (WidgetAppearanceProperty)property)]
+				: null,
+			DefaultShortPressAction = dto.DefaultShortPressAction is { } action
+				? new WidgetDefaultAction(action.ActionId, action.Parameters)
+				: null
+		};
+	}
+}

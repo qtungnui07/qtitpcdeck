@@ -1,0 +1,261 @@
+@use '../../../../styles/index' as ds;
+
+:host {
+  display: block;
+  @include ds.dropdown-affordances;
+}
+
+.profile-selector {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+// 288px, matching the menu's [minWidth]: the trigger and the panel below it read as one control.
+.profile-dropdown {
+  display: block;
+  width: 18rem;
+}
+
+.profile-dropdown ::ng-deep .dropdown-trigger[aria-expanded='true'] {
+  border-color: var(--color-accent);
+}
+
+.profile-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-width: 0;
+}
+
+// A control label, not a heading: at the section-heading size it out-shouted the
+// deck title below it and crowded the pill it sits in.
+.profile-trigger-name {
+  flex: 1;
+  min-width: 0;
+  text-align: start;
+  font-weight: var(--font-medium);
+  font-size: var(--text-base);
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-trigger-empty {
+  font-weight: normal;
+  color: var(--color-text-muted);
+}
+
+.profile-trigger-lock {
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.profile-trigger-chevron {
+  flex-shrink: 0;
+}
+
+.profile-tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+  font-size: var(--text-base);
+  font-weight: var(--font-semibold);
+  line-height: 1;
+  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.profile-tile-sm {
+  width: 1.375rem;
+  height: 1.375rem;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+}
+
+.profile-tile-accent {
+  background-color: var(--color-accent-muted);
+  border-color: var(--color-border-accent);
+  color: var(--color-accent);
+}
+
+.profile-tile-empty {
+  background-color: transparent;
+  border-style: dashed;
+}
+
+.profile-search {
+  position: relative;
+  display: flex;
+  padding: var(--space-2) var(--space-2) var(--space-1);
+
+  shared-input {
+    flex: 1;
+    min-width: 0;
+    --input-action-inline-start-gutter: var(--space-5);
+  }
+}
+
+.profile-search-icon {
+  position: absolute;
+  inset-inline-start: calc(var(--space-2) + var(--space-3));
+  top: calc(50% + var(--space-1) / 2);
+  transform: translateY(-50%);
+  color: var(--color-text-muted);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  padding: var(--space-1);
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.profile-list-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding-inline-end: var(--space-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.profile-list-item:hover,
+.profile-list-item:focus-within,
+.profile-list-item.menu-open {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+
+.profile-list-item.active {
+  background-color: var(--color-accent-muted);
+  border-color: var(--color-border-accent);
+  color: var(--color-text-primary);
+}
+
+.profile-drag-handle {
+  display: flex;
+  flex-shrink: 0;
+  margin-inline-start: var(--space-1);
+  color: var(--color-text-muted);
+  cursor: grab;
+  touch-action: none;
+}
+
+.profile-list-item.cdk-drag-preview {
+  background-color: var(--color-bg-elevated);
+  box-shadow: var(--shadow-md);
+}
+
+.profile-list-item.cdk-drag-placeholder {
+  opacity: 0.4;
+}
+
+.profile-list.cdk-drop-list-dragging .profile-list-item:not(.cdk-drag-placeholder),
+.profile-list-item.cdk-drag-animating {
+  transition: transform 150ms ease;
+}
+
+.profile-list-select {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: var(--space-1) var(--space-2);
+  background: transparent;
+  border: none;
+  border-radius: inherit;
+  color: inherit;
+  text-align: start;
+}
+
+.profile-list-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.0625rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.profile-list-name {
+  font-size: var(--text-base);
+  font-weight: var(--font-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-list-subtitle {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-list-check {
+  flex-shrink: 0;
+  color: var(--color-accent);
+}
+
+.profile-item-more {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+}
+
+.profile-list-empty {
+  margin: 0;
+  padding: var(--space-4) var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+// Matches .folder-nav-footer so both management footers read as one control.
+.profile-list-footer {
+  padding: var(--space-2);
+  border-top: 1px solid var(--color-border);
+}
+
+.profile-name-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.profile-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.profile-portable-error {
+  position: fixed;
+  top: var(--spacing-md, 0.8125rem);
+  left: 50%;
+  transform: translateX(-50%);
+  // Below the shell side panels at 30: a wrapped message reaches the panel header on a narrow window.
+  z-index: 28;
+  width: min(90%, 480px);
+}
+
+.layout-warning {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}

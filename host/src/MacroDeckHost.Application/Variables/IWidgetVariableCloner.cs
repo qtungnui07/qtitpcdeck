@@ -1,0 +1,25 @@
+using MacroDeckHost.Domain.Entities;
+using MacroDeckHost.Domain.Enums;
+
+namespace MacroDeckHost.Application.Variables;
+
+public sealed record WidgetVariableSnapshot(
+	string Name,
+	VariableType Type,
+	string Value,
+	int? DecimalPlaces,
+	VariableFileSource? FileSource = null,
+	VariableTemplateSource? TemplateSource = null);
+
+public interface IWidgetVariableCloner
+{
+	Task<IReadOnlyList<WidgetVariableSnapshot>> Snapshot(Guid widgetId);
+
+	Task Restore(Guid widgetId, IReadOnlyList<WidgetVariableSnapshot> variables);
+
+	Task Clone(Guid sourceWidgetId, Guid targetWidgetId);
+
+	Task<IReadOnlyList<WidgetVariableSnapshot>> SnapshotScope(VariableScope scope, string scopeRefId);
+
+	Task RestoreScope(VariableScope scope, string scopeRefId, IReadOnlyList<WidgetVariableSnapshot> variables);
+}

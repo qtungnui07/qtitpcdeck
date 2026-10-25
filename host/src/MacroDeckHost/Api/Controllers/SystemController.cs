@@ -1,0 +1,228 @@
+using MacroDeckHost.Application.Auth;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using MacroDeckHost.Application.Configuration;
+using MacroDeckHost.Application.Rendering;
+using MacroDeckHost.Application.Services;
+using MacroDeckHost.Application.ThirdParty;
+using MacroDeckHost.Application.Ui.Transport;
+using MacroDeckHost.Application.Ui.Transport.Messages.System;
+using MacroDeckHost.Application.Ui.Transport.Messages.Version;
+using MacroDeckHost.Auth;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Net.Http.Headers;
+
+namespace MacroDeckHost.Api.Controllers;
+
+[ApiController]
+[Route("api/system")]
+public class SystemController : ControllerBase
+{
+	private readonly IUiTransportMessageHandler<GetVersionRequest, GetVersionResponse> _getVersion;
+	private readonly IUiTransportMessageHandler<GetAboutInfoRequest, GetAboutInfoResponse> _getAboutInfo;
+	private readonly IUiTransportMessageHandler<GetSystemFontsRequest, GetSystemFontsResponse> _getSystemFonts;
+
+	private readonly IUiTransportMessageHandler<GetServerTimeRequest, GetServerTimeResponse> _getServerTime;
+
+	private readonly IUiTransportMessageHandler<GetApplicationFocusCapabilityRequest,
+			GetApplicationFocusCapabilityResponse>
+		_getApplicationFocusCapability;
+
+	private readonly IUiTransportMessageHandler<GetRunningApplicationsRequest, GetRunningApplicationsResponse>
+		_getRunningApplications;
+
+	private readonly IUiTransportMessageHandler<GetLockStateRequest, GetLockStateResponse> _getLockState;
+
+	private readonly IFontCatalog _fontCatalog;
+	private readonly IHostListenerState _listenerState;
+	private readonly IHostIdentityKeyProvider _hostIdentity;
+	private readonly IThirdPartyNotices _thirdPartyNotices;
+
+	public SystemController(
+		IUiTransportMessageHandler<GetVersionRequest, GetVersionResponse> getVersion,
+		IUiTransportMessageHandler<GetAboutInfoRequest, GetAboutInfoResponse> getAboutInfo,
+		IUiTransportMessageHandler<GetSystemFontsRequest, GetSystemFontsResponse> getSystemFonts,
+		IUiTransportMessageHandler<GetServerTimeRequest, GetServerTimeResponse> getServerTime,
+		IUiTransportMessageHandler<GetApplicationFocusCapabilityRequest, GetApplicationFocusCapabilityResponse>
+			getApplicationFocusCapability,
+		IUiTransportMessageHandler<GetRunningApplicationsRequest, GetRunningApplicationsResponse>
+			getRunningApplications,
+		IUiTransportMessageHandler<GetLockStateRequest, GetLockStateResponse> getLockState,
+		IFontCatalog fontCatalog,
+		IHostListenerState listenerState,
+		IHostIdentityKeyProvider hostIdentity,
+		IThirdPartyNotices thirdPartyNotices)
+	{
+		_getVersion = getVersion;
+		_getAboutInfo = getAboutInfo;
+		_getSystemFonts = getSystemFonts;
+		_getServerTime = getServerTime;
+		_getApplicationFocusCapability = getApplicationFocusCapability;
+		_getRunningApplications = getRunningApplications;
+		_getLockState = getLockState;
+		_fontCatalog = fontCatalog;
+		_listenerState = listenerState;
+		_hostIdentity = hostIdentity;
+		_thirdPartyNotices = thirdPartyNotices;
+	}
+
+	[HttpGet("version")]
+	[Authorize(Policy = AuthPolicies.ClientAccess)]
+	public Task<GetVersionResponse> GetVersion(CancellationToken ct)
+	{
+		return _getVersion.Handle(new GetVersionRequest(), ct).AsTask();
+	}
+
+	[HttpGet("about")]
+	public Task<GetAboutInfoResponse> GetAbout(CancellationToken ct)
+	{
+		return _getAboutInfo.Handle(new GetAboutInfoRequest(), ct).AsTask();
+	}
+
+	[HttpGet("third-party-notices")]
+	public ActionResult<ThirdPartyNoticesDocument> GetThirdPartyNotices()
+	{
+		return _thirdPartyNotices.Read() is { } document ? document : NotFound();
+	}
+
+	// Public on purpose: every device that receives the web client may read the notices of what it runs.
+	[HttpGet("third-party-notices.txt")]
+	[AllowAnonymous]
+	public IActionResult GetThirdPartyNoticesText()
+	{
+		if (_thirdPartyNotices.ReadText() is not { } text)
+		{
+			return NotFound();
+		}
+
+		Response.Headers.CacheControl = "public, max-age=3600";
+		return Content(text, "text/plain; charset=utf-8");
+	}
+
+	[HttpGet("time")]
+	[Authorize(Policy = AuthPolicies.ClientAccess)]
+	public async Task<GetServerTimeResponse> GetServerTime(CancellationToken ct)
+	{
+		Response.Headers.CacheControl = "no-store";
+		return await _getServerTime.Handle(new GetServerTimeRequest(), ct);
+	}
+
+	[HttpGet("fonts")]
+	[Authorize(Policy = AuthPolicies.ClientAccess)]
+	public Task<GetSystemFontsResponse> GetFonts(CancellationToken ct)
+	{
+		return _getSystemFonts.Handle(new GetSystemFontsRequest(), ct).AsTask();
+	}
+
+	[HttpGet("build-info")]
+	[AllowAnonymous]
+	public GetBuildInfoResponse GetBuildInfo()
+	{
+		Response.Headers.CacheControl = "no-store";
+		return new GetBuildInfoResponse { Commit = HostBuildInfo.Commit };
+	}
+
+	[HttpGet("connection-info")]
+	public async Task<GetConnectionInfoResponse> GetConnectionInfo()
+	{
+		var endpoints = GetReachableIpv4Addresses()
+			.SelectMany(address => _listenerState.PublicEndpoints.Endpoints,
+				(address, endpoint) => new ConnectionEndpointDto
+				{
+					Address = address,
+					Port = endpoint.Port,
+					Ssl = endpoint.Ssl
+				})
+			.ToList();
+
+		return new GetConnectionInfoResponse
+		{
+			InstanceName = Environment.MachineName,
+			Endpoints = endpoints,
+			PublicListenerUnavailable = !_listenerState.PublicListenerAvailable,
+			Version = HostVersion.Current,
+			IdentityFingerprint = await IdentityFingerprintOrNull()
+		};
+	}
+
+	private async Task<string?> IdentityFingerprintOrNull()
+	{
+		try
+		{
+			return HostIdentityMessage.Fingerprint(await _hostIdentity.GetPublicKey(HttpContext.RequestAborted));
+		}
+		catch (Exception e) when (e is HostIdentityUnavailableException or ObjectDisposedException)
+		{
+			return null;
+		}
+	}
+
+	private static List<string> GetReachableIpv4Addresses()
+	{
+		return NetworkInterface.GetAllNetworkInterfaces()
+			.Where(nic =>
+				nic.OperationalStatus == OperationalStatus.Up
+				&& nic.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+			.SelectMany(nic => nic.GetIPProperties().UnicastAddresses)
+			.Where(address => address.Address.AddressFamily == AddressFamily.InterNetwork
+				&& !IPAddress.IsLoopback(address.Address))
+			.Select(address => address.Address.ToString())
+			.Distinct()
+			.ToList();
+	}
+
+	[HttpGet("application-focus")]
+	public Task<GetApplicationFocusCapabilityResponse> GetApplicationFocusCapability(CancellationToken ct)
+	{
+		return _getApplicationFocusCapability.Handle(new GetApplicationFocusCapabilityRequest(), ct).AsTask();
+	}
+
+	[HttpGet("running-applications")]
+	public Task<GetRunningApplicationsResponse> GetRunningApplications(
+		[FromQuery] string? filter,
+		CancellationToken ct)
+	{
+		return _getRunningApplications.Handle(new GetRunningApplicationsRequest { Filter = filter }, ct).AsTask();
+	}
+
+	[HttpGet("lock-state")]
+	[Authorize(Policy = AuthPolicies.ClientAccess)]
+	public Task<GetLockStateResponse> GetLockState(CancellationToken ct)
+	{
+		return _getLockState.Handle(new GetLockStateRequest(), ct).AsTask();
+	}
+
+	[HttpGet("fonts/{faceId}/file")]
+	[Authorize(Policy = AuthPolicies.ClientAccess)]
+	public IActionResult GetFontFile(string? faceId)
+	{
+		var bytes = faceId is null ? null : _fontCatalog.GetFaceFile(faceId);
+		if (bytes is null)
+		{
+			return NotFound();
+		}
+
+		// An imported face can be removed and imported again under the same id, so only installed faces are immutable.
+		if (_fontCatalog.FindFace(faceId!) is { UserImported: true, ContentHash: { } contentHash })
+		{
+			Response.Headers.CacheControl = "no-cache";
+			return File(bytes, SfntContentType(bytes), null, new EntityTagHeaderValue($"\"{contentHash}\""));
+		}
+
+		Response.Headers.CacheControl = "public, max-age=31536000, immutable";
+		return File(bytes, SfntContentType(bytes), null, new EntityTagHeaderValue($"\"{faceId}\""));
+	}
+
+	private static string SfntContentType(byte[] sfnt)
+	{
+		return sfnt.Length >= 4
+			&& sfnt[0] == (byte)'O'
+			&& sfnt[1] == (byte)'T'
+			&& sfnt[2] == (byte)'T'
+			&& sfnt[3] == (byte)'O'
+				? "font/otf"
+				: "font/ttf";
+	}
+}

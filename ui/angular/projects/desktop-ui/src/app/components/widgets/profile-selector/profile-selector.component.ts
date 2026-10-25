@@ -1,0 +1,467 @@
+import { CdkDrag, CdkDragDrop, CdkDragHandle, CdkDropList } from '@angular/cdk/drag-drop';
+import { ChangeDetectionStrategy, Component, ElementRef, Injector, ViewChild, afterNextRender, computed, effect, inject, signal } from '@angular/core';
+import { FormsModule } from '@angular/forms';
+
+import { FileOpenService } from '../../../services';
+import { type EmptyCellStyle, Profile, WIDGET_REFERENCE_GAP, AppStrings, isColorReference, Strings } from '@macro-deck/runtime';
+import { ProfileService, ToastService, ModalComponent, ButtonComponent, ButtonGroupComponent, ContextMenuComponent, ContextMenuItem, ErrorBannerComponent, InputComponent, dismissModal, LocalizationService, TranslatePipe } from '@shared';
+import { SelectCaretComponent } from '../../forms/select-caret/select-caret.component';
+import { GridSettingsComponent } from '../../grid-settings/grid-settings.component';
+import { ConfirmationModalComponent } from '../../overlay/confirmation-modal/confirmation-modal.component';
+import { DropdownMenuComponent } from '../../overlay/dropdown-menu/dropdown-menu.component';
+import { ArchivePreviewModalComponent } from '../../portable/archive-preview-modal/archive-preview-modal.component';
+import { ExportOptionsModalComponent, EXPORT_ICONS_TOGGLE } from '../../portable/export-options-modal/export-options-modal.component';
+import { ImportPasswordModalComponent } from '../../portable/import-password-modal/import-password-modal.component';
+import { ShellDrop, ShellDropTargetDirective } from '../../shell-drop/shell-drop-target.directive';
+import { ArchiveDropKind } from '../../../domain/archive-drop.util';
+import { ArchiveImportSession } from '../../../domain/archive-import-session';
+import { savedFileDetail } from '../../../services/file-save.service';
+import { PortabilityService, PortableExportOptions } from '../../../services/portability.service';
+
+@Component({
+  selector: 'app-profile-selector',
+  standalone: true,
+  imports: [
+    CdkDrag,
+    CdkDragHandle,
+    CdkDropList,
+    FormsModule,
+    DropdownMenuComponent,
+    ModalComponent,
+    ButtonComponent,
+    ButtonGroupComponent,
+    ConfirmationModalComponent,
+    ContextMenuComponent,
+    ShellDropTargetDirective,
+    ArchivePreviewModalComponent,
+    ExportOptionsModalComponent,
+    ImportPasswordModalComponent,
+    ErrorBannerComponent,
+    GridSettingsComponent,
+    InputComponent,
+    SelectCaretComponent,
+    TranslatePipe,
+  ],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  templateUrl: './profile-selector.component.html',
+  styleUrls: ['./profile-selector.component.scss']
+})
+export class ProfileSelectorComponent {
+  protected readonly profileService = inject(ProfileService);
+  private readonly portability = inject(PortabilityService);
+  private readonly fileOpen = inject(FileOpenService);
+  private readonly toasts = inject(ToastService);
+  private readonly localization = inject(LocalizationService);
+  private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
+  private readonly injector = inject(Injector);
+
+  @ViewChild(ModalComponent) private modal?: ModalComponent;
+  @ViewChild('rowContextMenu', { read: ElementRef }) private rowContextMenu?: ElementRef<HTMLElement>;
+  @ViewChild('profileImportInput') private profileImportInput?: { nativeElement: HTMLInputElement };
+
+  protected readonly dropdownOpen = signal(false);
+  protected readonly search = signal('');
+
+  protected readonly filteredProfiles = computed(() => {
+    const query = this.search().trim().toLocaleLowerCase();
+    const profiles = this.profileService.sortedProfiles();
+    return query ? profiles.filter(profile => profile.name.toLocaleLowerCase().includes(query)) : profiles;
+  });
+
+  protected readonly reorderEnabled = computed(() => this.search().trim() === '');
+
+  private readonly movableProfiles = computed(() => this.profileService.sortedProfiles().filter(profile => !profile.isVirtual));
+
+  protected readonly keepDropAboveVirtualProfiles = (index: number): boolean => index < this.movableProfiles().length;
+
+  // Rendered beside the dropdown, not inside it: the dropdown tears its panel down on the same
+  // mousedown that picks a menu item, which would destroy a nested menu before the click lands.
+  protected readonly rowMenu = signal<{ profile: Profile; x: number; y: number } | null>(null);
+
+  protected readonly rowMenuItems = computed<ContextMenuItem[]>(() => {
+    const profile = this.rowMenu()?.profile;
+    if (!profile) {
+      return [];
+    }
+    const t = (key: string) => this.localization.translateKey(key);
+    return [
+      { id: 'edit', label: t(Strings.Common.Edit), icon: 'icon-pencil', disabled: !this.canModify(profile) },
+      { id: 'duplicate', label: t(AppStrings.Widgets.Folder.Duplicate), icon: 'icon-copy', disabled: !this.canDuplicate(profile) },
+      { id: 'export', label: t(Strings.Common.Export), icon: 'icon-upload', disabled: !this.canExport(profile), dividerAfter: true },
+      { id: 'moveUp', label: t(AppStrings.Widgets.Folder.MoveUp), icon: 'icon-arrow-up', disabled: !this.neighbour(profile, -1) },
+      { id: 'moveDown', label: t(AppStrings.Widgets.Folder.MoveDown), icon: 'icon-arrow-down', disabled: !this.neighbour(profile, 1), dividerAfter: true },
+      { id: 'delete', label: t(Strings.Common.Delete), icon: 'icon-trash', danger: true, disabled: !this.canDelete(profile) },
+    ];
+  });
+
+  protected readonly isCreating = signal(false);
+  protected readonly createName = signal('');
+
+  private readonly actionProfile = signal<Profile | null>(null);
+
+  protected readonly DEFAULT_ROWS = 3;
+  protected readonly DEFAULT_COLUMNS = 5;
+  protected readonly BUILT_IN_SPACING = WIDGET_REFERENCE_GAP;
+
+  protected readonly isEditing = signal(false);
+  protected readonly editName = signal('');
+  protected readonly editRows = signal(this.DEFAULT_ROWS);
+  protected readonly editColumns = signal(this.DEFAULT_COLUMNS);
+  protected readonly editBackground = signal('');
+  protected readonly editSpacing = signal<number | null>(null);
+  protected readonly editBorderRadius = signal<number | null>(null);
+  protected readonly editEmptyCellStyle = signal<EmptyCellStyle | null>(null);
+  protected readonly editShadows = signal(true);
+  protected readonly editError = signal<string | null>(null);
+
+  protected readonly showDeleteConfirm = signal(false);
+
+  protected readonly deleteMessage = computed(() => {
+    const name = this.actionProfile()?.name;
+    return name
+      ? this.localization.translateKey(AppStrings.Widgets.Profile.DeleteConfirmNamed, { name })
+      : this.localization.translateKey(AppStrings.Widgets.Profile.DeleteConfirmGeneric);
+  });
+
+  protected readonly showExportModal = signal(false);
+  protected readonly exportToggles = [EXPORT_ICONS_TOGGLE];
+
+  protected readonly archiveImport = new ArchiveImportSession(
+    this.portability,
+    (source, password) => this.portability.importProfile(source, password)
+  );
+
+  private readonly exportError = signal<string | null>(null);
+
+  protected readonly portableError = computed(() => this.exportError() ?? this.archiveImport.error());
+
+  private readonly editConstraint = computed(() => this.actionProfile()?.layout.constraint ?? null);
+
+  protected readonly editMaxColumns = computed(() => this.editConstraint()?.maxColumns ?? 16);
+
+  protected readonly editMaxRows = computed(() => this.editConstraint()?.maxRows ?? 16);
+
+  protected readonly editColumnsLocked = computed(() => this.editConstraint()?.columnsLocked ?? false);
+
+  protected readonly editRowsLocked = computed(() => this.editConstraint()?.rowsLocked ?? false);
+
+  protected readonly editSpacingHonoured = computed(() => this.editConstraint()?.widgetSpacingHonoured ?? true);
+
+  protected readonly editCornerRadiusHonoured = computed(() => this.editConstraint()?.cornerRadiusHonoured ?? true);
+
+  protected readonly noEffectNote = computed(() => {
+    const deviceName = this.editConstraint()?.deviceName;
+    return deviceName
+      ? this.localization.translateKey(AppStrings.Widgets.GridSettings.NoEffectOnDevice, { device: deviceName })
+      : '';
+  });
+
+  protected readonly gridLockNote = computed(() => {
+    const constraint = this.editConstraint();
+    if (!constraint?.deviceName || (!constraint.rowsLocked && !constraint.columnsLocked)) {
+      return '';
+    }
+
+    return this.localization.translateKey(AppStrings.Widgets.GridSettings.FixedByDevice,
+      { device: constraint.deviceName });
+  });
+
+  protected readonly layoutWarning = computed(() => {
+    const profile = this.actionProfile();
+    const compatibility = profile?.layout.compatibility;
+    if (!compatibility || compatibility.status === 'ok') {
+      return '';
+    }
+
+    if (compatibility.status === 'conflictingDevices') {
+      return this.localization.translateKey(AppStrings.Widgets.Profile.LayoutConflictWarning,
+        { devices: compatibility.deviceNames.join(', ') });
+    }
+
+    const constraint = this.editConstraint();
+    return this.localization.translateKey(AppStrings.Widgets.Profile.LayoutExceedsWarning, {
+      device: constraint?.deviceName ?? compatibility.deviceNames.join(', '),
+      columns: constraint?.columns ?? 0,
+      rows: constraint?.rows ?? 0
+    });
+  });
+
+  protected canModify(profile: Profile): boolean {
+    return !profile.isVirtual && !profile.layout.rowsLocked && !profile.layout.columnsLocked;
+  }
+
+  protected canDelete(profile: Profile): boolean {
+    return this.canModify(profile) && this.profileService.profiles().filter(p => !p.isVirtual).length > 1;
+  }
+
+  protected canExport(profile: Profile): boolean {
+    return !profile.isVirtual;
+  }
+
+  protected canDuplicate(profile: Profile): boolean {
+    return !profile.isVirtual;
+  }
+
+  protected monogram(profile: Profile): string {
+    return Array.from(profile.name.trim())[0]?.toLocaleUpperCase() ?? '';
+  }
+
+  protected onDropdownOpenChange(open: boolean): void {
+    this.dropdownOpen.set(open);
+    if (open) {
+      afterNextRender(() => this.host.nativeElement.querySelector<HTMLInputElement>('.profile-search input')?.focus(),
+        { injector: this.injector });
+    } else {
+      this.search.set('');
+    }
+  }
+
+  protected selectFirstMatch(): void {
+    const first = this.filteredProfiles()[0];
+    if (first) {
+      this.selectProfile(first.id);
+    }
+  }
+
+  protected openRowMenu(profile: Profile, event: MouseEvent): void {
+    event.stopPropagation();
+    const anchor = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    this.rowMenu.set({ profile, x: anchor.left, y: anchor.bottom + 4 });
+    if (event.detail === 0) {
+      afterNextRender(() => this.rowContextMenu?.nativeElement
+        .querySelector<HTMLButtonElement>('.menu-item:not([disabled])')?.focus(), { injector: this.injector });
+    }
+  }
+
+  protected onRowMenuAction(action: string): void {
+    const profile = this.rowMenu()?.profile;
+    if (!profile) {
+      return;
+    }
+    switch (action) {
+      case 'edit':
+        this.startEdit(profile);
+        break;
+      case 'duplicate':
+        void this.duplicate(profile);
+        break;
+      case 'export':
+        this.startExport(profile);
+        break;
+      case 'delete':
+        this.startDelete(profile);
+        break;
+      case 'moveUp':
+        void this.moveByMenu(profile, -1);
+        break;
+      case 'moveDown':
+        void this.moveByMenu(profile, 1);
+        break;
+    }
+  }
+
+  protected onProfileDropped(event: CdkDragDrop<unknown>): void {
+    const profiles = this.filteredProfiles();
+    const moving = profiles[event.previousIndex];
+    const target = profiles[event.currentIndex];
+    if (event.previousIndex === event.currentIndex || !moving || !target || moving.isVirtual || target.isVirtual) {
+      return;
+    }
+    void this.move(moving, target, event.currentIndex > event.previousIndex ? 'after' : 'before');
+  }
+
+  private neighbour(profile: Profile, step: -1 | 1): Profile | null {
+    const profiles = this.movableProfiles();
+    const index = profiles.findIndex(candidate => candidate.id === profile.id);
+    return index < 0 ? null : profiles[index + step] ?? null;
+  }
+
+  private async moveByMenu(profile: Profile, step: -1 | 1): Promise<void> {
+    const target = this.neighbour(profile, step);
+    if (!target) {
+      return;
+    }
+    await this.move(profile, target, step < 0 ? 'before' : 'after');
+    this.dropdownOpen.set(true);
+    afterNextRender(() => this.host.nativeElement
+      .querySelector<HTMLElement>(`[data-profile-id="${profile.id}"] .profile-item-more button`)?.focus(),
+      { injector: this.injector });
+  }
+
+  private async move(profile: Profile, target: Profile, position: 'before' | 'after'): Promise<void> {
+    const result = await this.profileService.moveProfile(profile.id, target.id, position);
+    if (!result.success) {
+      this.toasts.show(this.localization.translateKey(AppStrings.Errors.Profile.MoveFailed), { variant: 'error' });
+    }
+  }
+
+  selectProfile(id: string): void {
+    this.profileService.selectProfile(id);
+    this.onDropdownOpenChange(false);
+  }
+
+  startCreate(): void {
+    this.createName.set('');
+    this.isCreating.set(true);
+  }
+
+  async confirmCreate(): Promise<void> {
+    const name = this.createName().trim() || this.localization.translateKey(AppStrings.Widgets.Profile.NewProfile);
+    const result = await this.profileService.createProfile(name);
+    if (!result.success) {
+      console.error('Failed to create profile:', result.error?.message);
+    }
+    this.cancelCreate();
+  }
+
+  cancelCreate(): void {
+    dismissModal(this.modal, () => {
+      this.isCreating.set(false);
+      this.createName.set('');
+    });
+  }
+
+  startEdit(profile: Profile): void {
+    this.onDropdownOpenChange(false);
+    this.actionProfile.set(profile);
+    this.editName.set(profile.name);
+    this.editRows.set(profile.defaultRows);
+    this.editColumns.set(profile.defaultColumns);
+    this.editBackground.set(profile.defaultBackgroundSource ?? profile.defaultBackground ?? '');
+    this.editSpacing.set(profile.defaultSpacing);
+    this.editBorderRadius.set(profile.defaultBorderRadius);
+    this.editEmptyCellStyle.set(profile.defaultEmptyCellStyle ?? null);
+    this.editShadows.set(profile.defaultShadows !== false);
+    this.editError.set(null);
+    this.isEditing.set(true);
+  }
+
+  async confirmEdit(): Promise<void> {
+    const profile = this.actionProfile();
+    if (!profile) {
+      return;
+    }
+    this.editError.set(null);
+    const background = this.editBackground().trim() || undefined;
+    const result = await this.profileService.updateProfile(profile.id, {
+      name: this.editName().trim() || profile.name,
+      defaultRows: this.editRows(),
+      defaultColumns: this.editColumns(),
+      defaultBackgroundColor: background !== undefined && isColorReference(background) ? undefined : background,
+      defaultBackgroundColorSource: background,
+      defaultWidgetSpacing: this.editSpacing() ?? -1,
+      defaultWidgetBorderRadius: this.editBorderRadius() ?? -1,
+      defaultEmptyCellStyle: this.editEmptyCellStyle() ?? '',
+      defaultWidgetShadows: this.editShadows()
+    });
+    if (!result.success) {
+      this.editError.set(result.error?.message || this.localization.translateKey(AppStrings.Widgets.Profile.UpdateFailed));
+      return;
+    }
+    this.cancelEdit();
+  }
+
+  cancelEdit(): void {
+    dismissModal(this.modal, () => {
+      this.isEditing.set(false);
+      this.editError.set(null);
+    });
+  }
+
+  startDelete(profile: Profile): void {
+    this.onDropdownOpenChange(false);
+    this.actionProfile.set(profile);
+    this.showDeleteConfirm.set(true);
+  }
+
+  async confirmDelete(): Promise<void> {
+    const profile = this.actionProfile();
+    if (profile) {
+      const result = await this.profileService.deleteProfile(profile.id);
+      if (!result.success) {
+        console.error('Failed to delete profile:', result.error?.message);
+      }
+    }
+    this.showDeleteConfirm.set(false);
+  }
+
+  cancelDelete(): void {
+    this.showDeleteConfirm.set(false);
+  }
+
+  async duplicate(profile: Profile): Promise<void> {
+    this.onDropdownOpenChange(false);
+    const name = this.localization.translateKey(AppStrings.Widgets.Profile.CopyName, { name: profile.name });
+    const result = await this.profileService.duplicateProfile(profile.id, name);
+    if (!result.success) {
+      this.toasts.show(this.localization.translateKey(AppStrings.Errors.Profile.DuplicateFailed), { variant: 'error' });
+    }
+  }
+
+  startExport(profile: Profile): void {
+    this.onDropdownOpenChange(false);
+    this.actionProfile.set(profile);
+    this.exportError.set(null);
+    this.showExportModal.set(true);
+  }
+
+  async onExportConfirmed(options: PortableExportOptions): Promise<void> {
+    const profile = this.actionProfile();
+    this.showExportModal.set(false);
+    if (!profile) {
+      return;
+    }
+
+    const result = await this.portability.exportProfile(profile.id, options);
+    if (!result.ok) {
+      this.exportError.set(result.error ?? this.localization.translateKey(AppStrings.Widgets.Profile.ExportFailed));
+      return;
+    }
+    if (!result.canceled) {
+      this.toasts.show(this.localization.translateKey(AppStrings.Widgets.Profile.ProfileExported), { detail: savedFileDetail(result) });
+    }
+  }
+
+  cancelExport(): void {
+    this.showExportModal.set(false);
+  }
+
+  dismissPortableError(): void {
+    this.exportError.set(null);
+    this.archiveImport.dismissError();
+  }
+
+  startImport(): void {
+    this.onDropdownOpenChange(false);
+    this.archiveImport.dismissError();
+    this.profileImportInput?.nativeElement.click();
+  }
+
+  protected readonly profileDropKinds: readonly ArchiveDropKind[] = ['profile'];
+
+  private readonly claimOpenedProfile = effect(() => {
+    if (!this.fileOpen.pending().some(entry => entry.kind === 'profile')) {
+      return;
+    }
+
+    const opened = this.fileOpen.claim('profile');
+    if (opened) {
+      void this.archiveImport.beginPath(opened.path);
+    }
+  });
+
+  async onArchiveDropped(drop: ShellDrop): Promise<void> {
+    this.onDropdownOpenChange(false);
+    this.archiveImport.dismissError();
+    await this.archiveImport.beginPath(drop.path);
+  }
+
+  async onImportFileSelected(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0] ?? null;
+    input.value = '';
+    if (file) {
+      await this.archiveImport.beginFile(file);
+    }
+  }
+}

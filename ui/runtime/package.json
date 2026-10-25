@@ -1,0 +1,38 @@
+{
+  "name": "@macro-deck/runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Framework-free qtitpcdeck client runtime: domain models, grid arithmetic, the qtitpcdeck UI model and the host wire protocol.",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/public-api.d.ts",
+      "import": "./dist/public-api.js",
+      "require": "./dist/cjs/public-api.js"
+    },
+    "./styles/*.css": "./styles/*.css",
+    "./styles/icons/*.svg": "./styles/icons/*.svg"
+  },
+  "main": "./dist/cjs/public-api.js",
+  "types": "./dist/public-api.d.ts",
+  "files": [
+    "dist",
+    "styles"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json','{\\\"type\\\":\\\"commonjs\\\"}')\"",
+    "check:es5": "tsc -p tsconfig.es5.json && es-check es5 --module dist-es5/**/*.js",
+    "pretest": "tsc -p tsconfig.spec.json && node -e \"require('fs').writeFileSync('out-spec/package.json','{\\\"type\\\":\\\"commonjs\\\"}')\"",
+    "test": "jasmine --config=jasmine.json && npm run test:boundaries",
+    "test:boundaries": "node --test boundaries.test.mjs styles.test.mjs"
+  },
+  "devDependencies": {
+    "es-check": "^9.6.4",
+    "jasmine": "^7.0.0",
+    "jasmine-core": "~7.0.2",
+    "jsdom": "^30.0.1",
+    "typescript": "~6.0.3"
+  },
+  "module": "./dist/public-api.js"
+}

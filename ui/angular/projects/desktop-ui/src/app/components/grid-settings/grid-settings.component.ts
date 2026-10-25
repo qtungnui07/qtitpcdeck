@@ -1,0 +1,167 @@
+import { ChangeDetectionStrategy, Component, EventEmitter, Input, Output, computed, inject, signal } from '@angular/core';
+import { FormsModule } from '@angular/forms';
+import { AppStrings, type EmptyCellStyle, isEmptyCellStyle, WIDGET_REFERENCE_BORDER_RADIUS } from '@macro-deck/runtime';
+import { LocalizationService, SegmentedControlComponent, type SegmentedOption, ToggleSwitchComponent } from '@shared';
+import { ColorPickerComponent, ColorPreset } from '../forms/color-picker/color-picker.component';
+import { InheritableSettingComponent } from '../forms/inheritable-setting/inheritable-setting.component';
+
+const INHERIT_EMPTY_CELL_STYLE = 'inherit';
+
+@Component({
+  selector: 'shared-grid-settings',
+  standalone: true,
+  imports: [FormsModule, ColorPickerComponent, InheritableSettingComponent, SegmentedControlComponent, ToggleSwitchComponent],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  templateUrl: './grid-settings.component.html',
+  styleUrls: ['./grid-settings.component.scss']
+})
+export class GridSettingsComponent {
+  @Input() cols: number | null = 5;
+  @Input() rows: number | null = 3;
+  @Input() background = '';
+  @Input() minCols = 1;
+  @Input() maxCols = 16;
+  @Input() minRows = 1;
+  @Input() maxRows = 16;
+  @Input() colsLocked = false;
+  @Input() rowsLocked = false;
+  @Input() lockNote = '';
+  @Input() spacingHonoured = true;
+  @Input() cornerRadiusHonoured = true;
+  @Input() noEffectNote = '';
+  @Input() effectiveCols = 5;
+  @Input() effectiveRows = 3;
+  @Input() gridInheritable = true;
+
+  private readonly inheritedLabelOverride = signal<string | null>(null);
+  @Input() set inheritedLabel(value: string) { this.inheritedLabelOverride.set(value); }
+  readonly inheritedLabelState = computed(() =>
+    this.inheritedLabelOverride() ?? this.localization.translateKey(AppStrings.Widgets.GridSettings.Inherited));
+
+  @Input() showWidgetAppearance = false;
+  @Input() spacing: number | null = null;
+  @Input() borderRadius: number | null = null;
+  @Input() showShadowsToggle = false;
+  @Input() shadows = true;
+  @Input() effectiveSpacing = 12;
+  @Input() effectiveBorderRadius: number | null = null;
+
+  @Input() emptyCellStyle: EmptyCellStyle | null = null;
+  @Input() inheritedEmptyCellStyle: EmptyCellStyle = 'visible';
+  private readonly emptyCellStyleInheritableState = signal(true);
+  @Input() set emptyCellStyleInheritable(value: boolean) { this.emptyCellStyleInheritableState.set(value); }
+  get emptyCellStyleInheritable(): boolean { return this.emptyCellStyleInheritableState(); }
+
+  @Output() colsChange = new EventEmitter<number | null>();
+  @Output() rowsChange = new EventEmitter<number | null>();
+  @Output() backgroundChange = new EventEmitter<string>();
+  @Output() spacingChange = new EventEmitter<number | null>();
+  @Output() borderRadiusChange = new EventEmitter<number | null>();
+  @Output() emptyCellStyleChange = new EventEmitter<EmptyCellStyle | null>();
+  @Output() shadowsChange = new EventEmitter<boolean>();
+
+  private readonly localization = inject(LocalizationService);
+
+  readonly minSpacing = 0;
+  readonly maxSpacing = 40;
+  readonly minBorderRadius = 0;
+  readonly maxBorderRadius = 60;
+  readonly defaultBorderRadius = WIDGET_REFERENCE_BORDER_RADIUS;
+
+  readonly columnsLabel = computed(() => this.localization.translateKey(AppStrings.Widgets.GridSettings.Columns));
+  readonly rowsLabel = computed(() => this.localization.translateKey(AppStrings.Widgets.GridSettings.Rows));
+  readonly widgetSpacingLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Widgets.GridSettings.WidgetSpacing));
+  readonly cornerRadiusLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Widgets.GridSettings.CornerRadius));
+  readonly widgetShadowsLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Widgets.GridSettings.WidgetShadows));
+  readonly backgroundLabel = computed(() =>
+    this.localization.translateKey(AppStrings.Widgets.GridSettings.Background));
+
+  readonly emptyCellsLabel = computed(() => this.localization.translateKey(AppStrings.Widgets.GridSettings.EmptyCells));
+
+  readonly emptyCellOptions = computed<SegmentedOption[]>(() => {
+    const styles: SegmentedOption[] = [
+      { value: 'visible', label: this.emptyCellStyleLabel('visible') },
+      { value: 'transparent', label: this.emptyCellStyleLabel('transparent') },
+    ];
+    return this.emptyCellStyleInheritableState()
+      ? [{ value: INHERIT_EMPTY_CELL_STYLE, label: this.inheritedLabelState() }, ...styles]
+      : styles;
+  });
+
+  protected get selectedEmptyCellOption(): string {
+    if (this.emptyCellStyle !== null) return this.emptyCellStyle;
+    return this.emptyCellStyleInheritable ? INHERIT_EMPTY_CELL_STYLE : 'visible';
+  }
+
+  protected get emptyCellStyleSummary(): string {
+    return this.emptyCellStyleLabel(this.inheritedEmptyCellStyle);
+  }
+
+  private emptyCellStyleLabel(style: EmptyCellStyle): string {
+    return this.localization.translateKey(style === 'transparent'
+      ? AppStrings.Widgets.GridSettings.EmptyCellsTransparent
+      : AppStrings.Widgets.GridSettings.EmptyCellsVisible);
+  }
+
+  readonly backgroundPresets = computed<ColorPreset[]>(() => [
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorDark), value: 'rgba(0, 0, 0, 0.7)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorCharcoal), value: 'rgba(26, 26, 26, 0.8)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorForest), value: 'rgba(20, 83, 45, 0.4)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorEmerald), value: 'rgba(4, 120, 87, 0.3)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorOcean), value: 'rgba(30, 58, 138, 0.4)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorViolet), value: 'rgba(88, 28, 135, 0.4)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorRose), value: 'rgba(127, 29, 29, 0.4)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorAmber), value: 'rgba(154, 52, 18, 0.4)' },
+    { label: this.localization.translateKey(AppStrings.Widgets.GridSettings.ColorTransparent), value: 'transparent' },
+  ]);
+
+  onColsChange(value: number): void {
+    this.colsChange.emit(Number(value));
+  }
+
+  onColsReset(): void {
+    this.colsChange.emit(null);
+  }
+
+  onRowsChange(value: number): void {
+    this.rowsChange.emit(Number(value));
+  }
+
+  onRowsReset(): void {
+    this.rowsChange.emit(null);
+  }
+
+  onBackgroundChange(value: string): void {
+    this.background = value;
+    this.backgroundChange.emit(value);
+  }
+
+  onSpacingSliderChange(value: number): void {
+    this.spacingChange.emit(Number(value));
+  }
+
+  onSpacingReset(): void {
+    this.spacingChange.emit(null);
+  }
+
+  onBorderRadiusSliderChange(value: number): void {
+    this.borderRadiusChange.emit(Number(value));
+  }
+
+  onBorderRadiusReset(): void {
+    this.borderRadiusChange.emit(null);
+  }
+
+  onEmptyCellOptionChange(value: string): void {
+    const style = isEmptyCellStyle(value) ? value : null;
+    this.emptyCellStyle = style;
+    this.emptyCellStyleChange.emit(style);
+  }
+
+  onShadowsChange(value: boolean): void {
+    this.shadowsChange.emit(value);
+  }
+}
