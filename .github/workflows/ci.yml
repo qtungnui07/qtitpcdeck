@@ -56,6 +56,12 @@ jobs:
       - name: Install workspace dependencies
         working-directory: ui
         run: npm ci
+      - name: Build runtime
+        working-directory: ui/runtime
+        # The workspace links @macro-deck/runtime to ui/runtime, whose types
+        # come from dist/ - the Svelte check cannot resolve the package until
+        # it is compiled.
+        run: npm run build
       - name: Runtime tests
         working-directory: ui/runtime
         run: npm run test
