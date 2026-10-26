@@ -60,7 +60,6 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           npx tauri build \
             --config release.conf.json \
-            --config version-override.json \
             --config unsigned-local.conf.json \
             --config "{\"version\":\"$VERSION\"}"
       - name: Attach installers to the release
