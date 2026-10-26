@@ -40,6 +40,9 @@ jobs:
       - name: Install UI workspace dependencies
         working-directory: ui
         run: npm ci
+      - name: Install bootstrapper dependencies
+        working-directory: ui/bootstrapper
+        run: npm ci
       - name: Build the runtime, web client and admin UI
         shell: bash
         run: |
