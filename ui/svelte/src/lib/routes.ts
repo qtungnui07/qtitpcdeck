@@ -24,11 +24,6 @@ export const ROUTES: readonly RouteDefinition[] = [
   { id: 'integrations', pattern: '/integrations' },
   { id: 'integration-detail', pattern: '/integrations/:integrationId' },
 
-  { id: 'library', pattern: '/library', redirectTo: '/library/icon-packs' },
-  { id: 'library-icon-packs', pattern: '/library/icon-packs' },
-  { id: 'library-fonts', pattern: '/library/fonts' },
-
-  { id: 'icon-packs', pattern: '/icon-packs', redirectTo: '/library/icon-packs' },
 
   { id: 'store', pattern: '/store' },
   { id: 'store-installed', pattern: '/store/installed' },

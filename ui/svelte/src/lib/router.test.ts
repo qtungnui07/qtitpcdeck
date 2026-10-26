@@ -42,9 +42,9 @@ describe('resolve', () => {
     expect(match?.pattern).toBe('/deck');
   });
 
-  it('follows the icon-packs redirect', () => {
-    const match = resolve(ROUTES, '/icon-packs');
-    expect(match?.pattern).toBe('/library/icon-packs');
+  it('rejects the removed library routes', () => {
+    expect(resolve(ROUTES, '/icon-packs')).toBeNull();
+    expect(resolve(ROUTES, '/library')).toBeNull();
   });
 
   it('prefers the specific store route over the parameterised one', () => {

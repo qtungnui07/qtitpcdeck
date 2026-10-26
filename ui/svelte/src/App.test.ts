@@ -172,7 +172,7 @@ describe('App', () => {
 
   it('renders every main nav destination', () => {
     render(App);
-    for (const label of ['Deck', 'Scripts', 'Automations', 'Variables', 'Integrations', 'Library', 'Store']) {
+    for (const label of ['Deck', 'Scripts', 'Automations', 'Variables', 'Integrations', 'Store']) {
       expect(screen.getByRole('link', { name: label })).toBeTruthy();
     }
   });

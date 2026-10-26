@@ -122,7 +122,6 @@ export const navigation = {
       [
         { id: 'variables', label: text(AppStrings.Nav.Variables), icon: 'braces-x', route: '/variables' },
         { id: 'integrations', label: text(AppStrings.Nav.Integrations), icon: 'puzzle', route: '/integrations' },
-        { id: 'library', label: text(AppStrings.Nav.Library), icon: 'layers', route: '/library/icon-packs' },
       ],
       [{ id: 'store', label: text(AppStrings.Nav.Store), icon: 'store', route: '/store' }],
     ];

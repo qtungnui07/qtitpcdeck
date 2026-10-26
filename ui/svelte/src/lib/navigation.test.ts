@@ -81,8 +81,10 @@ describe('nav model', () => {
 
   it('lists every main destination', () => {
     const ids = navigation.mainNavGroups.flat().map(item => item.id);
+    // Library (icon packs, fonts) was removed: the deck imports packs by
+    // dropping them on it, and nobody managed fonts here.
     expect(ids).toEqual([
-      'deck', 'scripts', 'automations', 'variables', 'integrations', 'library', 'store',
+      'deck', 'scripts', 'automations', 'variables', 'integrations', 'store',
     ]);
   });
 

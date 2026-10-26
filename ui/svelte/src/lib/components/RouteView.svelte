@@ -14,7 +14,6 @@
   import VariablesPage from '$lib/pages/VariablesPage.svelte';
   import IntegrationsPage from '$lib/pages/IntegrationsPage.svelte';
   import IntegrationDetailPage from '$lib/pages/IntegrationDetailPage.svelte';
-  import LibraryPage from '$lib/pages/LibraryPage.svelte';
   import DeckPage from '$lib/pages/DeckPage.svelte';
   import WidgetEditorPage from '$lib/pages/WidgetEditorPage.svelte';
   import StorePage from '$lib/pages/StorePage.svelte';
@@ -66,8 +65,6 @@
   <IntegrationsPage />
 {:else if routeId === 'integration-detail'}
   <IntegrationDetailPage />
-{:else if routeId === 'library' || routeId === 'library-icon-packs' || routeId === 'library-fonts'}
-  <LibraryPage />
 {:else if routeId === 'store'}
   <StorePage />
 {:else if routeId === 'store-installed'}
