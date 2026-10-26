@@ -4,6 +4,7 @@
   "mainBinaryName": "qtitpcdeck",
   "identifier": "app.qtitpcdeck",
   "bundle": {
+		"createUpdaterArtifacts": false,
     "fileAssociations": [
       {
         "ext": ["qtitpcdeckProfile", "macroDeckProfile"],
