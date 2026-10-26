@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      NODE_VERSION: '^22.22.3'
+      DOTNET_VERSION: 10.0.401
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache the Rust bundle build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ui/bootstrapper
+      - name: Install UI workspace dependencies
+        working-directory: ui
+        run: npm ci
+      - name: Build the runtime, web client and admin UI
+        shell: bash
+        run: |
+          (cd ui/runtime && npm run build)
+          (cd ui && npm run build:web-client)
+          (cd ui/svelte && npm run build:only)
+      - name: Stage the host
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash ci/scripts/stage-host.sh win-x64 "$VERSION" Production
+      - name: Bundle the NSIS and MSI installers
+        shell: bash
+        working-directory: ui/bootstrapper
+        env:
+          MACRODECK_BUILD_CHANNEL: Production
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npx tauri build \
+            --config release.conf.json \
+            --config version-override.json \
+            --config unsigned-local.conf.json \
+            --config "{\"version\":\"$VERSION\"}"
+      - name: Attach installers to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "qtitpcdeck ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          files: |
+            ui/bootstrapper/target/release/bundle/nsis/*.exe
+            ui/bootstrapper/target/release/bundle/msi/*.msi
+          make_latest: true
